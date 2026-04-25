@@ -170,7 +170,7 @@ impl BackgroundEffect {
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred.
         let blur = self.options.blur && !self.blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
+        let blur_options = blur.then_some(BlurOptions::from(self.blur_config.clone()));
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {

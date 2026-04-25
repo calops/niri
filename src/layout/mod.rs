@@ -668,7 +668,7 @@ impl Options {
             animations: config.animations.clone(),
             gestures: config.gestures,
             overview: config.overview,
-            blur: config.blur,
+            blur: config.blur.clone(),
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,

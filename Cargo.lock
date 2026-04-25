@@ -2144,6 +2144,7 @@ dependencies = [
  "input",
  "insta",
  "keyframe",
+ "knuffel",
  "libc",
  "libdisplay-info",
  "log",

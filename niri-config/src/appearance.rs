@@ -1006,13 +1006,14 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Blur {
     pub off: bool,
     pub passes: u8,
     pub offset: f64,
     pub noise: f64,
     pub saturation: f64,
+    pub custom_shader: Option<String>,
 }
 
 impl Default for Blur {
@@ -1023,11 +1024,12 @@ impl Default for Blur {
             offset: 3.,
             noise: 0.02,
             saturation: 1.5,
+            custom_shader: None,
         }
     }
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct BlurPart {
     #[knuffel(child)]
     pub off: bool,
@@ -1041,6 +1043,8 @@ pub struct BlurPart {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub custom_shader: Option<String>,
 }
 
 impl MergeWith<BlurPart> for Blur {
@@ -1052,6 +1056,7 @@ impl MergeWith<BlurPart> for Blur {
 
         merge_clone!((self, part), passes);
         merge!((self, part), offset, noise, saturation);
+        merge_clone_opt!((self, part), custom_shader);
     }
 }
 

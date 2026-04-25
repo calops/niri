@@ -88,7 +88,7 @@ impl MappedLayer {
             view_size,
             scale,
             shadow: Shadow::new(shadow_config),
-            blur_config: config.blur,
+            blur_config: config.blur.clone(),
             clock,
         }
     }
@@ -100,7 +100,7 @@ impl MappedLayer {
         shadow_config.merge_with(&self.rules.shadow);
         self.shadow.update_config(shadow_config);
 
-        self.blur_config = config.blur;
+        self.blur_config = config.blur.clone();
     }
 
     pub fn update_shaders(&mut self) {
@@ -246,7 +246,7 @@ impl MappedLayer {
             surface,
             surface_off,
             surface_anim_scale,
-            self.blur_config,
+            self.blur_config.clone(),
             radius,
             self.rules.background_effect,
             should_block_out,
@@ -315,7 +315,7 @@ impl MappedLayer {
                 surface,
                 surface_off,
                 surface_anim_scale,
-                self.blur_config,
+                self.blur_config.clone(),
                 popup_rules.geometry_corner_radius.unwrap_or_default(),
                 effect,
                 false,
