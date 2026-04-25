@@ -5,7 +5,7 @@ use std::rc::Rc;
 use anyhow::{ensure, Context as _};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, link_program, GlesError, GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
+use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
@@ -20,12 +20,16 @@ pub struct Blur {
     ///
     /// Created lazily and stored here to avoid recreating blur textures frequently.
     textures: Vec<GlesTexture>,
+    /// Intermediate textures for custom blur passes.
+    custom_textures: Vec<GlesTexture>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct BlurOptions {
     pub passes: u8,
     pub offset: f64,
+    pub geo_size: (f32, f32),
+    pub corner_radius: [f32; 4],
 }
 
 impl From<niri_config::Blur> for BlurOptions {
@@ -33,7 +37,17 @@ impl From<niri_config::Blur> for BlurOptions {
         Self {
             passes: config.passes,
             offset: config.offset,
+            geo_size: (0.0, 0.0),
+            corner_radius: [0.0; 4],
         }
+    }
+}
+
+impl BlurOptions {
+    pub fn with_geometry(mut self, geo_size: (f32, f32), corner_radius: [f32; 4]) -> Self {
+        self.geo_size = geo_size;
+        self.corner_radius = corner_radius;
+        self
     }
 }
 
@@ -93,6 +107,88 @@ impl BlurProgram {
     }
 }
 
+#[derive(Debug)]
+struct CustomBlurPassProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_input_size: ffi::types::GLint,
+    uniform_half_pixel: ffi::types::GLint,
+    uniform_pass: ffi::types::GLint,
+    uniform_pass_count: ffi::types::GLint,
+    uniform_geo_size: ffi::types::GLint,
+    uniform_corner_radius: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct CustomBlurProgramInner {
+    passes: Vec<CustomBlurPassProgram>,
+    scales: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomBlurProgram(Rc<CustomBlurProgramInner>);
+
+unsafe fn compile_custom_pass(
+    gl: &ffi::Gles2,
+    frag_src: &str,
+) -> Result<CustomBlurPassProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur.vert");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+
+    let input = c"niri_input";
+    let output_size = c"niri_output_size";
+    let input_size = c"niri_input_size";
+    let half_pixel = c"niri_half_pixel";
+    let pass = c"niri_pass";
+    let pass_count = c"niri_pass_count";
+    let geo_size = c"niri_geo_size";
+    let corner_radius = c"niri_corner_radius";
+    let vert = c"vert";
+
+    Ok(CustomBlurPassProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, input.as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, output_size.as_ptr()),
+        uniform_input_size: gl.GetUniformLocation(program, input_size.as_ptr()),
+        uniform_half_pixel: gl.GetUniformLocation(program, half_pixel.as_ptr()),
+        uniform_pass: gl.GetUniformLocation(program, pass.as_ptr()),
+        uniform_pass_count: gl.GetUniformLocation(program, pass_count.as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
+        uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+    })
+}
+
+impl CustomBlurProgram {
+    pub fn compile(
+        renderer: &mut GlesRenderer,
+        pass_configs: &[crate::render_helpers::custom_blur::CustomBlurPassConfig],
+    ) -> anyhow::Result<Self> {
+        let scales: Vec<f32> = pass_configs.iter().map(|c| c.scale).collect();
+        renderer
+            .with_context(move |gl| unsafe {
+                let mut passes = Vec::with_capacity(pass_configs.len());
+                for (i, config) in pass_configs.iter().enumerate() {
+                    let pass = compile_custom_pass(gl, &config.source)
+                        .with_context(|| format!("error compiling custom blur pass {} ({:?})", i, config.name))?;
+                    passes.push(pass);
+                }
+                Ok(Self(Rc::new(CustomBlurProgramInner { passes, scales })))
+            })
+            .context("error making GL context current")?
+    }
+
+    pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
+        renderer.with_context(move |gl| unsafe {
+            for pass in &self.0.passes {
+                gl.DeleteProgram(pass.program);
+            }
+        })
+    }
+}
+
 impl Blur {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
         let program = Shaders::get(renderer).blur.clone()?;
@@ -100,6 +196,7 @@ impl Blur {
             program,
             renderer_context_id: renderer.context_id(),
             textures: Vec::new(),
+            custom_textures: Vec::new(),
         })
     }
 
@@ -163,6 +260,165 @@ impl Blur {
         Ok(())
     }
 
+    fn render_custom(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        source: &GlesTexture,
+        custom_program: &CustomBlurProgram,
+        geo_size: (f32, f32),
+        corner_radius: [f32; 4],
+    ) -> anyhow::Result<GlesTexture> {
+        let _span = tracy_client::span!("Blur::render_custom");
+        trace!("rendering custom blur");
+
+        ensure!(
+            renderer.context_id() == self.renderer_context_id,
+            "wrong renderer"
+        );
+
+        let passes = &custom_program.0.passes;
+        let scales = &custom_program.0.scales;
+        let pass_count = passes.len();
+
+        let source_size = source.size();
+        let source_w = source_size.w as f32;
+        let source_h = source_size.h as f32;
+
+        let mut pass_output_sizes: Vec<(i32, i32)> = Vec::with_capacity(pass_count);
+        let mut current_w = source_w;
+        let mut current_h = source_h;
+        for &scale in scales {
+            current_w = (current_w * scale).max(1.0);
+            current_h = (current_h * scale).max(1.0);
+            pass_output_sizes.push((current_w as i32, current_h as i32));
+        }
+
+        let needs_recreate = self.custom_textures.len() != pass_count
+            || self
+                .custom_textures
+                .iter()
+                .zip(pass_output_sizes.iter())
+                .any(|(tex, &size)| tex.size().w != size.0 || tex.size().h != size.1);
+
+        if needs_recreate {
+            self.custom_textures.clear();
+            for &(w, h) in &pass_output_sizes {
+                let size = Size::new(w, h);
+                let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+                self.custom_textures.push(texture);
+            }
+        }
+
+        renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
+            while gl.GetError() != ffi::NO_ERROR {}
+
+            gl.Disable(ffi::BLEND);
+            gl.Disable(ffi::SCISSOR_TEST);
+            gl.ActiveTexture(ffi::TEXTURE0);
+
+            let mut fbos = [0; 2];
+            gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
+
+            let vertices: [f32; 12] =
+                [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+
+            for (i, pass) in passes.iter().enumerate() {
+                let (output_w, output_h) = pass_output_sizes[i];
+                let (input_w, input_h) = if i == 0 {
+                    (source_size.w, source_size.h)
+                } else {
+                    let prev = pass_output_sizes[i - 1];
+                    (prev.0, prev.1)
+                };
+
+                gl.UseProgram(pass.program);
+                gl.Uniform1i(pass.uniform_input, 0);
+                gl.Uniform2f(
+                    pass.uniform_output_size,
+                    output_w as f32,
+                    output_h as f32,
+                );
+                gl.Uniform2f(pass.uniform_input_size, input_w as f32, input_h as f32);
+                gl.Uniform2f(
+                    pass.uniform_half_pixel,
+                    0.5 / output_w as f32,
+                    0.5 / output_h as f32,
+                );
+                gl.Uniform1i(pass.uniform_pass, i as i32);
+                gl.Uniform1i(pass.uniform_pass_count, pass_count as i32);
+                gl.Uniform2f(pass.uniform_geo_size, geo_size.0, geo_size.1);
+                gl.Uniform4f(
+                    pass.uniform_corner_radius,
+                    corner_radius[0],
+                    corner_radius[1],
+                    corner_radius[2],
+                    corner_radius[3],
+                );
+
+                gl.Viewport(0, 0, output_w, output_h);
+
+                gl.EnableVertexAttribArray(pass.attrib_vert as u32);
+                gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+                gl.VertexAttribPointer(
+                    pass.attrib_vert as u32,
+                    2,
+                    ffi::FLOAT,
+                    ffi::FALSE,
+                    0,
+                    vertices.as_ptr().cast(),
+                );
+
+                let dst = self.custom_textures[i].tex_id();
+                let src = if i == 0 {
+                    source.tex_id()
+                } else {
+                    self.custom_textures[i - 1].tex_id()
+                };
+
+                trace!("custom blur pass {i}: drawing {src} to {dst}");
+
+                gl.FramebufferTexture2D(
+                    ffi::DRAW_FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::TEXTURE_2D,
+                    dst,
+                    0,
+                );
+
+                gl.BindTexture(ffi::TEXTURE_2D, src);
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MIN_FILTER,
+                    ffi::LINEAR as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MAG_FILTER,
+                    ffi::LINEAR as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_S,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_T,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+
+                gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+                gl.DisableVertexAttribArray(pass.attrib_vert as u32);
+            }
+
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+            gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
+        })?;
+
+        Ok(self.custom_textures.last().unwrap().clone())
+    }
+
     pub fn render(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -171,6 +427,17 @@ impl Blur {
     ) -> anyhow::Result<GlesTexture> {
         let _span = tracy_client::span!("Blur::render");
         trace!("rendering blur");
+
+        let custom = Shaders::get(renderer).custom_blur.borrow().clone();
+        if let Some(custom) = custom {
+            return self.render_custom(
+                renderer,
+                source,
+                &custom,
+                options.geo_size,
+                options.corner_radius,
+            );
+        }
 
         ensure!(
             renderer.context_id() == self.renderer_context_id,
