@@ -306,6 +306,9 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             if let Some((blur, options)) = blur {
                 let mut guard = frame.renderer();
                 let renderer = guard.as_mut();
+                let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
+                let corner_radius: [f32; 4] = self.corner_radius.into();
+                let options = options.with_geometry(geo_size, corner_radius);
                 match blur.render(renderer, framebuffer, options) {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {
