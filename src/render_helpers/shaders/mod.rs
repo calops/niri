@@ -8,7 +8,7 @@ use smithay::backend::renderer::gles::{
 
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
-use crate::render_helpers::blur::BlurProgram;
+use crate::render_helpers::blur::{BlurProgram, CustomBlurProgram};
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
@@ -21,6 +21,7 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
+    pub custom_blur: RefCell<Option<CustomBlurProgram>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +160,7 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
+            custom_blur: RefCell::new(None),
         }
     }
 
@@ -194,6 +196,13 @@ impl Shaders {
         program: Option<ShaderProgram>,
     ) -> Option<ShaderProgram> {
         self.custom_open.replace(program)
+    }
+
+    pub fn replace_custom_blur_program(
+        &self,
+        program: Option<CustomBlurProgram>,
+    ) -> Option<CustomBlurProgram> {
+        self.custom_blur.replace(program)
     }
 
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
@@ -349,6 +358,46 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     if let Some(prev) = Shaders::get(renderer).replace_custom_open_program(program) {
         if let Err(err) = prev.destroy(renderer) {
             warn!("error destroying previous custom open shader: {err:?}");
+        }
+    }
+}
+
+pub fn set_custom_blur_program(
+    renderer: &mut GlesRenderer,
+    dir: Option<&str>,
+) {
+    let program = if let Some(dir) = dir {
+        let path = std::path::Path::new(dir);
+        match super::custom_blur::load_custom_blur_pipeline(path) {
+            Ok(configs) => {
+                if configs.is_empty() {
+                    warn!("custom blur pipeline has no passes, ignoring");
+                    None
+                } else {
+                    match crate::render_helpers::blur::CustomBlurProgram::compile(renderer, &configs) {
+                        Ok(program) => {
+                            info!("loaded custom blur shader with {} passes from {}", configs.len(), dir);
+                            Some(program)
+                        }
+                        Err(err) => {
+                            warn!("error compiling custom blur shader: {err:?}");
+                            None
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!("error loading custom blur shader from {}: {err:?}", dir);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(prev) = Shaders::get(renderer).replace_custom_blur_program(program) {
+        if let Err(err) = prev.destroy(renderer) {
+            warn!("error destroying previous custom blur shader: {err:?}");
         }
     }
 }
