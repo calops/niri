@@ -171,6 +171,9 @@ impl Winit {
         if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
             shaders::set_custom_open_program(renderer, Some(src));
         }
+        if let Some(dir) = config.blur.custom_shader.as_deref() {
+            shaders::set_custom_blur_program(renderer, Some(dir));
+        }
         drop(config);
 
         niri.update_shaders();

@@ -1595,6 +1595,14 @@ impl State {
             shaders_changed = true;
         }
 
+        if config.blur.custom_shader.as_ref() != old_config.blur.custom_shader.as_ref() {
+            let dir = config.blur.custom_shader.as_deref();
+            self.backend.with_primary_renderer(|renderer| {
+                shaders::set_custom_blur_program(renderer, dir);
+            });
+            shaders_changed = true;
+        }
+
         if config.cursor.hide_after_inactive_ms != old_config.cursor.hide_after_inactive_ms {
             cursor_inactivity_timeout_changed = true;
         }
@@ -4145,7 +4153,7 @@ impl Niri {
                     state.xray.workspaces.push((geo, bg_color));
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
-                let blur_options = BlurOptions::from(self.config.borrow().blur);
+                let blur_options = BlurOptions::from(self.config.borrow().blur.clone());
                 for buf in &state.xray.background {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
