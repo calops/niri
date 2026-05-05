@@ -78,10 +78,25 @@ void main() {
 
     vec2 p = rel / best_half_size;
 
-    vec2 sampleP = p * pow(f(dist_normalized), u_fPower);
+    float base = max(f(dist_normalized), 0.0);
+    float base_warp = pow(base, u_fPower);
+    float chromatic = 0.06;
 
-    vec2 warped_uv = sampleP * best_half_size + best_center;
-    warped_uv = clamp(warped_uv, 0.0, 1.0);
+    float warp_r = pow(base, u_fPower * (1.0 - chromatic));
+    float warp_b = pow(base, u_fPower * (1.0 + chromatic));
 
-    frag_color = texture(niri_input, warped_uv);
+    vec2 uv_r = (p * warp_r) * best_half_size + best_center;
+    vec2 uv_g = (p * base_warp) * best_half_size + best_center;
+    vec2 uv_b = (p * warp_b) * best_half_size + best_center;
+
+    uv_r = clamp(uv_r, 0.0, 1.0);
+    uv_g = clamp(uv_g, 0.0, 1.0);
+    uv_b = clamp(uv_b, 0.0, 1.0);
+
+    float cr = texture(niri_input, uv_r).r;
+    float cg = texture(niri_input, uv_g).g;
+    float cb = texture(niri_input, uv_b).b;
+    float ca = texture(niri_input, uv_g).a;
+
+    frag_color = vec4(cr, cg, cb, ca);
 }
