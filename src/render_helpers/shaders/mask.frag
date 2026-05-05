@@ -6,47 +6,44 @@ in vec2 v_coords;
 
 uniform int niri_subregion_count;
 uniform vec4 niri_subregion_rects[16];
+uniform vec2 niri_geo_size;
+uniform vec4 niri_corner_radius;
 
 out vec4 frag_color;
 
-// Smooth minimum: eliminates sharp iso-line seams at corners where
-// the nearest edge flips from horizontal to vertical.
-float smin(float a, float b, float k) {
-    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-    return mix(b, a, h) - k * h * (1.0 - h);
+float sdRoundedRect(vec2 p, vec2 half_size, float r) {
+    vec2 q = abs(p) - half_size + r;
+    return length(max(q, 0.0)) - r + min(max(q.x, q.y), 0.0);
 }
 
-void main() {
-    vec2 uv = v_coords;
-
-    float best_dist = 0.0;
-    vec2 best_center = vec2(0.5);
-    float max_half = 0.0;
+// Convert corner radius from pixels to UV space.
+    vec4 cr_uv = niri_corner_radius / niri_geo_size.xyxy;
 
     if (niri_subregion_count == 0) {
-        float dx = min(uv.x, 1.0 - uv.x);
-        float dy = min(uv.y, 1.0 - uv.y);
-        best_dist = smin(dx, dy, 0.005);
-        best_center = vec2(0.5);
-        max_half = 0.5;
+        vec2 half_size = vec2(0.5);
+        float cr = min(cr_uv.x, min(half_size.x, half_size.y));
+        float d = -sdRoundedRect(uv - 0.5, half_size, cr);
+        if (d > 0.0) {
+            best_dist = d;
+        }
+        max_half = min(half_size.x, half_size.y);
     } else {
         for (int i = 0; i < niri_subregion_count; i++) {
             vec4 r = niri_subregion_rects[i];
-            float hw = (r.z - r.x) * 0.5;
-            float hh = (r.w - r.y) * 0.5;
-            float h = min(hw, hh);
-            if (h > max_half) {
-                max_half = h;
+            vec2 center = (r.xy + r.zw) * 0.5;
+            vec2 half_size = (r.zw - r.xy) * 0.5;
+            float max_r = min(half_size.x, half_size.y);
+            float cr = min(cr_uv.x, max_r);
+
+            if (max_r > max_half) {
+                max_half = max_r;
             }
 
-            float dx = min(uv.x - r.x, r.z - uv.x);
-            float dy = min(uv.y - r.y, r.w - uv.y);
-            if (dx >= 0.0 && dy >= 0.0) {
-                // Smooth min avoids sharp seams where nearest-edge flips at corners.
-                float d = smin(dx, dy, 0.005);
+            float d = -sdRoundedRect(uv - center, half_size, cr);
+            if (d > 0.0) {
                 if (d > best_dist) {
                     best_dist = d;
-                    best_center = (r.xy + r.zw) * 0.5;
+                    best_center = center;
                 }
             }
         }

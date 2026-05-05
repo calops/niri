@@ -219,6 +219,8 @@ struct MaskProgram {
     program: ffi::types::GLuint,
     uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
+    uniform_geo_size: ffi::types::GLint,
+    uniform_corner_radius: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -231,12 +233,16 @@ unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError
 
     let subregion_count = c"niri_subregion_count";
     let subregion_rects = c"niri_subregion_rects";
+    let geo_size = c"niri_geo_size";
+    let corner_radius = c"niri_corner_radius";
     let vert = c"vert";
 
     Ok(MaskProgram {
         program,
         uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
         uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
+        uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -447,6 +453,15 @@ impl Blur {
                             padded.as_ptr().cast(),
                         );
                     }
+
+                    gl.Uniform2f(mask_prog.uniform_geo_size, geo_size.0, geo_size.1);
+                    gl.Uniform4f(
+                        mask_prog.uniform_corner_radius,
+                        corner_radius[0],
+                        corner_radius[1],
+                        corner_radius[2],
+                        corner_radius[3],
+                    );
 
                     gl.Viewport(0, 0, mask_w, mask_h);
                     gl.EnableVertexAttribArray(mask_prog.attrib_vert as u32);
