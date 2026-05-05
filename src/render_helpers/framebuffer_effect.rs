@@ -15,7 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::{Blur, BlurOptions, MAX_BLUR_SUBREGIONS};
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
@@ -232,13 +232,13 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             };
 
             // Prepare blur textures.
-            let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options);
+            let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options.clone());
             if let Some((b, options)) = &mut blur {
                 let renderer = guard.as_mut();
                 if let Err(err) = b.prepare_textures(
                     |fourcc, size| renderer.create_buffer(fourcc, size),
                     framebuffer,
-                    *options,
+                    options.clone(),
                 ) {
                     warn!("error preparing blur textures: {err:?}");
                     blur = None;
@@ -308,7 +308,93 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 let renderer = guard.as_mut();
                 let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
                 let corner_radius: [f32; 4] = self.corner_radius.into();
-                let options = options.with_geometry(geo_size, corner_radius);
+
+                let subregion_rects = if let Some(sr) = self.subregion.as_ref() {
+                    let mut raw: Vec<[f32; 4]> = Vec::new();
+                    for (tl, br) in sr.iter() {
+                        let mut x1 = ((tl.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
+                        let mut y_raw_top = ((tl.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
+                        let mut x2 = ((br.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
+                        let mut y_raw_bot = ((br.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
+                        x1 = x1.clamp(0., 1.);
+                        x2 = x2.clamp(0., 1.);
+                        y_raw_top = y_raw_top.clamp(0., 1.);
+                        y_raw_bot = y_raw_bot.clamp(0., 1.);
+                        let y1 = 1.0 - y_raw_bot;
+                        let y2 = 1.0 - y_raw_top;
+                        if x2 <= x1 || y2 <= y1 {
+                            continue;
+                        }
+                        raw.push([x1, y1, x2, y2]);
+                    }
+
+                    let mut merged: Vec<[f32; 4]> = Vec::new();
+                    for r in &raw {
+                        let mut absorbed = false;
+                        for m in &mut merged {
+                            if r[0] <= m[2] && r[2] >= m[0] && r[1] <= m[3] && r[3] >= m[1] {
+                                m[0] = m[0].min(r[0]);
+                                m[1] = m[1].min(r[1]);
+                                m[2] = m[2].max(r[2]);
+                                m[3] = m[3].max(r[3]);
+                                absorbed = true;
+                                break;
+                            }
+                        }
+                        if !absorbed {
+                            merged.push(*r);
+                        }
+                    }
+                    let mut changed = true;
+                    while changed {
+                        changed = false;
+                        let mut new_merged: Vec<[f32; 4]> = Vec::new();
+                        let mut used = vec![false; merged.len()];
+                        for i in 0..merged.len() {
+                            if used[i] {
+                                continue;
+                            }
+                            let mut r = merged[i];
+                            for j in (i + 1)..merged.len() {
+                                if used[j] {
+                                    continue;
+                                }
+                                if merged[j][0] <= r[2] && merged[j][2] >= r[0]
+                                    && merged[j][1] <= r[3] && merged[j][3] >= r[1]
+                                {
+                                    r[0] = r[0].min(merged[j][0]);
+                                    r[1] = r[1].min(merged[j][1]);
+                                    r[2] = r[2].max(merged[j][2]);
+                                    r[3] = r[3].max(merged[j][3]);
+                                    used[j] = true;
+                                    changed = true;
+                                }
+                            }
+                            new_merged.push(r);
+                            used[i] = true;
+                        }
+                        merged = new_merged;
+                    }
+                    merged.truncate(MAX_BLUR_SUBREGIONS);
+
+                    warn!(
+                        "subregion: {} raw scanlines, {} merged rects, geo=({},{},{},{})",
+                        raw.len(),
+                        merged.len(),
+                        self.geometry.loc.x, self.geometry.loc.y,
+                        self.geometry.size.w, self.geometry.size.h,
+                    );
+                    for (i, r) in merged.iter().enumerate() {
+                        warn!("  subregion[{}]: ({:.3},{:.3},{:.3},{:.3})", i, r[0], r[1], r[2], r[3]);
+                    }
+                    merged
+                } else {
+                    Vec::new()
+                };
+
+                let options = options
+                    .with_geometry(geo_size, corner_radius)
+                    .with_subregion_rects(subregion_rects);
                 match blur.render(renderer, framebuffer, options) {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {

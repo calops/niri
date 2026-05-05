@@ -1,0 +1,5 @@
+// Liquid Glass blur pipeline
+// Multi-pass Kawase blur with a final glass effect pass
+pass "down0" file="down.frag" scale=0.5
+pass "up0" file="up.frag" scale=2.0
+pass "glass" file="glass.frag" scale=1.0

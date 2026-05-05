@@ -294,7 +294,7 @@ impl EffectBuffer {
         blur.prepare_textures(
             |fourcc, size| renderer.create_buffer(fourcc, size),
             &offscreen.texture,
-            self.blur_options,
+            self.blur_options.clone(),
         )
         .context("error preparing blur textures")?;
 
@@ -315,7 +315,7 @@ impl EffectBuffer {
             let mut guard = frame.renderer();
             let renderer = guard.as_mut();
             let blurred = blur
-                .render(renderer, &offscreen.texture, self.blur_options)
+                .render(renderer, &offscreen.texture, self.blur_options.clone())
                 .context("error rendering blur")?;
             offscreen.blurred.insert(blurred).clone()
         };

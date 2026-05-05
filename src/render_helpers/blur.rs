@@ -24,12 +24,20 @@ pub struct Blur {
     custom_textures: Vec<GlesTexture>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+/// Maximum number of subregion rectangles passed to custom blur shaders.
+///
+/// TODO: Consider making the GLSL interface version-dependent to allow a larger or
+/// truly dynamic number of subregions on GLES 3.1+ (SSBOs), while keeping this fixed
+/// limit for GLES 3.0 compatibility.
+pub const MAX_BLUR_SUBREGIONS: usize = 16;
+
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct BlurOptions {
     pub passes: u8,
     pub offset: f64,
     pub geo_size: (f32, f32),
     pub corner_radius: [f32; 4],
+    pub subregion_rects: Vec<[f32; 4]>,
 }
 
 impl From<niri_config::Blur> for BlurOptions {
@@ -39,6 +47,7 @@ impl From<niri_config::Blur> for BlurOptions {
             offset: config.offset,
             geo_size: (0.0, 0.0),
             corner_radius: [0.0; 4],
+            subregion_rects: Vec::new(),
         }
     }
 }
@@ -47,6 +56,11 @@ impl BlurOptions {
     pub fn with_geometry(mut self, geo_size: (f32, f32), corner_radius: [f32; 4]) -> Self {
         self.geo_size = geo_size;
         self.corner_radius = corner_radius;
+        self
+    }
+
+    pub fn with_subregion_rects(mut self, rects: Vec<[f32; 4]>) -> Self {
+        self.subregion_rects = rects;
         self
     }
 }
@@ -118,6 +132,8 @@ struct CustomBlurPassProgram {
     uniform_pass_count: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
+    uniform_subregion_count: ffi::types::GLint,
+    uniform_subregion_rects: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -134,7 +150,7 @@ unsafe fn compile_custom_pass(
     gl: &ffi::Gles2,
     frag_src: &str,
 ) -> Result<CustomBlurPassProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur.vert");
+    let vert_src = include_str!("shaders/blur_custom.vert");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
     let input = c"niri_input";
@@ -145,6 +161,8 @@ unsafe fn compile_custom_pass(
     let pass_count = c"niri_pass_count";
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
+    let subregion_count = c"niri_subregion_count";
+    let subregion_rects = c"niri_subregion_rects";
     let vert = c"vert";
 
     Ok(CustomBlurPassProgram {
@@ -157,6 +175,8 @@ unsafe fn compile_custom_pass(
         uniform_pass_count: gl.GetUniformLocation(program, pass_count.as_ptr()),
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
+        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
+        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -265,11 +285,13 @@ impl Blur {
         renderer: &mut GlesRenderer,
         source: &GlesTexture,
         custom_program: &CustomBlurProgram,
-        geo_size: (f32, f32),
-        corner_radius: [f32; 4],
+        options: &BlurOptions,
     ) -> anyhow::Result<GlesTexture> {
         let _span = tracy_client::span!("Blur::render_custom");
         trace!("rendering custom blur");
+
+        let geo_size = options.geo_size;
+        let corner_radius = options.corner_radius;
 
         ensure!(
             renderer.context_id() == self.renderer_context_id,
@@ -279,6 +301,14 @@ impl Blur {
         let passes = &custom_program.0.passes;
         let scales = &custom_program.0.scales;
         let pass_count = passes.len();
+
+        let subregion_count = options.subregion_rects.len().min(MAX_BLUR_SUBREGIONS);
+        let subregion_data: Vec<[f32; 4]> = options
+            .subregion_rects
+            .iter()
+            .take(subregion_count)
+            .copied()
+            .collect();
 
         let source_size = source.size();
         let source_w = source_size.w as f32;
@@ -355,6 +385,22 @@ impl Blur {
                     corner_radius[2],
                     corner_radius[3],
                 );
+
+                if pass.uniform_subregion_count >= 0 {
+                    gl.Uniform1i(pass.uniform_subregion_count, subregion_count as i32);
+                }
+
+                if pass.uniform_subregion_rects >= 0 && subregion_count > 0 {
+                    let mut padded = [[0.0f32; 4]; MAX_BLUR_SUBREGIONS];
+                    for (j, rect) in subregion_data.iter().enumerate() {
+                        padded[j] = *rect;
+                    }
+                    gl.Uniform4fv(
+                        pass.uniform_subregion_rects,
+                        MAX_BLUR_SUBREGIONS as _,
+                        padded.as_ptr().cast(),
+                    );
+                }
 
                 gl.Viewport(0, 0, output_w, output_h);
 
@@ -434,8 +480,7 @@ impl Blur {
                 renderer,
                 source,
                 &custom,
-                options.geo_size,
-                options.corner_radius,
+                &options,
             );
         }
 

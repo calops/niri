@@ -4157,12 +4157,12 @@ impl Niri {
                 for buf in &state.xray.background {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
+                    buffer.update_blur_options(blur_options.clone());
                 }
                 for buf in &state.xray.backdrop {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
+                    buffer.update_blur_options(blur_options.clone());
                 }
 
                 let layer_map = layer_map_for_output(out);
