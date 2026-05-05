@@ -22,6 +22,8 @@ pub struct Blur {
     textures: Vec<GlesTexture>,
     /// Intermediate textures for custom blur passes.
     custom_textures: Vec<GlesTexture>,
+    /// Mask texture for subregion coverage, at half source resolution.
+    mask_texture: Option<GlesTexture>,
 }
 
 /// Maximum number of subregion rectangles passed to custom blur shaders.
@@ -134,6 +136,7 @@ struct CustomBlurPassProgram {
     uniform_corner_radius: ffi::types::GLint,
     uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
+    uniform_mask: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -163,6 +166,7 @@ unsafe fn compile_custom_pass(
     let corner_radius = c"niri_corner_radius";
     let subregion_count = c"niri_subregion_count";
     let subregion_rects = c"niri_subregion_rects";
+    let mask = c"niri_mask";
     let vert = c"vert";
 
     Ok(CustomBlurPassProgram {
@@ -177,6 +181,7 @@ unsafe fn compile_custom_pass(
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
         uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
+        uniform_mask: gl.GetUniformLocation(program, mask.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -209,6 +214,211 @@ impl CustomBlurProgram {
     }
 }
 
+fn generate_mask_data(
+    mask_w: i32,
+    mask_h: i32,
+    subregion_rects: &[[f32; 4]],
+) -> Vec<u8> {
+    let w = mask_w as usize;
+    let h = mask_h as usize;
+
+    if w == 0 || h == 0 {
+        return vec![];
+    }
+
+    let mut binary = vec![0u8; w * h];
+
+    for rect in subregion_rects {
+        let px1 = (rect[0] * mask_w as f32).floor() as i32;
+        let py1 = (rect[1] * mask_h as f32).floor() as i32;
+        let px2 = (rect[2] * mask_w as f32).ceil() as i32;
+        let py2 = (rect[3] * mask_h as f32).ceil() as i32;
+
+        let px1 = px1.clamp(0, mask_w) as usize;
+        let py1 = py1.clamp(0, mask_h) as usize;
+        let px2 = px2.clamp(0, mask_w) as usize;
+        let py2 = py2.clamp(0, mask_h) as usize;
+
+        for py in py1..py2 {
+            let row = py * w;
+            for px in px1..px2 {
+                binary[row + px] = 1;
+            }
+        }
+    }
+
+    // Compute rect centers for direction field.
+    let mut rect_centers: Vec<(f32, f32)> = subregion_rects
+        .iter()
+        .map(|r| ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5))
+        .collect();
+
+    // For full-window (no rects), use mask center.
+    let full_window = subregion_rects.is_empty();
+    if full_window {
+        rect_centers.push((0.5, 0.5));
+        for v in &mut binary {
+            *v = 1;
+        }
+    }
+
+    // Initialize squared distance: 0 for outside, large value for inside.
+    let inf = (w * w + h * h) as f32;
+    let mut dist = vec![0.0f32; w * h];
+    for i in 0..(w * h) {
+        dist[i] = if binary[i] == 1 { inf } else { 0.0 };
+    }
+
+    // Row pass: 1D EDT along each row.
+    for y in 0..h {
+        edt_1d(&mut dist[y * w..(y + 1) * w]);
+    }
+
+    // Column pass: 1D EDT along each column.
+    let mut col = vec![0.0f32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = dist[y * w + x];
+        }
+        edt_1d(&mut col);
+        for y in 0..h {
+            dist[y * w + x] = col[y];
+        }
+    }
+
+    // Clamp with distance to virtual 0-pixels just outside the mask boundary.
+    // Uses the minimum axis-aligned distance to any edge (not Euclidean to corner).
+    for y in 0..h {
+        for x in 0..w {
+            let edge_dist = ((x + 1) as f32)
+                .min((w - x) as f32)
+                .min((y + 1) as f32)
+                .min((h - y) as f32);
+            let edge_sq = edge_dist * edge_dist;
+            let idx = y * w + x;
+            if binary[idx] == 1 {
+                dist[idx] = dist[idx].min(edge_sq);
+            }
+        }
+    }
+
+    // Sqrt to get actual distance, find max for normalization.
+    let mut max_dist = 0.0f32;
+    for d in &mut dist {
+        *d = d.sqrt();
+        if *d > max_dist {
+            max_dist = *d;
+        }
+    }
+
+    let scale = if max_dist > 0.0 { 1.0 / max_dist } else { 0.0 };
+
+    // Encode: R = normalized distance to edge,
+    //         G,B = to_center vector (center_uv - pixel_uv) encoded to [0,255],
+    //         A = 255.
+    //
+    // The shader uses: sample_uv = uv + to_center * (1 - warp(distance))
+    // matching overshifted2's center + (uv - center) * warp.
+    let mut data = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let pidx = idx * 4;
+
+            if binary[idx] == 0 {
+                data[pidx] = 0;
+                data[pidx + 1] = 128;
+                data[pidx + 2] = 128;
+                data[pidx + 3] = 255;
+                continue;
+            }
+
+            let uv_x = x as f32 / (w - 1).max(1) as f32;
+            let uv_y = y as f32 / (h - 1).max(1) as f32;
+
+            // Find nearest rect center.
+            let mut best_dist_sq = f32::MAX;
+            let mut best_cx = 0.5f32;
+            let mut best_cy = 0.5f32;
+            for &(cx, cy) in &rect_centers {
+                let dx = uv_x - cx;
+                let dy = uv_y - cy;
+                let d_sq = dx * dx + dy * dy;
+                if d_sq < best_dist_sq {
+                    best_dist_sq = d_sq;
+                    best_cx = cx;
+                    best_cy = cy;
+                }
+            }
+
+            // Full to_center vector (not normalized): center - pixel.
+            // Encoded directly: (comp + 1.0) * 0.5 → [0, 1] → [0, 255].
+            // Decode in shader: (encoded - 0.5) * 2.0.
+            let tc_x = best_cx - uv_x;
+            let tc_y = best_cy - uv_y;
+            let tc_x_byte = ((tc_x + 1.0) * 0.5 * 255.0).round() as u8;
+            let tc_y_byte = ((tc_y + 1.0) * 0.5 * 255.0).round() as u8;
+
+            let dist_byte = (dist[idx] * scale * 255.0).round() as u8;
+
+            data[pidx] = dist_byte;
+            data[pidx + 1] = tc_x_byte;
+            data[pidx + 2] = tc_y_byte;
+            data[pidx + 3] = 255;
+        }
+    }
+
+    data
+}
+
+/// 1D Euclidean Distance Transform using Felzenszwalb & Huttenlocher's parabola
+/// envelope method. Transforms squared distances in-place.
+fn edt_1d(f: &mut [f32]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+
+    let mut v: Vec<usize> = Vec::with_capacity(n);
+    let mut z: Vec<f32> = Vec::with_capacity(n + 1);
+    let mut k = 0usize;
+    v.push(0);
+    z.push(f32::NEG_INFINITY);
+    z.push(f32::INFINITY);
+
+    for q in 1..n {
+        let fq = f[q];
+        while k > 0 {
+            let s = ((fq + (q as f32) * (q as f32))
+                - (f[v[k]] + (v[k] as f32) * (v[k] as f32)))
+                / (2.0f32 * q as f32 - 2.0f32 * v[k] as f32);
+            if s <= z[k] {
+                k -= 1;
+                v.pop();
+                z.pop();
+            } else {
+                break;
+            }
+        }
+        k += 1;
+        v.push(q);
+        let s = ((fq + (q as f32) * (q as f32))
+            - (f[v[k - 1]] + (v[k - 1] as f32) * (v[k - 1] as f32)))
+            / (2.0f32 * q as f32 - 2.0f32 * v[k - 1] as f32);
+        z[k] = s;
+        z.push(f32::INFINITY);
+    }
+
+    k = 0;
+    for q in 0..n {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let dq = q as f32 - v[k] as f32;
+        f[q] = dq * dq + f[v[k]];
+    }
+}
+
 impl Blur {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
         let program = Shaders::get(renderer).blur.clone()?;
@@ -217,6 +427,7 @@ impl Blur {
             renderer_context_id: renderer.context_id(),
             textures: Vec::new(),
             custom_textures: Vec::new(),
+            mask_texture: None,
         })
     }
 
@@ -339,12 +550,71 @@ impl Blur {
             }
         }
 
+        let mask_w = (source_size.w + 1) / 2;
+        let mask_h = (source_size.h + 1) / 2;
+        warn!(
+            "mask: {} rects, source {}x{}, mask {}x{}",
+            options.subregion_rects.len(),
+            source_size.w, source_size.h,
+            mask_w, mask_h,
+        );
+        let mask_data = generate_mask_data(mask_w, mask_h, &options.subregion_rects);
+
+        let mask_size = Size::new(mask_w, mask_h);
+        let need_new_mask = self
+            .mask_texture
+            .as_ref()
+            .map_or(true, |t| t.size() != mask_size);
+        if need_new_mask {
+            let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, mask_size)?;
+            self.mask_texture = Some(texture);
+        }
+
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
             gl.Disable(ffi::BLEND);
             gl.Disable(ffi::SCISSOR_TEST);
             gl.ActiveTexture(ffi::TEXTURE0);
+
+            if let Some(mask_tex) = &self.mask_texture {
+                gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
+                gl.TexSubImage2D(
+                    ffi::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    mask_w,
+                    mask_h,
+                    ffi::RGBA,
+                    ffi::UNSIGNED_BYTE,
+                    mask_data.as_ptr().cast(),
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MIN_FILTER,
+                    ffi::LINEAR as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MAG_FILTER,
+                    ffi::LINEAR as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_S,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_T,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+
+                gl.ActiveTexture(ffi::TEXTURE1);
+                gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
+                gl.ActiveTexture(ffi::TEXTURE0);
+            }
 
             let mut fbos = [0; 2];
             gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
@@ -400,6 +670,10 @@ impl Blur {
                         MAX_BLUR_SUBREGIONS as _,
                         padded.as_ptr().cast(),
                     );
+                }
+
+                if pass.uniform_mask >= 0 {
+                    gl.Uniform1i(pass.uniform_mask, 1);
                 }
 
                 gl.Viewport(0, 0, output_w, output_h);
