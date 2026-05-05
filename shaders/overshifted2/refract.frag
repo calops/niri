@@ -27,9 +27,9 @@ float f(float x) {
     return 1.0 - u_b * pow(u_c * M_E, -u_d * x - u_a);
 }
 
-float sdRect(vec2 p) {
-    vec2 d = abs(p) - vec2(1.0);
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+float sdRoundedRect(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) - r + min(max(q.x, q.y), 0.0);
 }
 
 void main() {
@@ -65,12 +65,20 @@ void main() {
         return;
     }
 
-    vec2 p = (uv - best_center) / best_half_size;
+    vec2 rel = uv - best_center;
 
-    float d = sdRect(p);
+    vec4 r_uv = niri_corner_radius / niri_geo_size.xyxy;
+    float max_r = min(best_half_size.x, best_half_size.y);
+    float r = min(r_uv.x, max_r);
+
+    float d = sdRoundedRect(rel, best_half_size, r);
     float dist = -d;
 
-    vec2 sampleP = p * pow(f(dist), u_fPower);
+    float dist_normalized = dist / max_r;
+
+    vec2 p = rel / best_half_size;
+
+    vec2 sampleP = p * pow(f(dist_normalized), u_fPower);
 
     vec2 warped_uv = sampleP * best_half_size + best_center;
     warped_uv = clamp(warped_uv, 0.0, 1.0);

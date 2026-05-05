@@ -21,18 +21,13 @@ const float u_glowEdge0 = 0.06;
 const float u_glowEdge1 = 0.0;
 const float u_noise = 0.06;
 
-float sdRect(vec2 p) {
-    vec2 d = abs(p) - vec2(1.0);
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+float sdRoundedRect(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) - r + min(max(q.x, q.y), 0.0);
 }
 
 float rand(vec2 co) {
     return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
-
-float Glow(vec2 uv, vec2 center) {
-    vec2 rel = (uv - center) / ((niri_subregion_rects[0].zw - niri_subregion_rects[0].xy) * 0.5);
-    return sin(atan(rel.y, rel.x) - 0.5);
 }
 
 void main() {
@@ -68,12 +63,20 @@ void main() {
         return;
     }
 
-    vec2 p = (uv - best_center) / best_half_size;
-    float d = sdRect(p);
+    vec2 rel = uv - best_center;
+
+    vec4 r_uv = niri_corner_radius / niri_geo_size.xyxy;
+    float max_r = min(best_half_size.x, best_half_size.y);
+    float r = min(r_uv.x, max_r);
+
+    float d = sdRoundedRect(rel, best_half_size, r);
     float dist = -d;
 
-    float glow = Glow(uv, best_center);
-    float mul = glow * u_glowWeight * smoothstep(u_glowEdge0, u_glowEdge1, dist) + 1.0 + u_glowBias;
+    float dist_normalized = dist / max_r;
+
+    vec2 rel_norm = rel / best_half_size;
+    float glow = sin(atan(rel_norm.y, rel_norm.x) - 0.5);
+    float mul = glow * u_glowWeight * smoothstep(u_glowEdge0, u_glowEdge1, dist_normalized) + 1.0 + u_glowBias;
 
     vec4 noise = vec4(vec3(rand(gl_FragCoord.xy * 1e-3) - 0.5), 0.0);
     vec4 color = texture(niri_input, uv) + noise * u_noise;
