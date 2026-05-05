@@ -1,0 +1,3 @@
+pass "refract" file="refract.frag" scale=1.0
+pass "blur" file="blur.frag" scale=1.0
+pass "composite" file="composite.frag" scale=1.0

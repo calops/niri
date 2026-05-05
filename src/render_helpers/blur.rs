@@ -22,13 +22,14 @@ pub struct Blur {
     textures: Vec<GlesTexture>,
     /// Intermediate textures for custom blur passes.
     custom_textures: Vec<GlesTexture>,
-    /// Mask texture for subregion coverage, at half source resolution.
+    /// Mask texture at source resolution, rendered from GPU mask shader.
     mask_texture: Option<GlesTexture>,
-    /// Cached mask data to avoid recomputation when rects/size unchanged.
+    /// Cached mask shader (compiled once per-blur-instance).
+    mask_program: Option<MaskProgram>,
+    /// Cache: last rects and size used for mask render.
     cached_mask_rects: Vec<[f32; 4]>,
     cached_mask_w: i32,
     cached_mask_h: i32,
-    cached_mask_data: Vec<u8>,
 }
 
 /// Maximum number of subregion rectangles passed to custom blur shaders.
@@ -219,227 +220,31 @@ impl CustomBlurProgram {
     }
 }
 
-fn generate_mask_data(
-    mask_w: i32,
-    mask_h: i32,
-    subregion_rects: &[[f32; 4]],
-) -> Vec<u8> {
-    let w = mask_w as usize;
-    let h = mask_h as usize;
-
-    if w == 0 || h == 0 {
-        return vec![];
-    }
-
-    let mut binary = vec![0u8; w * h];
-
-    // Pre-fill output with neutral values (zero distance, zero direction).
-    let mut data = vec![0u8; w * h * 4];
-    for pidx in (0..data.len()).step_by(4) {
-        data[pidx] = 0;
-        data[pidx + 1] = 128;
-        data[pidx + 2] = 128;
-        data[pidx + 3] = 255;
-    }
-
-    let full_window = subregion_rects.is_empty();
-
-    // Bounding box of all filled pixels, expanded by 1 for boundary zeros.
-    let mut bbox_xmin = w;
-    let mut bbox_ymin = h;
-    let mut bbox_xmax = 0usize;
-    let mut bbox_ymax = 0usize;
-
-    for rect in subregion_rects {
-        let px1 = (rect[0] * mask_w as f32).floor() as i32;
-        let py1 = (rect[1] * mask_h as f32).floor() as i32;
-        let px2 = (rect[2] * mask_w as f32).ceil() as i32;
-        let py2 = (rect[3] * mask_h as f32).ceil() as i32;
-
-        let px1 = px1.clamp(0, mask_w) as usize;
-        let py1 = py1.clamp(0, mask_h) as usize;
-        let px2 = px2.clamp(0, mask_w) as usize;
-        let py2 = py2.clamp(0, mask_h) as usize;
-
-        for py in py1..py2 {
-            let row = py * w;
-            for px in px1..px2 {
-                binary[row + px] = 1;
-            }
-        }
-
-        bbox_xmin = bbox_xmin.min(px1.saturating_sub(1));
-        bbox_ymin = bbox_ymin.min(py1.saturating_sub(1));
-        bbox_xmax = bbox_xmax.max((px2 + 1).min(w - 1));
-        bbox_ymax = bbox_ymax.max((py2 + 1).min(h - 1));
-    }
-
-    // For full-window, process entire mask.
-    if full_window {
-        for v in &mut binary {
-            *v = 1;
-        }
-        bbox_xmin = 0;
-        bbox_ymin = 0;
-        bbox_xmax = w - 1;
-        bbox_ymax = h - 1;
-    }
-
-    // Rect centers for direction field.
-    let mut rect_centers: Vec<(f32, f32)> = subregion_rects
-        .iter()
-        .map(|r| ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5))
-        .collect();
-    if full_window {
-        rect_centers.push((0.5, 0.5));
-    }
-
-    // Initialize squared distance: 0 for outside, large value for inside.
-    let inf = (w * w + h * h) as f32;
-    let mut dist = vec![0.0f32; w * h];
-    for i in 0..(w * h) {
-        dist[i] = if binary[i] == 1 { inf } else { 0.0 };
-    }
-
-    // Row pass: EDT only on rows in bbox.
-    for y in bbox_ymin..=bbox_ymax {
-        edt_1d(&mut dist[y * w + bbox_xmin..y * w + bbox_xmax + 1]);
-    }
-
-    // Column pass: EDT only on columns in bbox.
-    let col_h = bbox_ymax - bbox_ymin + 1;
-    let mut col = vec![0.0f32; col_h];
-    for x in bbox_xmin..=bbox_xmax {
-        for yi in 0..col_h {
-            col[yi] = dist[(bbox_ymin + yi) * w + x];
-        }
-        edt_1d(&mut col);
-        for yi in 0..col_h {
-            dist[(bbox_ymin + yi) * w + x] = col[yi];
-        }
-    }
-
-    // Clamp with edge distance, only in bbox.
-    for y in bbox_ymin..=bbox_ymax {
-        for x in bbox_xmin..=bbox_xmax {
-            let edge_dist = ((x + 1) as f32)
-                .min((w - x) as f32)
-                .min((y + 1) as f32)
-                .min((h - y) as f32);
-            let edge_sq = edge_dist * edge_dist;
-            let idx = y * w + x;
-            if binary[idx] == 1 {
-                dist[idx] = dist[idx].min(edge_sq);
-            }
-        }
-    }
-
-    // Sqrt and find max distance, only in bbox.
-    let mut max_dist = 0.0f32;
-    for y in bbox_ymin..=bbox_ymax {
-        for x in bbox_xmin..=bbox_xmax {
-            let idx = y * w + x;
-            if binary[idx] == 1 {
-                let d = dist[idx].sqrt();
-                dist[idx] = d;
-                if d > max_dist {
-                    max_dist = d;
-                }
-            }
-        }
-    }
-
-    let scale = if max_dist > 0.0 { 1.0 / max_dist } else { 0.0 };
-
-    // Encode direction and distance, only in bbox.
-    for y in bbox_ymin..=bbox_ymax {
-        for x in bbox_xmin..=bbox_xmax {
-            let idx = y * w + x;
-            if binary[idx] == 0 {
-                continue;
-            }
-
-            let pidx = idx * 4;
-            let uv_x = x as f32 / (w - 1).max(1) as f32;
-            let uv_y = y as f32 / (h - 1).max(1) as f32;
-
-            let mut best_dist_sq = f32::MAX;
-            let mut best_cx = 0.5f32;
-            let mut best_cy = 0.5f32;
-            for &(cx, cy) in &rect_centers {
-                let dx = uv_x - cx;
-                let dy = uv_y - cy;
-                let d_sq = dx * dx + dy * dy;
-                if d_sq < best_dist_sq {
-                    best_dist_sq = d_sq;
-                    best_cx = cx;
-                    best_cy = cy;
-                }
-            }
-
-            let tc_x = best_cx - uv_x;
-            let tc_y = best_cy - uv_y;
-            let tc_x_byte = ((tc_x + 1.0) * 0.5 * 255.0).round() as u8;
-            let tc_y_byte = ((tc_y + 1.0) * 0.5 * 255.0).round() as u8;
-
-            let dist_byte = (dist[idx] * scale * 255.0).round() as u8;
-
-            data[pidx] = dist_byte;
-            data[pidx + 1] = tc_x_byte;
-            data[pidx + 2] = tc_y_byte;
-            data[pidx + 3] = 255;
-        }
-    }
-
-    data
+#[derive(Debug)]
+struct MaskProgram {
+    program: ffi::types::GLuint,
+    uniform_subregion_count: ffi::types::GLint,
+    uniform_subregion_rects: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
 }
 
-/// 1D Euclidean Distance Transform using Felzenszwalb & Huttenlocher's parabola
-/// envelope method. Transforms squared distances in-place.
-fn edt_1d(f: &mut [f32]) {
-    let n = f.len();
-    if n == 0 {
-        return;
-    }
+const MASK_VERTICES: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 
-    let mut v: Vec<usize> = Vec::with_capacity(n);
-    let mut z: Vec<f32> = Vec::with_capacity(n + 1);
-    let mut k = 0usize;
-    v.push(0);
-    z.push(f32::NEG_INFINITY);
-    z.push(f32::INFINITY);
+unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/mask.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
-    for q in 1..n {
-        let fq = f[q];
-        while k > 0 {
-            let s = ((fq + (q as f32) * (q as f32))
-                - (f[v[k]] + (v[k] as f32) * (v[k] as f32)))
-                / (2.0f32 * q as f32 - 2.0f32 * v[k] as f32);
-            if s <= z[k] {
-                k -= 1;
-                v.pop();
-                z.pop();
-            } else {
-                break;
-            }
-        }
-        k += 1;
-        v.push(q);
-        let s = ((fq + (q as f32) * (q as f32))
-            - (f[v[k - 1]] + (v[k - 1] as f32) * (v[k - 1] as f32)))
-            / (2.0f32 * q as f32 - 2.0f32 * v[k - 1] as f32);
-        z[k] = s;
-        z.push(f32::INFINITY);
-    }
+    let subregion_count = c"niri_subregion_count";
+    let subregion_rects = c"niri_subregion_rects";
+    let vert = c"vert";
 
-    k = 0;
-    for q in 0..n {
-        while z[k + 1] < q as f32 {
-            k += 1;
-        }
-        let dq = q as f32 - v[k] as f32;
-        f[q] = dq * dq + f[v[k]];
-    }
+    Ok(MaskProgram {
+        program,
+        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
+        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+    })
 }
 
 impl Blur {
@@ -451,10 +256,10 @@ impl Blur {
             textures: Vec::new(),
             custom_textures: Vec::new(),
             mask_texture: None,
+            mask_program: None,
             cached_mask_rects: Vec::new(),
             cached_mask_w: 0,
             cached_mask_h: 0,
-            cached_mask_data: Vec::new(),
         })
     }
 
@@ -577,21 +382,20 @@ impl Blur {
             }
         }
 
-        let mask_w = (source_size.w + 1) / 2;
-        let mask_h = (source_size.h + 1) / 2;
+        let mask_w = source_size.w;
+        let mask_h = source_size.h;
 
         let rects_changed = self.cached_mask_rects != options.subregion_rects;
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
 
-        if rects_changed || size_changed {
+        let render_mask = rects_changed || size_changed;
+
+        if render_mask {
             trace!(
-                "regenerating mask: {} rects, source {}x{}, mask {}x{}",
+                "rendering GPU mask: {} rects, {}x{}",
                 options.subregion_rects.len(),
-                source_size.w, source_size.h,
                 mask_w, mask_h,
             );
-            self.cached_mask_data =
-                generate_mask_data(mask_w, mask_h, &options.subregion_rects);
             self.cached_mask_rects = options.subregion_rects.clone();
             self.cached_mask_w = mask_w;
             self.cached_mask_h = mask_h;
@@ -607,7 +411,7 @@ impl Blur {
             self.mask_texture = Some(texture);
         }
 
-        let need_upload = rects_changed || size_changed || need_new_mask;
+        let need_render = render_mask || need_new_mask;
 
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
@@ -617,19 +421,67 @@ impl Blur {
             gl.ActiveTexture(ffi::TEXTURE0);
 
             if let Some(mask_tex) = &self.mask_texture {
-                if need_upload {
-                    gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
-                    gl.TexSubImage2D(
+                if need_render {
+                    let subregion_count = options.subregion_rects.len().min(MAX_BLUR_SUBREGIONS);
+                    let mut padded = [[0.0f32; 4]; MAX_BLUR_SUBREGIONS];
+                    for (j, rect) in options.subregion_rects.iter().enumerate().take(subregion_count) {
+                        padded[j] = *rect;
+                    }
+
+                    // Compile mask shader lazily, cache for reuse.
+                    if self.mask_program.is_none() {
+                        match compile_mask_program(gl) {
+                            Ok(p) => self.mask_program = Some(p),
+                            Err(err) => {
+                                warn!("error compiling mask shader: {err:?}");
+                                return;
+                            }
+                        }
+                    }
+                    let mask_prog = self.mask_program.as_ref().unwrap();
+
+                    let mut mask_fbo = 0u32;
+                    gl.GenFramebuffers(1, &mut mask_fbo);
+                    gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
+                    gl.FramebufferTexture2D(
+                        ffi::DRAW_FRAMEBUFFER,
+                        ffi::COLOR_ATTACHMENT0,
                         ffi::TEXTURE_2D,
+                        mask_tex.tex_id(),
                         0,
-                        0,
-                        0,
-                        mask_w,
-                        mask_h,
-                        ffi::RGBA,
-                        ffi::UNSIGNED_BYTE,
-                        self.cached_mask_data.as_ptr().cast(),
                     );
+
+                    gl.UseProgram(mask_prog.program);
+                    gl.Uniform1i(mask_prog.uniform_subregion_count, subregion_count as i32);
+
+                    if subregion_count > 0 {
+                        gl.Uniform4fv(
+                            mask_prog.uniform_subregion_rects,
+                            MAX_BLUR_SUBREGIONS as _,
+                            padded.as_ptr().cast(),
+                        );
+                    }
+
+                    gl.Viewport(0, 0, mask_w, mask_h);
+                    gl.EnableVertexAttribArray(mask_prog.attrib_vert as u32);
+                    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+                    gl.VertexAttribPointer(
+                        mask_prog.attrib_vert as u32,
+                        2,
+                        ffi::FLOAT,
+                        ffi::FALSE,
+                        0,
+                    MASK_VERTICES.as_ptr().cast(),
+                    );
+
+                    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+                    gl.DisableVertexAttribArray(mask_prog.attrib_vert as u32);
+
+                    gl.DeleteFramebuffers(1, &mut mask_fbo);
+                    gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+
+                    // Set texture params on the rendered mask.
+                    gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
                     gl.TexParameteri(
                         ffi::TEXTURE_2D,
                         ffi::TEXTURE_MIN_FILTER,
@@ -661,8 +513,7 @@ impl Blur {
             gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
 
-            let vertices: [f32; 12] =
-                [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+            let vertices = MASK_VERTICES;
 
             for (i, pass) in passes.iter().enumerate() {
                 let (output_w, output_h) = pass_output_sizes[i];
