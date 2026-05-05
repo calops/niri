@@ -366,40 +366,32 @@ pub fn set_custom_blur_program(
     renderer: &mut GlesRenderer,
     dir: Option<&str>,
 ) {
-    let program = if let Some(dir) = dir {
-        let path = std::path::Path::new(dir);
-        match super::custom_blur::load_custom_blur_pipeline(path) {
-            Ok(configs) => {
-                if configs.is_empty() {
-                    warn!("custom blur pipeline has no passes, ignoring");
-                    None
-                } else {
-                    match crate::render_helpers::blur::CustomBlurProgram::compile(renderer, &configs) {
-                        Ok(program) => {
-                            info!("loaded custom blur shader with {} passes from {}", configs.len(), dir);
-                            Some(program)
-                        }
-                        Err(err) => {
-                            warn!("error compiling custom blur shader: {err:?}");
-                            None
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                warn!("error loading custom blur shader from {}: {err:?}", dir);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let program = dir.and_then(|dir| try_load_program(dir, renderer));
 
     if let Some(prev) = Shaders::get(renderer).replace_custom_blur_program(program) {
         if let Err(err) = prev.destroy(renderer) {
             warn!("error destroying previous custom blur shader: {err:?}");
         }
     }
+}
+
+fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlurProgram> {
+    let path = std::path::Path::new(dir);
+    let configs = super::custom_blur::load_custom_blur_pipeline(path)
+        .inspect_err(|err| warn!("error loading custom blur shader from {dir}: {err:?}"))
+        .ok()?;
+
+    if configs.is_empty() {
+        warn!("custom blur pipeline has no passes, ignoring");
+        return None;
+    }
+
+    let program = CustomBlurProgram::compile(renderer, &configs)
+        .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
+        .ok()?;
+
+    info!("loaded custom blur shader with {} passes from {dir}", configs.len());
+    Some(program)
 }
 
 pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
