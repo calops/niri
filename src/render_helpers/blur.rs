@@ -433,7 +433,7 @@ impl Blur {
                         match compile_mask_program(gl) {
                             Ok(p) => self.mask_program = Some(p),
                             Err(err) => {
-                                warn!("error compiling mask shader: {err:?}");
+                                debug!("error compiling mask shader: {err:?}");
                                 return;
                             }
                         }

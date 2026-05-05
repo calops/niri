@@ -377,16 +377,6 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     }
                     merged.truncate(MAX_BLUR_SUBREGIONS);
 
-                    warn!(
-                        "subregion: {} raw scanlines, {} merged rects, geo=({},{},{},{})",
-                        raw.len(),
-                        merged.len(),
-                        self.geometry.loc.x, self.geometry.loc.y,
-                        self.geometry.size.w, self.geometry.size.h,
-                    );
-                    for (i, r) in merged.iter().enumerate() {
-                        warn!("  subregion[{}]: ({:.3},{:.3},{:.3},{:.3})", i, r[0], r[1], r[2], r[3]);
-                    }
                     merged
                 } else {
                     Vec::new()
