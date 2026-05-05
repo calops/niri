@@ -18,7 +18,7 @@ out vec4 frag_color;
 const float M_E = 2.718281828459045;
 
 const float u_a = 0.7;
-const float u_b = 2.3;
+const float u_b = 1.5;
 const float u_c = 5.2;
 const float u_d = 6.9;
 const float u_fPower = 3.0;

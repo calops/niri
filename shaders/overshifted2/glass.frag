@@ -15,11 +15,7 @@ uniform vec4 niri_subregion_rects[16];
 
 out vec4 frag_color;
 
-const float u_glowWeight = 0.3;
-const float u_glowBias = 0.0;
-const float u_glowEdge0 = 0.06;
-const float u_glowEdge1 = 0.0;
-const float u_noise = 0.06;
+const float u_noise = 0.01;
 
 float sdRoundedRect(vec2 p, vec2 b, float r) {
     vec2 q = abs(p) - b + r;
@@ -67,19 +63,30 @@ void main() {
 
     vec4 r_uv = niri_corner_radius / niri_geo_size.xyxy;
     float max_r = min(best_half_size.x, best_half_size.y);
-    float r = min(r_uv.x, max_r);
+    float cr = min(r_uv.x, max_r);
 
-    float d = sdRoundedRect(rel, best_half_size, r);
+    float d = sdRoundedRect(rel, best_half_size, cr);
     float dist = -d;
 
-    float dist_normalized = dist / max_r;
+    float max_dist = max_r;
+    float dist_norm = dist / max_dist;
 
+    // Directional light/shadow (multiplicative) — this creates both dark and bright areas
     vec2 rel_norm = rel / best_half_size;
-    float glow = sin(atan(rel_norm.y, rel_norm.x) - 0.5);
-    float mul = glow * u_glowWeight * smoothstep(u_glowEdge0, u_glowEdge1, dist_normalized) + 1.0 + u_glowBias;
+    float angle = atan(rel_norm.y, rel_norm.x) - 0.5;
+    float glow = pow(max(sin(angle), 0.0), 3.0) - pow(max(-sin(angle), 0.0), 3.0);
+    float glow_weight = 0.6;
+    float glow_bias = 0.0;
+    float mul = glow * glow_weight * smoothstep(0.08, 0.0, dist_norm) + 1.0 + glow_bias;
 
+    // Thin Fresnel rim (additive) — subtle bright edge line
+    float fresnel = exp(-dist / 0.02) * 0.12;
+
+    // Combine: multiplicative for light/shadow, additive for rim
     vec4 noise = vec4(vec3(rand(gl_FragCoord.xy * 1e-3) - 0.5), 0.0);
     vec4 color = texture(niri_input, uv) + noise * u_noise;
 
-    frag_color = color * vec4(vec3(mul), 1.0);
+    color.rgb *= mul;
+
+    frag_color = color;
 }
