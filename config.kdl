@@ -175,7 +175,7 @@ spawn-sh-at-startup "awww-daemon"
 spawn-sh-at-startup "awww img /nix/store/czn63ppw9mxf3wizqh6lc577ywxz86c9-wallhaven-d6j79o.png"
 
 window-rule {
-  geometry-corner-radius 8.000000 8.000000 8.000000 8.000000
+  geometry-corner-radius 15.000000 15.000000 15.000000 15.000000
   clip-to-geometry true
 }
 window-rule {
