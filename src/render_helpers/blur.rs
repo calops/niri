@@ -140,8 +140,6 @@ struct CustomBlurPassProgram {
     uniform_pass_count: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
-    uniform_subregion_count: ffi::types::GLint,
-    uniform_subregion_rects: ffi::types::GLint,
     uniform_mask: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
@@ -170,8 +168,6 @@ unsafe fn compile_custom_pass(
     let pass_count = c"niri_pass_count";
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
-    let subregion_count = c"niri_subregion_count";
-    let subregion_rects = c"niri_subregion_rects";
     let mask = c"niri_mask";
     let vert = c"vert";
 
@@ -185,8 +181,6 @@ unsafe fn compile_custom_pass(
         uniform_pass_count: gl.GetUniformLocation(program, pass_count.as_ptr()),
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
-        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
-        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
         uniform_mask: gl.GetUniformLocation(program, mask.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
@@ -345,14 +339,6 @@ impl Blur {
         let scales = &custom_program.0.scales;
         let pass_count = passes.len();
 
-        let subregion_count = options.subregion_rects.len().min(MAX_BLUR_SUBREGIONS);
-        let subregion_data: Vec<[f32; 4]> = options
-            .subregion_rects
-            .iter()
-            .take(subregion_count)
-            .copied()
-            .collect();
-
         let source_size = source.size();
         let source_w = source_size.w as f32;
         let source_h = source_size.h as f32;
@@ -433,7 +419,7 @@ impl Blur {
                         match compile_mask_program(gl) {
                             Ok(p) => self.mask_program = Some(p),
                             Err(err) => {
-                                debug!("error compiling mask shader: {err:?}");
+                                warn!("error compiling mask shader: {err:?}");
                                 return;
                             }
                         }
@@ -547,22 +533,6 @@ impl Blur {
                     corner_radius[2],
                     corner_radius[3],
                 );
-
-                if pass.uniform_subregion_count >= 0 {
-                    gl.Uniform1i(pass.uniform_subregion_count, subregion_count as i32);
-                }
-
-                if pass.uniform_subregion_rects >= 0 && subregion_count > 0 {
-                    let mut padded = [[0.0f32; 4]; MAX_BLUR_SUBREGIONS];
-                    for (j, rect) in subregion_data.iter().enumerate() {
-                        padded[j] = *rect;
-                    }
-                    gl.Uniform4fv(
-                        pass.uniform_subregion_rects,
-                        MAX_BLUR_SUBREGIONS as _,
-                        padded.as_ptr().cast(),
-                    );
-                }
 
                 if pass.uniform_mask >= 0 {
                     gl.Uniform1i(pass.uniform_mask, 1);
