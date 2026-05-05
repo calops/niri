@@ -16,12 +16,20 @@ float sdRoundedRect(vec2 p, vec2 half_size, float r) {
     return length(max(q, 0.0)) - r + min(max(q.x, q.y), 0.0);
 }
 
-// Convert corner radius from pixels to UV space.
-    vec4 cr_uv = niri_corner_radius / niri_geo_size.xyxy;
+void main() {
+    vec2 uv = v_coords;
+
+    float best_dist = 0.0;
+    vec2 best_center = vec2(0.5);
+    float max_half = 0.0;
+
+    // Corner radius in UV space (uniform, non-const init avoided).
+    float cr_uv_x = niri_corner_radius.x;
+    cr_uv_x /= niri_geo_size.x;
 
     if (niri_subregion_count == 0) {
         vec2 half_size = vec2(0.5);
-        float cr = min(cr_uv.x, min(half_size.x, half_size.y));
+        float cr = min(cr_uv_x, min(half_size.x, half_size.y));
         float d = -sdRoundedRect(uv - 0.5, half_size, cr);
         if (d > 0.0) {
             best_dist = d;
@@ -33,7 +41,7 @@ float sdRoundedRect(vec2 p, vec2 half_size, float r) {
             vec2 center = (r.xy + r.zw) * 0.5;
             vec2 half_size = (r.zw - r.xy) * 0.5;
             float max_r = min(half_size.x, half_size.y);
-            float cr = min(cr_uv.x, max_r);
+            float cr = min(cr_uv_x, max_r);
 
             if (max_r > max_half) {
                 max_half = max_r;

@@ -61,18 +61,7 @@ fn recompute_blur_region(states: &SurfaceData, inner: &mut CachedBlurRegionInner
     if cached.has::<BackgroundEffectSurfaceCachedState>() {
         let mut guard = cached.get::<BackgroundEffectSurfaceCachedState>();
         if let Some(region) = &guard.current().blur_region {
-            for (i, (kind, r)) in region.rects.iter().enumerate().take(4) {
-                warn!(
-                    "protocol region[{}]: {:?} loc=({},{}) size=({},{})",
-                    i, kind, r.loc.x, r.loc.y, r.size.w, r.size.h
-                );
-            }
-            warn!("protocol region total rects: {}", region.rects.len());
             region_to_non_overlapping_rects(region, rects);
-            for (i, r) in rects.iter().enumerate().take(4) {
-                warn!("decomposed[{}]: loc=({},{}) size=({},{})", i, r.loc.x, r.loc.y, r.size.w, r.size.h);
-            }
-            warn!("decomposed total rects: {}", rects.len());
             return;
         } else {
             inner.rects = None;
