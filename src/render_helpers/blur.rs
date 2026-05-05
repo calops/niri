@@ -24,6 +24,11 @@ pub struct Blur {
     custom_textures: Vec<GlesTexture>,
     /// Mask texture for subregion coverage, at half source resolution.
     mask_texture: Option<GlesTexture>,
+    /// Cached mask data to avoid recomputation when rects/size unchanged.
+    cached_mask_rects: Vec<[f32; 4]>,
+    cached_mask_w: i32,
+    cached_mask_h: i32,
+    cached_mask_data: Vec<u8>,
 }
 
 /// Maximum number of subregion rectangles passed to custom blur shaders.
@@ -428,6 +433,10 @@ impl Blur {
             textures: Vec::new(),
             custom_textures: Vec::new(),
             mask_texture: None,
+            cached_mask_rects: Vec::new(),
+            cached_mask_w: 0,
+            cached_mask_h: 0,
+            cached_mask_data: Vec::new(),
         })
     }
 
@@ -552,13 +561,23 @@ impl Blur {
 
         let mask_w = (source_size.w + 1) / 2;
         let mask_h = (source_size.h + 1) / 2;
-        warn!(
-            "mask: {} rects, source {}x{}, mask {}x{}",
-            options.subregion_rects.len(),
-            source_size.w, source_size.h,
-            mask_w, mask_h,
-        );
-        let mask_data = generate_mask_data(mask_w, mask_h, &options.subregion_rects);
+
+        let rects_changed = self.cached_mask_rects != options.subregion_rects;
+        let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
+
+        if rects_changed || size_changed {
+            trace!(
+                "regenerating mask: {} rects, source {}x{}, mask {}x{}",
+                options.subregion_rects.len(),
+                source_size.w, source_size.h,
+                mask_w, mask_h,
+            );
+            self.cached_mask_data =
+                generate_mask_data(mask_w, mask_h, &options.subregion_rects);
+            self.cached_mask_rects = options.subregion_rects.clone();
+            self.cached_mask_w = mask_w;
+            self.cached_mask_h = mask_h;
+        }
 
         let mask_size = Size::new(mask_w, mask_h);
         let need_new_mask = self
@@ -570,6 +589,8 @@ impl Blur {
             self.mask_texture = Some(texture);
         }
 
+        let need_upload = rects_changed || size_changed || need_new_mask;
+
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
@@ -578,38 +599,40 @@ impl Blur {
             gl.ActiveTexture(ffi::TEXTURE0);
 
             if let Some(mask_tex) = &self.mask_texture {
-                gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
-                gl.TexSubImage2D(
-                    ffi::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    mask_w,
-                    mask_h,
-                    ffi::RGBA,
-                    ffi::UNSIGNED_BYTE,
-                    mask_data.as_ptr().cast(),
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_MIN_FILTER,
-                    ffi::LINEAR as i32,
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_MAG_FILTER,
-                    ffi::LINEAR as i32,
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_WRAP_S,
-                    ffi::CLAMP_TO_EDGE as i32,
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_WRAP_T,
-                    ffi::CLAMP_TO_EDGE as i32,
-                );
+                if need_upload {
+                    gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
+                    gl.TexSubImage2D(
+                        ffi::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        mask_w,
+                        mask_h,
+                        ffi::RGBA,
+                        ffi::UNSIGNED_BYTE,
+                        self.cached_mask_data.as_ptr().cast(),
+                    );
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_MIN_FILTER,
+                        ffi::LINEAR as i32,
+                    );
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_MAG_FILTER,
+                        ffi::LINEAR as i32,
+                    );
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_WRAP_S,
+                        ffi::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_WRAP_T,
+                        ffi::CLAMP_TO_EDGE as i32,
+                    );
+                }
 
                 gl.ActiveTexture(ffi::TEXTURE1);
                 gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
