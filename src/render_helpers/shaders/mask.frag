@@ -9,6 +9,13 @@ uniform vec4 niri_subregion_rects[16];
 
 out vec4 frag_color;
 
+// Smooth minimum: eliminates sharp iso-line seams at corners where
+// the nearest edge flips from horizontal to vertical.
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
 void main() {
     vec2 uv = v_coords;
 
@@ -17,8 +24,9 @@ void main() {
     float max_half = 0.0;
 
     if (niri_subregion_count == 0) {
-        // Full-window: distance to nearest window edge.
-        best_dist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+        float dx = min(uv.x, 1.0 - uv.x);
+        float dy = min(uv.y, 1.0 - uv.y);
+        best_dist = smin(dx, dy, 0.005);
         best_center = vec2(0.5);
         max_half = 0.5;
     } else {
@@ -34,7 +42,8 @@ void main() {
             float dx = min(uv.x - r.x, r.z - uv.x);
             float dy = min(uv.y - r.y, r.w - uv.y);
             if (dx >= 0.0 && dy >= 0.0) {
-                float d = min(dx, dy);
+                // Smooth min avoids sharp seams where nearest-edge flips at corners.
+                float d = smin(dx, dy, 0.005);
                 if (d > best_dist) {
                     best_dist = d;
                     best_center = (r.xy + r.zw) * 0.5;
