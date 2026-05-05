@@ -233,6 +233,23 @@ fn generate_mask_data(
 
     let mut binary = vec![0u8; w * h];
 
+    // Pre-fill output with neutral values (zero distance, zero direction).
+    let mut data = vec![0u8; w * h * 4];
+    for pidx in (0..data.len()).step_by(4) {
+        data[pidx] = 0;
+        data[pidx + 1] = 128;
+        data[pidx + 2] = 128;
+        data[pidx + 3] = 255;
+    }
+
+    let full_window = subregion_rects.is_empty();
+
+    // Bounding box of all filled pixels, expanded by 1 for boundary zeros.
+    let mut bbox_xmin = w;
+    let mut bbox_ymin = h;
+    let mut bbox_xmax = 0usize;
+    let mut bbox_ymax = 0usize;
+
     for rect in subregion_rects {
         let px1 = (rect[0] * mask_w as f32).floor() as i32;
         let py1 = (rect[1] * mask_h as f32).floor() as i32;
@@ -250,21 +267,31 @@ fn generate_mask_data(
                 binary[row + px] = 1;
             }
         }
+
+        bbox_xmin = bbox_xmin.min(px1.saturating_sub(1));
+        bbox_ymin = bbox_ymin.min(py1.saturating_sub(1));
+        bbox_xmax = bbox_xmax.max((px2 + 1).min(w - 1));
+        bbox_ymax = bbox_ymax.max((py2 + 1).min(h - 1));
     }
 
-    // Compute rect centers for direction field.
+    // For full-window, process entire mask.
+    if full_window {
+        for v in &mut binary {
+            *v = 1;
+        }
+        bbox_xmin = 0;
+        bbox_ymin = 0;
+        bbox_xmax = w - 1;
+        bbox_ymax = h - 1;
+    }
+
+    // Rect centers for direction field.
     let mut rect_centers: Vec<(f32, f32)> = subregion_rects
         .iter()
         .map(|r| ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5))
         .collect();
-
-    // For full-window (no rects), use mask center.
-    let full_window = subregion_rects.is_empty();
     if full_window {
         rect_centers.push((0.5, 0.5));
-        for v in &mut binary {
-            *v = 1;
-        }
     }
 
     // Initialize squared distance: 0 for outside, large value for inside.
@@ -274,27 +301,27 @@ fn generate_mask_data(
         dist[i] = if binary[i] == 1 { inf } else { 0.0 };
     }
 
-    // Row pass: 1D EDT along each row.
-    for y in 0..h {
-        edt_1d(&mut dist[y * w..(y + 1) * w]);
+    // Row pass: EDT only on rows in bbox.
+    for y in bbox_ymin..=bbox_ymax {
+        edt_1d(&mut dist[y * w + bbox_xmin..y * w + bbox_xmax + 1]);
     }
 
-    // Column pass: 1D EDT along each column.
-    let mut col = vec![0.0f32; h];
-    for x in 0..w {
-        for y in 0..h {
-            col[y] = dist[y * w + x];
+    // Column pass: EDT only on columns in bbox.
+    let col_h = bbox_ymax - bbox_ymin + 1;
+    let mut col = vec![0.0f32; col_h];
+    for x in bbox_xmin..=bbox_xmax {
+        for yi in 0..col_h {
+            col[yi] = dist[(bbox_ymin + yi) * w + x];
         }
         edt_1d(&mut col);
-        for y in 0..h {
-            dist[y * w + x] = col[y];
+        for yi in 0..col_h {
+            dist[(bbox_ymin + yi) * w + x] = col[yi];
         }
     }
 
-    // Clamp with distance to virtual 0-pixels just outside the mask boundary.
-    // Uses the minimum axis-aligned distance to any edge (not Euclidean to corner).
-    for y in 0..h {
-        for x in 0..w {
+    // Clamp with edge distance, only in bbox.
+    for y in bbox_ymin..=bbox_ymax {
+        for x in bbox_xmin..=bbox_xmax {
             let edge_dist = ((x + 1) as f32)
                 .min((w - x) as f32)
                 .min((y + 1) as f32)
@@ -307,41 +334,35 @@ fn generate_mask_data(
         }
     }
 
-    // Sqrt to get actual distance, find max for normalization.
+    // Sqrt and find max distance, only in bbox.
     let mut max_dist = 0.0f32;
-    for d in &mut dist {
-        *d = d.sqrt();
-        if *d > max_dist {
-            max_dist = *d;
+    for y in bbox_ymin..=bbox_ymax {
+        for x in bbox_xmin..=bbox_xmax {
+            let idx = y * w + x;
+            if binary[idx] == 1 {
+                let d = dist[idx].sqrt();
+                dist[idx] = d;
+                if d > max_dist {
+                    max_dist = d;
+                }
+            }
         }
     }
 
     let scale = if max_dist > 0.0 { 1.0 / max_dist } else { 0.0 };
 
-    // Encode: R = normalized distance to edge,
-    //         G,B = to_center vector (center_uv - pixel_uv) encoded to [0,255],
-    //         A = 255.
-    //
-    // The shader uses: sample_uv = uv + to_center * (1 - warp(distance))
-    // matching overshifted2's center + (uv - center) * warp.
-    let mut data = vec![0u8; w * h * 4];
-    for y in 0..h {
-        for x in 0..w {
+    // Encode direction and distance, only in bbox.
+    for y in bbox_ymin..=bbox_ymax {
+        for x in bbox_xmin..=bbox_xmax {
             let idx = y * w + x;
-            let pidx = idx * 4;
-
             if binary[idx] == 0 {
-                data[pidx] = 0;
-                data[pidx + 1] = 128;
-                data[pidx + 2] = 128;
-                data[pidx + 3] = 255;
                 continue;
             }
 
+            let pidx = idx * 4;
             let uv_x = x as f32 / (w - 1).max(1) as f32;
             let uv_y = y as f32 / (h - 1).max(1) as f32;
 
-            // Find nearest rect center.
             let mut best_dist_sq = f32::MAX;
             let mut best_cx = 0.5f32;
             let mut best_cy = 0.5f32;
@@ -356,9 +377,6 @@ fn generate_mask_data(
                 }
             }
 
-            // Full to_center vector (not normalized): center - pixel.
-            // Encoded directly: (comp + 1.0) * 0.5 → [0, 1] → [0, 255].
-            // Decode in shader: (encoded - 0.5) * 2.0.
             let tc_x = best_cx - uv_x;
             let tc_y = best_cy - uv_y;
             let tc_x_byte = ((tc_x + 1.0) * 0.5 * 255.0).round() as u8;
