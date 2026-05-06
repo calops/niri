@@ -12,9 +12,6 @@ uniform vec2 niri_half_pixel;
 
 out vec4 frag_color;
 
-const float u_magnify_strength = 0.15;
-const float u_chromatic = 0.06;
-
 void main() {
     vec2 uv = v_coords;
 
@@ -28,14 +25,15 @@ void main() {
 
     vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
 
-    float normalized = mask * 2.0 - 1.0;
-    float dome = normalized * normalized * normalized * u_magnify_strength;
+    float dome = mask / (0.12 + 0.88 * mask) * 0.45;
 
-    vec2 displacement = -to_center * dome;
+    vec2 displacement = +to_center * dome;
 
-    vec2 uv_r = clamp(uv + displacement * (1.0 - u_chromatic), 0.0, 1.0);
+    float chromatic = pow(1.0 - mask, 3.0) * 0.05;
+
+    vec2 uv_r = clamp(uv + displacement * (1.0 - chromatic), 0.0, 1.0);
     vec2 uv_g = clamp(uv + displacement, 0.0, 1.0);
-    vec2 uv_b = clamp(uv + displacement * (1.0 + u_chromatic), 0.0, 1.0);
+    vec2 uv_b = clamp(uv + displacement * (1.0 + chromatic), 0.0, 1.0);
 
     float cr = texture(niri_input, uv_r).r;
     float cg = texture(niri_input, uv_g).g;
