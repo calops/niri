@@ -399,7 +399,7 @@ impl Blur {
             .as_ref()
             .map_or(true, |t| t.size() != mask_size);
         if need_new_mask {
-            let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, mask_size)?;
+            let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
             self.mask_texture = Some(texture);
         }
 
