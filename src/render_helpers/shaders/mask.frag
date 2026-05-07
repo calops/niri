@@ -64,11 +64,11 @@ void main() {
         return;
     }
 
-    vec2 to_center = (best_center - uv) / max_half;
+    vec2 to_center = best_center - uv;
     frag_color = vec4(
         clamp(mask, 0.0, 1.0),
         to_center.x * 0.5 + 0.5,
         to_center.y * 0.5 + 0.5,
-        max_half
+        1.0
     );
 }

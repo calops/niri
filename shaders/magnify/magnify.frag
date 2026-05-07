@@ -23,9 +23,7 @@ void main() {
         return;
     }
 
-    vec2 to_center_raw = (mask_sample.gb - 0.5) * 2.0;
-    float max_half = mask_sample.a;
-    vec2 to_center = to_center_raw * max_half;
+    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
 
     float dome = mask / (0.12 + 0.88 * mask) * 0.45;
 

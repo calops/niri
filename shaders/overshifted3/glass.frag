@@ -32,14 +32,9 @@ void main() {
         return;
     }
 
-    vec2 to_center_norm = (mask_sample.gb - 0.5) * 2.0;
-    float max_half = mask_sample.a;
-    vec2 to_center = to_center_norm * max_half;
-    float dist = length(to_center_norm);
-
-    // Surface normal from dome curvature.
-    float slope = (1.0 - mask) * 5.0;
-    vec2 dir = dist > 1e-6 ? to_center_norm / dist : vec2(0.0);
+    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
+    float dist = length(to_center);
+    vec2 dir = dist > 1e-6 ? to_center / dist : vec2(0.0);
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
     // Point light grazing from top-left.
