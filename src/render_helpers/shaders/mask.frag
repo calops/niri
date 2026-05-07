@@ -23,31 +23,37 @@ void main() {
     vec2 best_center = vec2(0.5);
     float max_half = 0.0;
 
-    // Corner radius in UV space (uniform, non-const init avoided).
-    float cr_uv_x = niri_corner_radius.x;
-    cr_uv_x /= niri_geo_size.x;
+    // Transform to isotropic space where pixels are square.
+    float aspect = niri_geo_size.y / niri_geo_size.x;
+    vec2 iso = vec2(1.0, aspect);
+
+    // Corner radius in isotropic space.
+    float cr_iso = niri_corner_radius.x;
+    cr_iso /= niri_geo_size.x;
 
     if (niri_subregion_count == 0) {
-        vec2 half_size = vec2(0.5);
-        float cr = min(cr_uv_x, min(half_size.x, half_size.y));
-        float d = -sdRoundedRect(uv - 0.5, half_size, cr);
+        vec2 half_size = vec2(0.5, 0.5);
+        vec2 half_iso = half_size * iso;
+        float cr = min(cr_iso, min(half_iso.x, half_iso.y));
+        float d = -sdRoundedRect((uv - 0.5) * iso, half_iso, cr);
         if (d > 0.0) {
             best_dist = d;
         }
-        max_half = min(half_size.x, half_size.y);
+        max_half = min(half_iso.x, half_iso.y);
     } else {
         for (int i = 0; i < niri_subregion_count; i++) {
             vec4 r = niri_subregion_rects[i];
             vec2 center = (r.xy + r.zw) * 0.5;
             vec2 half_size = (r.zw - r.xy) * 0.5;
-            float max_r = min(half_size.x, half_size.y);
-            float cr = min(cr_uv_x, max_r);
+            vec2 half_iso = half_size * iso;
+            float max_r = min(half_iso.x, half_iso.y);
+            float cr = min(cr_iso, max_r);
 
             if (max_r > max_half) {
                 max_half = max_r;
             }
 
-            float d = -sdRoundedRect(uv - center, half_size, cr);
+            float d = -sdRoundedRect((uv - center) * iso, half_iso, cr);
             if (d > 0.0) {
                 if (d > best_dist) {
                     best_dist = d;
