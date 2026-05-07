@@ -11,10 +11,11 @@ uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
 uniform vec2 niri_geo_size;
 uniform vec4 niri_corner_radius;
+uniform vec2 niri_light_pos;
 
 out vec4 frag_color;
 
-const float u_noise = 0.01;
+const float u_noise = 0.005;
 
 float rand(vec2 co) {
     return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
@@ -31,18 +32,38 @@ void main() {
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-    float dist_center = length(to_center);
+    vec2 to_center_norm = (mask_sample.gb - 0.5) * 2.0;
+    float max_half = mask_sample.a;
+    vec2 to_center = to_center_norm * max_half;
+    float dist = length(to_center_norm);
 
-    float angle = dist_center > 1e-6 ? atan(to_center.y, to_center.x) : 0.0;
-    float glow = pow(max(sin(angle - 0.5), 0.0), 3.0) - pow(max(-sin(angle - 0.5), 0.0), 3.0);
-    float glow_weight = 0.6;
-    float mul = glow * glow_weight * smoothstep(0.2, 0.0, mask) + 1.0;
+    // Surface normal from dome curvature.
+    float slope = (1.0 - mask) * 5.0;
+    vec2 dir = dist > 1e-6 ? to_center_norm / dist : vec2(0.0);
+    vec3 normal = normalize(vec3(-slope * dir, 3.0));
+
+    // Point light grazing from top-left.
+    vec2 to_light = niri_light_pos - uv;
+    vec3 light_dir = normalize(vec3(to_light, 0.04));
+    vec3 half_dir = normalize(light_dir + vec3(0.0, 0.0, 1.0));
+
+    // Dome specular: where the smooth surface faces the half-vector.
+    float spec = pow(max(dot(normal, half_dir), 0.0), 60.0);
+
+    // Directional edge glow + shadow: rim brightness depends on how the outward
+    // direction aligns with the light. Opposite side gets a shadow.
+    float facing = max(dot(-dir, normalize(to_light)), 0.0);
+    float away = max(-dot(-dir, normalize(to_light)), 0.0);
+    float edge = pow(1.0 - mask, 3.0);
+    float rim_light = facing * edge * 1.5;
+    float rim_shadow = away * edge * 0.35;
+
+    float glow = spec * 0.85 + rim_light;
 
     vec4 noise = vec4(vec3(rand(gl_FragCoord.xy * 1e-3) - 0.5), 0.0);
     vec4 color = texture(niri_input, uv) + noise * u_noise;
 
-    color.rgb *= mul;
+    color.rgb *= 1.0 + glow - rim_shadow;
 
     frag_color = color;
 }

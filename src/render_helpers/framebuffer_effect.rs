@@ -384,7 +384,11 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
 
                 let options = options
                     .with_geometry(geo_size, corner_radius)
-                    .with_subregion_rects(subregion_rects);
+                    .with_subregion_rects(subregion_rects)
+                    .with_light_pos((
+                        (-self.geometry.loc.x / self.geometry.size.w) as f32,
+                        1.0 + (self.geometry.loc.y / self.geometry.size.h) as f32,
+                    ));
                 match blur.render(renderer, framebuffer, options) {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {
