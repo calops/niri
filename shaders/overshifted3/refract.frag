@@ -37,7 +37,9 @@ void main() {
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
+    vec2 to_center_raw = (mask_sample.gb - 0.5) * 2.0;
+    float max_half = mask_sample.a;
+    vec2 to_center = to_center_raw * max_half;
 
     float base = max(f(mask), 0.0);
     float base_warp = pow(base, u_fPower);

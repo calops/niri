@@ -89,9 +89,9 @@ blur {
     custom-shader "shaders/magnify"
 }
 
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.5 -o background_blur=1"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.5 -o background_blur=1"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.5 -o background_blur=1"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
 
 binds {
   Mod+Ctrl+S          { screenshot-screen; }
@@ -191,7 +191,7 @@ window-rule {
   match app-id="^kitty$"
   default-column-width { proportion 0.333330; }
   open-floating true
-  geometry-corner-radius 1000 1000 1000 1000
+  // geometry-corner-radius 1000 1000 1000 1000
   background-effect {
     xray false
     blur true
