@@ -15,7 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{Blur, BlurOptions, MAX_BLUR_SUBREGIONS};
+use crate::render_helpers::blur::{Blur, BlurOptions};
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
@@ -328,56 +328,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                         raw.push([x1, y1, x2, y2]);
                     }
 
-                    let mut merged: Vec<[f32; 4]> = Vec::new();
-                    for r in &raw {
-                        let mut absorbed = false;
-                        for m in &mut merged {
-                            if r[0] <= m[2] && r[2] >= m[0] && r[1] <= m[3] && r[3] >= m[1] {
-                                m[0] = m[0].min(r[0]);
-                                m[1] = m[1].min(r[1]);
-                                m[2] = m[2].max(r[2]);
-                                m[3] = m[3].max(r[3]);
-                                absorbed = true;
-                                break;
-                            }
-                        }
-                        if !absorbed {
-                            merged.push(*r);
-                        }
-                    }
-                    let mut changed = true;
-                    while changed {
-                        changed = false;
-                        let mut new_merged: Vec<[f32; 4]> = Vec::new();
-                        let mut used = vec![false; merged.len()];
-                        for i in 0..merged.len() {
-                            if used[i] {
-                                continue;
-                            }
-                            let mut r = merged[i];
-                            for j in (i + 1)..merged.len() {
-                                if used[j] {
-                                    continue;
-                                }
-                                if merged[j][0] <= r[2] && merged[j][2] >= r[0]
-                                    && merged[j][1] <= r[3] && merged[j][3] >= r[1]
-                                {
-                                    r[0] = r[0].min(merged[j][0]);
-                                    r[1] = r[1].min(merged[j][1]);
-                                    r[2] = r[2].max(merged[j][2]);
-                                    r[3] = r[3].max(merged[j][3]);
-                                    used[j] = true;
-                                    changed = true;
-                                }
-                            }
-                            new_merged.push(r);
-                            used[i] = true;
-                        }
-                        merged = new_merged;
-                    }
-                    merged.truncate(MAX_BLUR_SUBREGIONS);
-
-                    merged
+                    raw
                 } else {
                     Vec::new()
                 };

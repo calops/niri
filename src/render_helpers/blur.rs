@@ -32,12 +32,6 @@ pub struct Blur {
     cached_mask_h: i32,
 }
 
-/// Maximum number of subregion rectangles passed to custom blur shaders.
-///
-/// TODO: Consider making the GLSL interface version-dependent to allow a larger or
-/// truly dynamic number of subregions on GLES 3.1+ (SSBOs), while keeping this fixed
-/// limit for GLES 3.0 compatibility.
-pub const MAX_BLUR_SUBREGIONS: usize = 16;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct BlurOptions {
@@ -426,11 +420,7 @@ impl Blur {
 
             if let Some(mask_tex) = &self.mask_texture {
                 if need_render {
-                    let subregion_count = options.subregion_rects.len().min(MAX_BLUR_SUBREGIONS);
-                    let mut padded = [[0.0f32; 4]; MAX_BLUR_SUBREGIONS];
-                    for (j, rect) in options.subregion_rects.iter().enumerate().take(subregion_count) {
-                        padded[j] = *rect;
-                    }
+                    let subregion_count = options.subregion_rects.len() as i32;
 
                     // Compile mask shader lazily, cache for reuse.
                     if self.mask_program.is_none() {
@@ -456,13 +446,13 @@ impl Blur {
                     );
 
                     gl.UseProgram(mask_prog.program);
-                    gl.Uniform1i(mask_prog.uniform_subregion_count, subregion_count as i32);
+                    gl.Uniform1i(mask_prog.uniform_subregion_count, subregion_count);
 
                     if subregion_count > 0 {
                         gl.Uniform4fv(
                             mask_prog.uniform_subregion_rects,
-                            MAX_BLUR_SUBREGIONS as _,
-                            padded.as_ptr().cast(),
+                            subregion_count,
+                            options.subregion_rects.as_ptr() as *const f32,
                         );
                     }
 
