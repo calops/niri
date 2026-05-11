@@ -508,7 +508,19 @@ impl Blur {
 
         let need_render = render_mask || need_new_mask;
 
+        // Use JFA for explicit subregions; fall back to analytical SDF when
+        // there's a single region covering the whole window (or none at all).
         let jfa_bbox = if need_render && !options.subregion_rects.is_empty() {
+            let rects = &options.subregion_rects;
+            let single_full = rects.len() == 1
+                && rects[0][0] <= 0.001
+                && rects[0][1] <= 0.001
+                && rects[0][2] >= 0.999
+                && rects[0][3] >= 0.999;
+            if single_full {
+                info!("single full-window subregion, using analytical SDF");
+                None
+            } else {
             let mut bbox = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
             for rect in &options.subregion_rects {
                 bbox[0] = bbox[0].min(rect[0]);
@@ -531,6 +543,7 @@ impl Blur {
             } else {
                 None
             }
+            } // end single_full else
         } else {
             None
         };
@@ -545,6 +558,7 @@ impl Blur {
             if let Some(mask_tex) = &self.mask_texture {
                 if need_render {
                     if let Some((bbx, bby, bbw, bbh)) = jfa_bbox {
+                        info!("rendering JFA mask: bbox {}x{}", bbw, bbh);
                         let mask_tex_id = mask_tex.tex_id();
                         render_jfa_mask(
                             gl,
@@ -558,6 +572,7 @@ impl Blur {
                             &self.jfa_textures,
                         );
                     } else {
+                        info!("rendering analytical SDF mask: {}x{}", mask_w, mask_h);
                         // Compile mask shader lazily, cache for reuse.
                         if self.mask_program.is_none() {
                             match compile_mask_program(gl) {

@@ -18,12 +18,15 @@ void main() {
     vec2 uv = v_coords;
 
     float best_dist = 0.0;
+    vec2 best_center = vec2(0.5);
 
     float aspect = niri_geo_size.y / niri_geo_size.x;
     vec2 iso = vec2(1.0, aspect);
-    float cr_iso = niri_corner_radius.x / niri_geo_size.x;
 
-    vec2 half_size = vec2(0.5);
+    float cr_iso = niri_corner_radius.x;
+    cr_iso /= niri_geo_size.x;
+
+    vec2 half_size = vec2(0.5, 0.5);
     vec2 half_iso = half_size * iso;
     float cr = min(cr_iso, min(half_iso.x, half_iso.y));
     float d = -sdRoundedRect((uv - 0.5) * iso, half_iso, cr);
@@ -39,7 +42,7 @@ void main() {
         return;
     }
 
-    vec2 to_center = vec2(0.5) - uv;
+    vec2 to_center = best_center - uv;
     frag_color = vec4(
         clamp(mask, 0.0, 1.0),
         to_center.x * 0.5 + 0.5,
