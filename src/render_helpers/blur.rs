@@ -228,6 +228,46 @@ struct MaskProgram {
     attrib_vert: ffi::types::GLint,
 }
 
+struct JfaBinaryProgram {
+    program: ffi::types::GLuint,
+    uniform_subregion_count: ffi::types::GLint,
+    uniform_subregion_rects: ffi::types::GLint,
+    uniform_mask_size: ffi::types::GLint,
+    uniform_bbox_origin: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+struct JfaInitProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+struct JfaStepProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_half_pixel: ffi::types::GLint,
+    uniform_step: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+struct JfaEncodeProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_max_dist: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+struct JfaPipeline {
+    binary_prog: JfaBinaryProgram,
+    init_prog: JfaInitProgram,
+    step_prog: JfaStepProgram,
+    encode_prog: JfaEncodeProgram,
+}
+
 const MASK_VERTICES: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 
 unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError> {
@@ -244,6 +284,59 @@ unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_binary(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/mask_binary.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaBinaryProgram {
+        program,
+        uniform_subregion_count: gl.GetUniformLocation(program, c"niri_subregion_count".as_ptr()),
+        uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
+        uniform_mask_size: gl.GetUniformLocation(program, c"niri_mask_size".as_ptr()),
+        uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_init(gl: &ffi::Gles2) -> Result<JfaInitProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_init.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaInitProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_step(gl: &ffi::Gles2) -> Result<JfaStepProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_step.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaStepProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_half_pixel: gl.GetUniformLocation(program, c"niri_half_pixel".as_ptr()),
+        uniform_step: gl.GetUniformLocation(program, c"niri_step".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_encode.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaEncodeProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
 
