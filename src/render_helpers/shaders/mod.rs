@@ -362,10 +362,7 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     }
 }
 
-pub fn set_custom_blur_program(
-    renderer: &mut GlesRenderer,
-    dir: Option<&str>,
-) {
+pub fn set_custom_blur_program(renderer: &mut GlesRenderer, dir: Option<&str>) {
     let program = dir.and_then(|dir| try_load_program(dir, renderer));
 
     if let Some(prev) = Shaders::get(renderer).replace_custom_blur_program(program) {
@@ -390,7 +387,10 @@ fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlur
         .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
         .ok()?;
 
-    info!("loaded custom blur shader with {} passes from {dir}", configs.len());
+    info!(
+        "loaded custom blur shader with {} passes from {dir}",
+        configs.len()
+    );
     Some(program)
 }
 

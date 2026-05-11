@@ -313,9 +313,11 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     let mut raw: Vec<[f32; 4]> = Vec::new();
                     for (tl, br) in sr.iter() {
                         let mut x1 = ((tl.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let mut y_raw_top = ((tl.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
+                        let mut y_raw_top =
+                            ((tl.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
                         let mut x2 = ((br.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let mut y_raw_bot = ((br.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
+                        let mut y_raw_bot =
+                            ((br.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
                         x1 = x1.clamp(0., 1.);
                         x2 = x2.clamp(0., 1.);
                         y_raw_top = y_raw_top.clamp(0., 1.);
@@ -334,12 +336,10 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 };
 
                 let light_pos = if let Some(ls) = &options.light_source {
-                    let sx = ((output_rect.size.w as f64 * ls.x as f64)
-                        - self.geometry.loc.x)
+                    let sx = ((output_rect.size.w as f64 * ls.x as f64) - self.geometry.loc.x)
                         / self.geometry.size.w;
                     let sy = 1.0
-                        - ((output_rect.size.h as f64 * ls.y as f64)
-                            - self.geometry.loc.y)
+                        - ((output_rect.size.h as f64 * ls.y as f64) - self.geometry.loc.y)
                             / self.geometry.size.h;
                     (sx as f32, sy as f32)
                 } else {

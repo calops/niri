@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context as _, ensure};
+use anyhow::{ensure, Context as _};
 
 #[derive(Debug, Clone)]
 pub struct CustomBlurPassConfig {
@@ -25,9 +25,7 @@ struct PipelineManifest {
     passes: Vec<PipelinePass>,
 }
 
-pub fn load_custom_blur_pipeline(
-    dir: &Path,
-) -> anyhow::Result<Vec<CustomBlurPassConfig>> {
+pub fn load_custom_blur_pipeline(dir: &Path) -> anyhow::Result<Vec<CustomBlurPassConfig>> {
     ensure!(
         dir.is_dir(),
         "custom shader path is not a directory: {}",
