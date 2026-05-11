@@ -223,8 +223,6 @@ impl CustomBlurProgram {
 #[derive(Debug)]
 struct MaskProgram {
     program: ffi::types::GLuint,
-    uniform_subregion_count: ffi::types::GLint,
-    uniform_subregion_rects: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
@@ -237,16 +235,12 @@ unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError
     let frag_src = include_str!("shaders/mask.frag");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
-    let subregion_count = c"niri_subregion_count";
-    let subregion_rects = c"niri_subregion_rects";
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
     let vert = c"vert";
 
     Ok(MaskProgram {
         program,
-        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
-        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
@@ -420,8 +414,6 @@ impl Blur {
 
             if let Some(mask_tex) = &self.mask_texture {
                 if need_render {
-                    let subregion_count = options.subregion_rects.len() as i32;
-
                     // Compile mask shader lazily, cache for reuse.
                     if self.mask_program.is_none() {
                         match compile_mask_program(gl) {
@@ -446,16 +438,6 @@ impl Blur {
                     );
 
                     gl.UseProgram(mask_prog.program);
-                    gl.Uniform1i(mask_prog.uniform_subregion_count, subregion_count);
-
-                    if subregion_count > 0 {
-                        gl.Uniform4fv(
-                            mask_prog.uniform_subregion_rects,
-                            subregion_count,
-                            options.subregion_rects.as_ptr() as *const f32,
-                        );
-                    }
-
                     gl.Uniform2f(mask_prog.uniform_geo_size, geo_size.0, geo_size.1);
                     gl.Uniform4f(
                         mask_prog.uniform_corner_radius,
