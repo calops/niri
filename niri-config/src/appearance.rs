@@ -1014,6 +1014,7 @@ pub struct Blur {
     pub noise: f64,
     pub saturation: f64,
     pub custom_shader: Option<String>,
+    pub light_source: Option<LightSource>,
 }
 
 impl Default for Blur {
@@ -1025,8 +1026,17 @@ impl Default for Blur {
             noise: 0.02,
             saturation: 1.5,
             custom_shader: None,
+            light_source: None,
         }
     }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct LightSource {
+    #[knuffel(argument)]
+    pub x: f32,
+    #[knuffel(argument)]
+    pub y: f32,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
@@ -1045,6 +1055,8 @@ pub struct BlurPart {
     pub saturation: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub custom_shader: Option<String>,
+    #[knuffel(child)]
+    pub light_source: Option<LightSource>,
 }
 
 impl MergeWith<BlurPart> for Blur {
@@ -1057,6 +1069,7 @@ impl MergeWith<BlurPart> for Blur {
         merge_clone!((self, part), passes);
         merge!((self, part), offset, noise, saturation);
         merge_clone_opt!((self, part), custom_shader);
+        merge_clone_opt!((self, part), light_source);
     }
 }
 

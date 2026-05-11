@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Bounce a floating window around the screen like a DVD screensaver.
+
+Usage: niri-bounce <WINDOW_ID> [--speed <px_per_frame>] [--fps <rate>]
+
+The window must be floating. If it isn't, the script will float it first.
+"""
+
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+
+
+def niri_msg(*args: str) -> str:
+    result = subprocess.run(
+        ["niri", "msg", *args],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NIRI_SOCKET": os.environ.get("NIRI_SOCKET", "")},
+    )
+    if result.returncode != 0:
+        print(f"niri msg failed: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout
+
+
+def niri_msg_json(msg_type: str):
+    return json.loads(niri_msg("--json", msg_type))
+
+
+def get_windows():
+    return niri_msg_json("windows")
+
+
+def get_outputs():
+    return niri_msg_json("outputs")
+
+
+def make_float(window_id: int):
+    niri_msg("action", "move-window-to-floating", "--id", str(window_id))
+
+
+def move_window(window_id: int, x: int, y: int):
+    niri_msg(
+        "action",
+        "move-floating-window",
+        "--id",
+        str(window_id),
+        "-x",
+        str(x),
+        "-y",
+        str(y),
+    )
+
+
+def find_output_for_window(window, outputs):
+    """Find which output the window is on by checking tile position."""
+    layout = window.get("layout", {})
+    tile_pos = layout.get("tile_pos_in_workspace_view")
+    if not tile_pos:
+        return next(iter(outputs.values()))
+
+    wx, wy = tile_pos[0], tile_pos[1]
+    ww, wh = layout.get("tile_size", [0, 0])
+    wcx, wcy = wx + ww / 2, wy + wh / 2
+
+    for out in outputs.values():
+        lo = out.get("logical")
+        if not lo:
+            continue
+        if (lo["x"] <= wcx <= lo["x"] + lo["width"]
+                and lo["y"] <= wcy <= lo["y"] + lo["height"]):
+            return out
+
+    return next(iter(outputs.values()))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <WINDOW_ID> [--speed <px>] [--fps <rate>]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        window_id = int(sys.argv[1])
+    except ValueError:
+        print(f"Invalid window ID: {sys.argv[1]}", file=sys.stderr)
+        sys.exit(1)
+
+    speed = 4
+    fps = 60
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--speed" and i + 1 < len(args):
+            speed = int(args[i + 1])
+            i += 2
+        elif args[i] == "--fps" and i + 1 < len(args):
+            fps = int(args[i + 1])
+            i += 2
+        else:
+            print(f"Unknown option: {args[i]}", file=sys.stderr)
+            sys.exit(1)
+
+    windows = get_windows()
+    target = None
+    for w in windows:
+        if w["id"] == window_id:
+            target = w
+            break
+
+    if target is None:
+        print(f"Window {window_id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    if not target.get("is_floating"):
+        print("Making window float...")
+        make_float(window_id)
+        time.sleep(0.2)
+        windows = get_windows()
+        for w in windows:
+            if w["id"] == window_id:
+                target = w
+                break
+
+    outputs = get_outputs()
+    out = find_output_for_window(target, outputs)
+    lo = out.get("logical", {})
+    out_x = lo.get("x", 0)
+    out_y = lo.get("y", 0)
+    out_w = lo.get("width", 1920)
+    out_h = lo.get("height", 1080)
+
+    layout = target.get("layout", {})
+    win_w = int(layout.get("tile_size", [200, 200])[0])
+    win_h = int(layout.get("tile_size", [200, 200])[1])
+
+    tile_pos = layout.get("tile_pos_in_workspace_view")
+    if tile_pos:
+        cur_x = tile_pos[0] - out_x
+        cur_y = tile_pos[1] - out_y
+    else:
+        cur_x = (out_w - win_w) // 2
+        cur_y = (out_h - win_h) // 2
+
+    dirs = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+    dx, dy = random.choice(dirs)
+
+    title = target.get("title") or target.get("app_id") or "unnamed"
+    print(f"Bouncing: {title}")
+    print(f"  window: {win_w}x{win_h}")
+    print(f"  output: {out_w}x{out_h} at ({out_x},{out_y})")
+    print(f"  speed:  {speed} px/frame")
+    print("Press Ctrl+C to stop")
+
+    max_x = out_w - win_w
+    max_y = out_h - win_h
+    sleep_time = 1.0 / fps
+
+    try:
+        while True:
+            cur_x += dx * speed
+            cur_y += dy * speed
+
+            if cur_x < 0:
+                cur_x = max(0, cur_x)
+                dx = abs(dx)
+            elif cur_x > max_x:
+                cur_x = min(max_x, cur_x)
+                dx = -abs(dx)
+
+            if cur_y < 0:
+                cur_y = max(0, cur_y)
+                dy = abs(dy)
+            elif cur_y > max_y:
+                cur_y = min(max_y, cur_y)
+                dy = -abs(dy)
+
+            # Bound with a tiny nudge to prevent getting stuck at edges
+            cur_x = max(0, min(max_x, cur_x))
+            cur_y = max(0, min(max_y, cur_y))
+
+            move_window(window_id, int(cur_x), int(cur_y))
+            time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

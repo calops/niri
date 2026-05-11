@@ -87,11 +87,12 @@ environment {
 blur {
     noise 0
     custom-shader "shaders/overshifted3"
+    light-source 0.0 0.333
 }
 
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-circle -o scrollbar=never"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-square -o scrollbar=never"
+spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-rounded -o scrollbar=never"
 
 binds {
   Mod+Ctrl+S          { screenshot-screen; }
@@ -188,8 +189,7 @@ window-rule {
   open-floating true
 }
 window-rule {
-  match app-id="^kitty$"
-  default-column-width { proportion 0.333330; }
+  match app-id="^kitty"
   open-floating true
   geometry-corner-radius 100 100 100 100
   background-effect {
@@ -197,6 +197,14 @@ window-rule {
     blur true
     noise 0.0
   }
+}
+window-rule {
+  match app-id="^kitty-circle$"
+  geometry-corner-radius 1000 1000 1000 1000
+}
+window-rule {
+  match app-id="^kitty-square$"
+  geometry-corner-radius 0 0 0 0
 }
 window-rule {
   match app-id="^bad_apple$"

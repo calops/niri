@@ -1679,6 +1679,7 @@ mod tests {
                 noise: 0.02,
                 saturation: 1.5,
                 custom_shader: None,
+                light_source: None,
             },
             gestures: Gestures {
                 dnd_edge_view_scroll: DndEdgeViewScroll {

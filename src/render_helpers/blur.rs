@@ -47,19 +47,7 @@ pub struct BlurOptions {
     pub corner_radius: [f32; 4],
     pub subregion_rects: Vec<[f32; 4]>,
     pub light_pos: (f32, f32),
-}
-
-impl From<niri_config::Blur> for BlurOptions {
-    fn from(config: niri_config::Blur) -> Self {
-        Self {
-            passes: config.passes,
-            offset: config.offset,
-            geo_size: (0.0, 0.0),
-            corner_radius: [0.0; 4],
-            subregion_rects: Vec::new(),
-            light_pos: (0.0, 0.0),
-        }
-    }
+    pub light_source: Option<niri_config::LightSource>,
 }
 
 impl BlurOptions {
@@ -77,6 +65,20 @@ impl BlurOptions {
     pub fn with_light_pos(mut self, pos: (f32, f32)) -> Self {
         self.light_pos = pos;
         self
+    }
+}
+
+impl From<niri_config::Blur> for BlurOptions {
+    fn from(config: niri_config::Blur) -> Self {
+        Self {
+            passes: config.passes,
+            offset: config.offset,
+            geo_size: (0.0, 0.0),
+            corner_radius: [0.0; 4],
+            subregion_rects: Vec::new(),
+            light_pos: (0.0, 0.0),
+            light_source: config.light_source,
+        }
     }
 }
 

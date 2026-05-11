@@ -382,13 +382,23 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     Vec::new()
                 };
 
+                let light_pos = if let Some(ls) = &options.light_source {
+                    let sx = ((output_rect.size.w as f64 * ls.x as f64)
+                        - self.geometry.loc.x)
+                        / self.geometry.size.w;
+                    let sy = 1.0
+                        - ((output_rect.size.h as f64 * ls.y as f64)
+                            - self.geometry.loc.y)
+                            / self.geometry.size.h;
+                    (sx as f32, sy as f32)
+                } else {
+                    (0.0, 0.0)
+                };
+
                 let options = options
                     .with_geometry(geo_size, corner_radius)
                     .with_subregion_rects(subregion_rects)
-                    .with_light_pos((
-                        (-self.geometry.loc.x / self.geometry.size.w) as f32,
-                        1.0 + (self.geometry.loc.y / self.geometry.size.h) as f32,
-                    ));
+                    .with_light_pos(light_pos);
                 match blur.render(renderer, framebuffer, options) {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {
