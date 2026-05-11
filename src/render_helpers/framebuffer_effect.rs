@@ -312,16 +312,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 let subregion_rects = if let Some(sr) = self.subregion.as_ref() {
                     let mut raw: Vec<[f32; 4]> = Vec::new();
                     for (tl, br) in sr.iter() {
-                        let mut x1 = ((tl.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let mut y_raw_top =
+                        let x1 = ((tl.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
+                        let y_raw_top =
                             ((tl.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
-                        let mut x2 = ((br.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let mut y_raw_bot =
+                        let x2 = ((br.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
+                        let y_raw_bot =
                             ((br.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
-                        x1 = x1.clamp(0., 1.);
-                        x2 = x2.clamp(0., 1.);
-                        y_raw_top = y_raw_top.clamp(0., 1.);
-                        y_raw_bot = y_raw_bot.clamp(0., 1.);
                         let y1 = 1.0 - y_raw_bot;
                         let y2 = 1.0 - y_raw_top;
                         if x2 <= x1 || y2 <= y1 {
