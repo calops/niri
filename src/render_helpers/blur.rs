@@ -281,10 +281,11 @@ struct JfaDensityBlurProgram {
 struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
-    uniform_density: ffi::types::GLint,
+    uniform_sdf_mip: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_max_dist: ffi::types::GLint,
-    uniform_edge_threshold_px: ffi::types::GLint,
+    uniform_lod_base: ffi::types::GLint,
+    uniform_max_lod: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -293,7 +294,7 @@ struct JfaPipeline {
     binary_prog: JfaBinaryProgram,
     init_prog: JfaInitProgram,
     step_prog: JfaStepProgram,
-    density_prog: JfaDensityBlurProgram,
+    sdf_bake_prog: JfaSdfBakeProgram,
     encode_prog: JfaEncodeProgram,
 }
 
@@ -305,10 +306,8 @@ struct JfaTextures {
     jfa_a: GlesTexture,
     /// JFA ping-pong B.
     jfa_b: GlesTexture,
-    /// Density blur horizontal intermediate (R=low, G=high).
-    density_h: GlesTexture,
-    /// Density blur final (R=low, G=high).
-    density: GlesTexture,
+    /// Scalar SDF (R channel), mipmapped for per-pixel LoD sampling in encode.
+    sdf: GlesTexture,
     /// Final encoded output (R=normalized SDF, GB=encoded direction).
     encoded: GlesTexture,
     /// Bbox size these textures were allocated for.
@@ -408,13 +407,11 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
     Ok(JfaEncodeProgram {
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_density: gl.GetUniformLocation(program, c"niri_density".as_ptr()),
+        uniform_sdf_mip: gl.GetUniformLocation(program, c"niri_sdf_mip".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
-        uniform_edge_threshold_px: gl.GetUniformLocation(
-            program,
-            c"niri_edge_threshold_px".as_ptr(),
-        ),
+        uniform_lod_base: gl.GetUniformLocation(program, c"niri_lod_base".as_ptr()),
+        uniform_max_lod: gl.GetUniformLocation(program, c"niri_max_lod".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -618,8 +615,7 @@ impl Blur {
                             bin: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             jfa_a: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             jfa_b: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            density_h: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            density: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                            sdf: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             encoded: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             size: bbox_size,
                         });
@@ -895,25 +891,30 @@ fn render_jfa_mask(
             bbw,
             bbh,
         );
-        compute_density(
+        // Compute the normalization scale once — used both by the SDF bake
+        // (so the baked texture is in [0, 1]) and by encode_output (so the
+        // mask R channel uses the same scale).
+        let max_dist = (max(1, min(bbw, bbh)) as f32) / 2.0;
+
+        bake_sdf(
             gl,
-            &pipeline.density_prog,
+            &pipeline.sdf_bake_prog,
             jfa_result,
-            &textures.density_h,
-            &textures.density,
+            &textures.sdf,
             bbw,
             bbh,
-            2,
-            20,
+            max_dist,
         );
+        generate_sdf_mipmaps(gl, &textures.sdf);
         encode_output(
             gl,
             &pipeline.encode_prog,
             jfa_result,
-            &textures.density,
+            &textures.sdf,
             &textures.encoded,
             bbw,
             bbh,
+            max_dist,
         );
         blit_to_mask_texture(
             gl,
@@ -965,7 +966,7 @@ unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipe
             binary_prog: compile_jfa_binary(gl)?,
             init_prog: compile_jfa_init(gl)?,
             step_prog: compile_jfa_step(gl)?,
-            density_prog: compile_jfa_density_blur(gl)?,
+            sdf_bake_prog: compile_jfa_sdf_bake(gl)?,
             encode_prog: compile_jfa_encode(gl)?,
         })
     })() {
@@ -1148,72 +1149,16 @@ unsafe fn run_jfa_steps<'a>(
     read_tex
 }
 
-// Computes a two-scale smoothed-distance field. The horizontal pass reads the
-// JFA result (per-pixel nearest exterior coord) and stores the per-sample
-// distance, blurred horizontally with two radii. The vertical pass reads that
-// intermediate and blurs vertically. Output: R = small-radius blur (sharp near
-// boundary), G = large-radius blur (smooth interior). The gradient of each
-// gives an inward-pointing vector at every interior pixel — including deep in
-// the rect, where blurring a binary mask would produce a flat 1.0 with zero
-// gradient.
-unsafe fn compute_density(
+// Bakes the JFA result into a scalar normalized SDF texture (R channel).
+// dc / max_dist clamped to [0, 1]. Exterior pixels get 0.
+unsafe fn bake_sdf(
     gl: &ffi::Gles2,
-    prog: &JfaDensityBlurProgram,
-    jfa_input: &GlesTexture,
-    h_intermediate: &GlesTexture,
-    final_density: &GlesTexture,
-    bbw: i32,
-    bbh: i32,
-    radius_low: i32,
-    radius_high: i32,
-) {
-    let pass = |src: &GlesTexture, dst: &GlesTexture, axis: i32| {
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            dst.tex_id(),
-            0,
-        );
-
-        gl.UseProgram(prog.program);
-        gl.Uniform1i(prog.uniform_input, 0);
-        gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
-        gl.Uniform1i(prog.uniform_axis, axis);
-        gl.Uniform1i(prog.uniform_radius_low, radius_low);
-        gl.Uniform1i(prog.uniform_radius_high, radius_high);
-
-        gl.Viewport(0, 0, bbw, bbh);
-        gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-
-        gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            prog.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(prog.attrib_vert as u32);
-    };
-
-    pass(jfa_input, h_intermediate, 0);
-    pass(h_intermediate, final_density, 1);
-}
-
-unsafe fn encode_output(
-    gl: &ffi::Gles2,
-    prog: &JfaEncodeProgram,
+    prog: &JfaSdfBakeProgram,
     jfa: &GlesTexture,
-    density: &GlesTexture,
     dst: &GlesTexture,
     bbw: i32,
     bbh: i32,
+    max_dist: f32,
 ) {
     gl.FramebufferTexture2D(
         ffi::DRAW_FRAMEBUFFER,
@@ -1225,23 +1170,108 @@ unsafe fn encode_output(
 
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_input, 0);
-    gl.Uniform1i(prog.uniform_density, 1);
     gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
-    // Bbox-relative normalization: deep interior reads near R=1.0 regardless
-    // of bbox aspect.
-    gl.Uniform1f(prog.uniform_max_dist, (max(1, min(bbw, bbh)) as f32) / 2.0);
-    // Pixel distance over which the blend transitions from sharp (low-radius)
-    // gradient to smooth (high-radius) gradient.
-    gl.Uniform1f(prog.uniform_edge_threshold_px, 20.0);
+    gl.Uniform1f(prog.uniform_max_dist, max_dist);
+
+    gl.Viewport(0, 0, bbw, bbh);
+    gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
+// Generates the full mipmap chain for the SDF texture. Smithay creates the
+// texture with only level 0; glGenerateMipmap lazily allocates and fills the
+// rest. Min-filter must be set to a mipmap variant before generation so the
+// driver knows to build the chain.
+unsafe fn generate_sdf_mipmaps(gl: &ffi::Gles2, sdf: &GlesTexture) {
+    gl.BindTexture(ffi::TEXTURE_2D, sdf.tex_id());
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::LINEAR_MIPMAP_LINEAR as i32,
+    );
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.GenerateMipmap(ffi::TEXTURE_2D);
+}
+
+unsafe fn encode_output(
+    gl: &ffi::Gles2,
+    prog: &JfaEncodeProgram,
+    jfa: &GlesTexture,
+    sdf_mip: &GlesTexture,
+    dst: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+    max_dist: f32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform1i(prog.uniform_sdf_mip, 1);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+    gl.Uniform1f(prog.uniform_max_dist, max_dist);
+
+    // LoD scaling: a pixel at depth `2^k * lod_base` samples mip k. With
+    // lod_base = 4, depths 4 / 8 / 16 / 32 / 64 / 128 px map to mip 0 / 1 / 2
+    // / 3 / 4 / 5. Tunable in this one spot.
+    let lod_base: f32 = 4.0;
+    let mip_count = (max(bbw, bbh) as f32).log2().floor();
+    gl.Uniform1f(prog.uniform_lod_base, lod_base);
+    gl.Uniform1f(prog.uniform_max_lod, mip_count);
 
     gl.Viewport(0, 0, bbw, bbh);
 
+    // Bind the mipmapped SDF on TEXTURE1 with mipmap-aware sampler params.
+    // generate_sdf_mipmaps already set these, but re-asserting them costs
+    // nothing and protects against accidental state mutation between passes.
     gl.ActiveTexture(ffi::TEXTURE1);
-    gl.BindTexture(ffi::TEXTURE_2D, density.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.BindTexture(ffi::TEXTURE_2D, sdf_mip.tex_id());
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::LINEAR_MIPMAP_LINEAR as i32,
+    );
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
 
