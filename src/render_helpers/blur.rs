@@ -258,20 +258,24 @@ struct JfaStepProgram {
 }
 
 #[derive(Debug)]
-struct JfaEncodeProgram {
+struct JfaDensityBlurProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
-    uniform_seeds: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
-    uniform_max_dist: ffi::types::GLint,
+    uniform_axis: ffi::types::GLint,
+    uniform_radius_low: ffi::types::GLint,
+    uniform_radius_high: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
 #[derive(Debug)]
-struct JfaBlurProgram {
+struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
+    uniform_density: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
+    uniform_max_dist: ffi::types::GLint,
+    uniform_edge_threshold_px: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -280,7 +284,7 @@ struct JfaPipeline {
     binary_prog: JfaBinaryProgram,
     init_prog: JfaInitProgram,
     step_prog: JfaStepProgram,
-    blur_prog: JfaBlurProgram,
+    density_prog: JfaDensityBlurProgram,
     encode_prog: JfaEncodeProgram,
 }
 
@@ -342,14 +346,17 @@ unsafe fn compile_jfa_step(gl: &ffi::Gles2) -> Result<JfaStepProgram, GlesError>
     })
 }
 
-unsafe fn compile_jfa_blur(gl: &ffi::Gles2) -> Result<JfaBlurProgram, GlesError> {
+unsafe fn compile_jfa_density_blur(gl: &ffi::Gles2) -> Result<JfaDensityBlurProgram, GlesError> {
     let vert_src = include_str!("shaders/blur_custom.vert");
-    let frag_src = include_str!("shaders/jfa_blur.frag");
+    let frag_src = include_str!("shaders/jfa_density_blur.frag");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
-    Ok(JfaBlurProgram {
+    Ok(JfaDensityBlurProgram {
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_axis: gl.GetUniformLocation(program, c"niri_axis".as_ptr()),
+        uniform_radius_low: gl.GetUniformLocation(program, c"niri_radius_low".as_ptr()),
+        uniform_radius_high: gl.GetUniformLocation(program, c"niri_radius_high".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -361,9 +368,13 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
     Ok(JfaEncodeProgram {
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_seeds: gl.GetUniformLocation(program, c"niri_seeds".as_ptr()),
+        uniform_density: gl.GetUniformLocation(program, c"niri_density".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
+        uniform_edge_threshold_px: gl.GetUniformLocation(
+            program,
+            c"niri_edge_threshold_px".as_ptr(),
+        ),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -816,7 +827,7 @@ fn render_jfa_mask(
                     binary_prog: compile_jfa_binary(gl)?,
                     init_prog: compile_jfa_init(gl)?,
                     step_prog: compile_jfa_step(gl)?,
-                    blur_prog: compile_jfa_blur(gl)?,
+                    density_prog: compile_jfa_density_blur(gl)?,
                     encode_prog: compile_jfa_encode(gl)?,
                 })
             })() {
@@ -988,7 +999,11 @@ fn render_jfa_mask(
             ffi::CLAMP_TO_EDGE as i32,
         );
 
-        let mut step = max_dim;
+        // JFA with power-of-two steps.
+        let mut step = 1;
+        while step * 2 <= max_dim {
+            step *= 2;
+        }
         let mut read_idx = 1;
         let mut write_idx = 2;
 
@@ -1012,85 +1027,38 @@ fn render_jfa_mask(
 
             gl.Viewport(0, 0, bbw, bbh);
             gl.BindTexture(ffi::TEXTURE_2D, tex[read_idx].tex_id());
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
             gl.EnableVertexAttribArray(pipeline.step_prog.attrib_vert as u32);
             gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-            gl.VertexAttribPointer(
-                pipeline.step_prog.attrib_vert as u32,
-                2,
-                ffi::FLOAT,
-                ffi::FALSE,
-                0,
-                MASK_VERTICES.as_ptr().cast(),
-            );
+            gl.VertexAttribPointer(pipeline.step_prog.attrib_vert as u32, 2, ffi::FLOAT, ffi::FALSE, 0, MASK_VERTICES.as_ptr().cast());
             gl.DrawArrays(ffi::TRIANGLES, 0, 6);
             gl.DisableVertexAttribArray(pipeline.step_prog.attrib_vert as u32);
 
             gl.BindTexture(ffi::TEXTURE_2D, tex[write_idx].tex_id());
-            gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_MIN_FILTER,
-                ffi::NEAREST as i32,
-            );
-            gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_MAG_FILTER,
-                ffi::NEAREST as i32,
-            );
-            gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_WRAP_S,
-                ffi::CLAMP_TO_EDGE as i32,
-            );
-            gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_WRAP_T,
-                ffi::CLAMP_TO_EDGE as i32,
-            );
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
 
             std::mem::swap(&mut read_idx, &mut write_idx);
             step /= 2;
         }
 
+        // tex[0] = binary mask (unchanged since init read from it)
+        // tex[read_idx] = JFA distance field
+        // tex[3], tex[4] = density blur destinations
+        // tex[5] = temp for separable blur intermediate
 
-        // Blur the JFA output to smooth the medial axis.
+        // Encode: reads JFA tex[read_idx], writes tex[0].
         gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            tex[3].tex_id(),
-            0,
-        );
-
-        gl.UseProgram(pipeline.blur_prog.program);
-        gl.Uniform1i(pipeline.blur_prog.uniform_input, 0);
-        gl.Uniform2f(pipeline.blur_prog.uniform_output_size, bbw as f32, bbh as f32);
-
-        gl.Viewport(0, 0, bbw, bbh);
-        gl.BindTexture(ffi::TEXTURE_2D, tex[read_idx].tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-        gl.EnableVertexAttribArray(pipeline.blur_prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(pipeline.blur_prog.attrib_vert as u32, 2, ffi::FLOAT, ffi::FALSE, 0, MASK_VERTICES.as_ptr().cast());
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.blur_prog.attrib_vert as u32);
-
-        // Encode directly from raw JFA output.
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            tex[0].tex_id(),
-            0,
+            ffi::DRAW_FRAMEBUFFER, ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D, tex[0].tex_id(), 0,
         );
 
         gl.UseProgram(pipeline.encode_prog.program);
         gl.Uniform1i(pipeline.encode_prog.uniform_input, 0);
-        gl.Uniform2f(
-            pipeline.encode_prog.uniform_output_size,
-            bbw as f32,
-            bbh as f32,
-        );
+        gl.Uniform2f(pipeline.encode_prog.uniform_output_size, bbw as f32, bbh as f32);
         gl.Uniform1f(pipeline.encode_prog.uniform_max_dist, max_dim as f32 / 2.0);
 
         gl.Viewport(0, 0, bbw, bbh);
@@ -1108,7 +1076,7 @@ fn render_jfa_mask(
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
         gl.DisableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
 
-
+        // Blit encoded result (tex[0]) to mask texture.
         let mut read_fbo = 0u32;
         gl.GenFramebuffers(1, &mut read_fbo);
         gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, read_fbo);
@@ -1128,7 +1096,6 @@ fn render_jfa_mask(
             0,
         );
 
-        // Blit interior of JFA output into mask texture at the region's screen position.
         gl.BlitFramebuffer(
             1, 1, bbw - 1, bbh - 1,
             blit_x1, blit_y1, blit_x2, blit_y2,
