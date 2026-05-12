@@ -267,6 +267,52 @@ struct JfaSdfBakeProgram {
 }
 
 #[derive(Debug)]
+struct JfaPoissonInitRhsProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct JfaPoissonRestrictMaskProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_src_texel: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct JfaPoissonJacobiProgram {
+    program: ffi::types::GLuint,
+    uniform_u_in: ffi::types::GLint,
+    uniform_rhs: ffi::types::GLint,
+    uniform_texel: ffi::types::GLint,
+    uniform_h_sq: ffi::types::GLint,
+    uniform_omega: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct JfaPoissonResidualRestrictProgram {
+    program: ffi::types::GLuint,
+    uniform_u_fine: ffi::types::GLint,
+    uniform_rhs_fine: ffi::types::GLint,
+    uniform_mask_coarse: ffi::types::GLint,
+    uniform_fine_texel: ffi::types::GLint,
+    uniform_h_sq_fine: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct JfaPoissonProlongateProgram {
+    program: ffi::types::GLuint,
+    uniform_u_fine: ffi::types::GLint,
+    uniform_correction: ffi::types::GLint,
+    uniform_rhs_fine: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
 struct JfaSdfDownsampleProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
@@ -279,11 +325,9 @@ struct JfaSdfDownsampleProgram {
 struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
-    uniform_sdf_mip: ffi::types::GLint,
+    uniform_poisson_u: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_max_dist: ffi::types::GLint,
-    uniform_lod_base: ffi::types::GLint,
-    uniform_max_lod: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -293,8 +337,24 @@ struct JfaPipeline {
     init_prog: JfaInitProgram,
     step_prog: JfaStepProgram,
     sdf_bake_prog: JfaSdfBakeProgram,
-    sdf_downsample_prog: JfaSdfDownsampleProgram,
+    poisson_init_rhs_prog: JfaPoissonInitRhsProgram,
+    poisson_restrict_mask_prog: JfaPoissonRestrictMaskProgram,
+    poisson_jacobi_prog: JfaPoissonJacobiProgram,
+    poisson_residual_restrict_prog: JfaPoissonResidualRestrictProgram,
+    poisson_prolongate_prog: JfaPoissonProlongateProgram,
     encode_prog: JfaEncodeProgram,
+}
+
+#[derive(Debug)]
+struct MultigridLevel {
+    /// Ping-pong A for the solution `u` (R channel).
+    u_a: GlesTexture,
+    /// Ping-pong B for the solution `u` (R channel).
+    u_b: GlesTexture,
+    /// Packed RHS: R = `f` (forcing function), G = mask.
+    rhs: GlesTexture,
+    /// Level size.
+    size: Size<i32, Buffer>,
 }
 
 #[derive(Debug)]
@@ -305,8 +365,10 @@ struct JfaTextures {
     jfa_a: GlesTexture,
     /// JFA ping-pong B.
     jfa_b: GlesTexture,
-    /// Scalar SDF (R channel), mipmapped for per-pixel LoD sampling in encode.
+    /// Scalar SDF (R channel) baked from JFA; sampled by encode for R.
     sdf: GlesTexture,
+    /// Multigrid pyramid. Index 0 is the finest (bbox-sized) level.
+    pyramid: Vec<MultigridLevel>,
     /// Final encoded output (R=normalized SDF, GB=encoded direction).
     encoded: GlesTexture,
     /// Bbox size these textures were allocated for.
@@ -384,6 +446,82 @@ unsafe fn compile_jfa_sdf_bake(gl: &ffi::Gles2) -> Result<JfaSdfBakeProgram, Gle
     })
 }
 
+unsafe fn compile_jfa_poisson_init_rhs(
+    gl: &ffi::Gles2,
+) -> Result<JfaPoissonInitRhsProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_poisson_init_rhs.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaPoissonInitRhsProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_poisson_restrict_mask(
+    gl: &ffi::Gles2,
+) -> Result<JfaPoissonRestrictMaskProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_poisson_restrict_mask.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaPoissonRestrictMaskProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_src_texel: gl.GetUniformLocation(program, c"niri_src_texel".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_poisson_jacobi(
+    gl: &ffi::Gles2,
+) -> Result<JfaPoissonJacobiProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_poisson_jacobi.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaPoissonJacobiProgram {
+        program,
+        uniform_u_in: gl.GetUniformLocation(program, c"niri_u_in".as_ptr()),
+        uniform_rhs: gl.GetUniformLocation(program, c"niri_rhs".as_ptr()),
+        uniform_texel: gl.GetUniformLocation(program, c"niri_texel".as_ptr()),
+        uniform_h_sq: gl.GetUniformLocation(program, c"niri_h_sq".as_ptr()),
+        uniform_omega: gl.GetUniformLocation(program, c"niri_omega".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_poisson_residual_restrict(
+    gl: &ffi::Gles2,
+) -> Result<JfaPoissonResidualRestrictProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_poisson_residual_restrict.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaPoissonResidualRestrictProgram {
+        program,
+        uniform_u_fine: gl.GetUniformLocation(program, c"niri_u_fine".as_ptr()),
+        uniform_rhs_fine: gl.GetUniformLocation(program, c"niri_rhs_fine".as_ptr()),
+        uniform_mask_coarse: gl.GetUniformLocation(program, c"niri_mask_coarse".as_ptr()),
+        uniform_fine_texel: gl.GetUniformLocation(program, c"niri_fine_texel".as_ptr()),
+        uniform_h_sq_fine: gl.GetUniformLocation(program, c"niri_h_sq_fine".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_poisson_prolongate(
+    gl: &ffi::Gles2,
+) -> Result<JfaPoissonProlongateProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_poisson_prolongate.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaPoissonProlongateProgram {
+        program,
+        uniform_u_fine: gl.GetUniformLocation(program, c"niri_u_fine".as_ptr()),
+        uniform_correction: gl.GetUniformLocation(program, c"niri_correction".as_ptr()),
+        uniform_rhs_fine: gl.GetUniformLocation(program, c"niri_rhs_fine".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
 unsafe fn compile_jfa_sdf_downsample(
     gl: &ffi::Gles2,
 ) -> Result<JfaSdfDownsampleProgram, GlesError> {
@@ -406,11 +544,9 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
     Ok(JfaEncodeProgram {
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_sdf_mip: gl.GetUniformLocation(program, c"niri_sdf_mip".as_ptr()),
+        uniform_poisson_u: gl.GetUniformLocation(program, c"niri_poisson_u".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
-        uniform_lod_base: gl.GetUniformLocation(program, c"niri_lod_base".as_ptr()),
-        uniform_max_lod: gl.GetUniformLocation(program, c"niri_max_lod".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -610,11 +746,37 @@ impl Blur {
                         None => true,
                     };
                     if need_alloc {
+                        // Build the multigrid pyramid sized to the bbox.
+                        // Level 0 is bbox_size; each subsequent level halves
+                        // both dimensions (floor, min 1). Stop at K=5 or
+                        // when the level would degenerate to 1×1.
+                        let pyramid_max_levels = 6usize;
+                        let mut pyramid: Vec<MultigridLevel> =
+                            Vec::with_capacity(pyramid_max_levels);
+                        for k in 0..pyramid_max_levels {
+                            let mw = std::cmp::max(1, bbw >> k);
+                            let mh = std::cmp::max(1, bbh >> k);
+                            let lvl_size = Size::new(mw, mh);
+                            pyramid.push(MultigridLevel {
+                                u_a: renderer
+                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                                u_b: renderer
+                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                                rhs: renderer
+                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                                size: lvl_size,
+                            });
+                            if mw == 1 || mh == 1 {
+                                break;
+                            }
+                        }
+
                         self.jfa_textures = Some(JfaTextures {
                             bin: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             jfa_a: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             jfa_b: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             sdf: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                            pyramid,
                             encoded: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
                             size: bbox_size,
                         });
@@ -904,23 +1066,52 @@ fn render_jfa_mask(
             bbh,
             max_dist,
         );
-        let mip_count = generate_sdf_mipmaps(
+
+        // Multigrid Poisson solve for the direction field.
+        // 1. Write level-0 RHS from binary mask.
+        // 2. Restrict the mask through the pyramid.
+        // 3. Zero all u_a textures (initial guess u = 0).
+        // 4. Run one V-cycle.
+        init_rhs_level0(
             gl,
-            &pipeline.sdf_downsample_prog,
-            &textures.sdf,
-            bbw,
-            bbh,
+            &pipeline.poisson_init_rhs_prog,
+            &textures.bin,
+            &textures.pyramid[0].rhs,
+            textures.pyramid[0].size.w,
+            textures.pyramid[0].size.h,
         );
+        restrict_mask_pyramid(
+            gl,
+            &pipeline.poisson_restrict_mask_prog,
+            &textures.pyramid,
+        );
+        for lvl in &textures.pyramid {
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                lvl.u_a.tex_id(),
+                0,
+            );
+            gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+            gl.Clear(ffi::COLOR_BUFFER_BIT);
+        }
+        let final_u_idx = run_v_cycle(gl, pipeline, &textures.pyramid, 3, 3, 0.8);
+        let poisson_u = if final_u_idx == 0 {
+            &textures.pyramid[0].u_a
+        } else {
+            &textures.pyramid[0].u_b
+        };
+
         encode_output(
             gl,
             &pipeline.encode_prog,
             jfa_result,
-            &textures.sdf,
+            poisson_u,
             &textures.encoded,
             bbw,
             bbh,
             max_dist,
-            mip_count,
         );
         blit_to_mask_texture(
             gl,
@@ -973,7 +1164,11 @@ unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipe
             init_prog: compile_jfa_init(gl)?,
             step_prog: compile_jfa_step(gl)?,
             sdf_bake_prog: compile_jfa_sdf_bake(gl)?,
-            sdf_downsample_prog: compile_jfa_sdf_downsample(gl)?,
+            poisson_init_rhs_prog: compile_jfa_poisson_init_rhs(gl)?,
+            poisson_restrict_mask_prog: compile_jfa_poisson_restrict_mask(gl)?,
+            poisson_jacobi_prog: compile_jfa_poisson_jacobi(gl)?,
+            poisson_residual_restrict_prog: compile_jfa_poisson_residual_restrict(gl)?,
+            poisson_prolongate_prog: compile_jfa_poisson_prolongate(gl)?,
             encode_prog: compile_jfa_encode(gl)?,
         })
     })() {
@@ -1199,6 +1394,420 @@ unsafe fn bake_sdf(
     gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 }
 
+// Writes pyramid[0].rhs from the binary mask:
+//   R = 1 inside mask, 0 outside
+//   G = mask (1 inside, 0 outside)
+unsafe fn init_rhs_level0(
+    gl: &ffi::Gles2,
+    prog: &JfaPoissonInitRhsProgram,
+    bin: &GlesTexture,
+    dst_rhs: &GlesTexture,
+    level_w: i32,
+    level_h: i32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst_rhs.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+
+    gl.Viewport(0, 0, level_w, level_h);
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, bin.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
+// For each pyramid level k = 1..pyramid.len(), box-downsamples the mask
+// from level k-1's rhs into level k's rhs. Both R (`f`) and G (mask) are
+// box-averaged; later residual_restrict overwrites R, but the mask in G
+// is needed by the Jacobi smoother at all coarser levels.
+unsafe fn restrict_mask_pyramid(
+    gl: &ffi::Gles2,
+    prog: &JfaPoissonRestrictMaskProgram,
+    pyramid: &[MultigridLevel],
+) {
+    if pyramid.len() < 2 {
+        return;
+    }
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+
+    for k in 1..pyramid.len() {
+        let src = &pyramid[k - 1];
+        let dst = &pyramid[k];
+
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            dst.rhs.tex_id(),
+            0,
+        );
+
+        gl.Uniform2f(
+            prog.uniform_src_texel,
+            1.0 / src.size.w as f32,
+            1.0 / src.size.h as f32,
+        );
+
+        gl.BindTexture(ffi::TEXTURE_2D, src.rhs.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+
+        gl.Viewport(0, 0, dst.size.w, dst.size.h);
+        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    }
+
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
+// Runs `sweeps` weighted-Jacobi sweeps on pyramid[level], ping-ponging
+// between u_a and u_b. Returns the index (0 = u_a, 1 = u_b) of the
+// texture holding the latest u.
+unsafe fn jacobi_smooth(
+    gl: &ffi::Gles2,
+    prog: &JfaPoissonJacobiProgram,
+    pyramid: &[MultigridLevel],
+    level: usize,
+    sweeps: i32,
+    current_u_idx: usize,
+    omega: f32,
+) -> usize {
+    let lvl = &pyramid[level];
+    let h_sq = (1u64 << (2 * level)) as f32; // h^2 = (2^level)^2 = 4^level
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_u_in, 0);
+    gl.Uniform1i(prog.uniform_rhs, 1);
+    gl.Uniform2f(
+        prog.uniform_texel,
+        1.0 / lvl.size.w as f32,
+        1.0 / lvl.size.h as f32,
+    );
+    gl.Uniform1f(prog.uniform_h_sq, h_sq);
+    gl.Uniform1f(prog.uniform_omega, omega);
+
+    // RHS stays bound on TEXTURE1 across all sweeps.
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, lvl.rhs.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+
+    let mut current = current_u_idx;
+    for _ in 0..sweeps {
+        let (src, dst) = if current == 0 {
+            (&lvl.u_a, &lvl.u_b)
+        } else {
+            (&lvl.u_b, &lvl.u_a)
+        };
+
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            dst.tex_id(),
+            0,
+        );
+
+        gl.ActiveTexture(ffi::TEXTURE0);
+        gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+        gl.Viewport(0, 0, lvl.size.w, lvl.size.h);
+        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+
+        current = 1 - current;
+    }
+
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    current
+}
+
+// Computes residual at fine level and box-restricts it into the coarse
+// level's rhs.R. The coarse mask (rhs.G) is preserved.
+//
+// Resets coarse-level u_a to zero (correction equation `L e = r` starts
+// from e = 0). Returns nothing; caller assumes coarse u_idx = 0.
+unsafe fn residual_restrict(
+    gl: &ffi::Gles2,
+    prog: &JfaPoissonResidualRestrictProgram,
+    pyramid: &[MultigridLevel],
+    fine_level: usize,
+    fine_u_idx: usize,
+) {
+    let fine = &pyramid[fine_level];
+    let coarse = &pyramid[fine_level + 1];
+    let fine_u = if fine_u_idx == 0 { &fine.u_a } else { &fine.u_b };
+    let h_sq_fine = (1u64 << (2 * fine_level)) as f32;
+
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        coarse.rhs.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_u_fine, 0);
+    gl.Uniform1i(prog.uniform_rhs_fine, 1);
+    gl.Uniform1i(prog.uniform_mask_coarse, 2);
+    gl.Uniform2f(
+        prog.uniform_fine_texel,
+        1.0 / fine.size.w as f32,
+        1.0 / fine.size.h as f32,
+    );
+    gl.Uniform1f(prog.uniform_h_sq_fine, h_sq_fine);
+
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, fine_u.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, fine.rhs.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.ActiveTexture(ffi::TEXTURE2);
+    // Mask read from the same texture we're writing to. Per GL spec this
+    // is undefined; in practice drivers return pre-draw values for
+    // non-MSAA single-sample textures. Fallback documented in design
+    // notes if this manifests as artefacts.
+    gl.BindTexture(ffi::TEXTURE_2D, coarse.rhs.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+
+    gl.Viewport(0, 0, coarse.size.w, coarse.size.h);
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    // Reset coarse u_a to zero so subsequent smoothing solves the
+    // correction equation from e = 0.
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        coarse.u_a.tex_id(),
+        0,
+    );
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(ffi::COLOR_BUFFER_BIT);
+}
+
+// Bilinear-upsamples the coarse-level correction and adds it into the
+// fine-level solution. Writes into the OPPOSITE of `fine_u_idx`; returns
+// the new fine u idx.
+unsafe fn prolongate(
+    gl: &ffi::Gles2,
+    prog: &JfaPoissonProlongateProgram,
+    pyramid: &[MultigridLevel],
+    fine_level: usize,
+    fine_u_idx: usize,
+    coarse_u_idx: usize,
+) -> usize {
+    let fine = &pyramid[fine_level];
+    let coarse = &pyramid[fine_level + 1];
+    let fine_u = if fine_u_idx == 0 { &fine.u_a } else { &fine.u_b };
+    let fine_dst = if fine_u_idx == 0 { &fine.u_b } else { &fine.u_a };
+    let coarse_u = if coarse_u_idx == 0 {
+        &coarse.u_a
+    } else {
+        &coarse.u_b
+    };
+
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        fine_dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_u_fine, 0);
+    gl.Uniform1i(prog.uniform_correction, 1);
+    gl.Uniform1i(prog.uniform_rhs_fine, 2);
+
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, fine_u.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, coarse_u.tex_id());
+    // LINEAR upsampling for the coarse correction — this is the bilinear
+    // prolongation operator.
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+
+    gl.ActiveTexture(ffi::TEXTURE2);
+    gl.BindTexture(ffi::TEXTURE_2D, fine.rhs.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+
+    gl.Viewport(0, 0, fine.size.w, fine.size.h);
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    1 - fine_u_idx
+}
+
+// Runs one full V-cycle on the multigrid pyramid. Returns the index
+// (0 or 1) of the level-0 `u_a`/`u_b` texture that contains the final
+// solution.
+//
+// Caller must have:
+//   1. Initialised pyramid[0].rhs via init_rhs_level0.
+//   2. Restricted the mask through the pyramid via restrict_mask_pyramid.
+//   3. Cleared all pyramid[k].u_a to zero (initial guess u = 0 for k=0,
+//      correction initial guess e = 0 for k > 0).
+unsafe fn run_v_cycle(
+    gl: &ffi::Gles2,
+    pipeline: &JfaPipeline,
+    pyramid: &[MultigridLevel],
+    n_pre: i32,
+    n_post: i32,
+    omega: f32,
+) -> usize {
+    let k_max = pyramid.len() - 1;
+    let mut u_idx: Vec<usize> = vec![0; pyramid.len()];
+
+    // Down sweep.
+    for k in 0..k_max {
+        u_idx[k] = jacobi_smooth(
+            gl,
+            &pipeline.poisson_jacobi_prog,
+            pyramid,
+            k,
+            n_pre,
+            u_idx[k],
+            omega,
+        );
+        residual_restrict(
+            gl,
+            &pipeline.poisson_residual_restrict_prog,
+            pyramid,
+            k,
+            u_idx[k],
+        );
+        // residual_restrict zeroed coarse.u_a, so the coarse level
+        // starts from u_idx = 0.
+        u_idx[k + 1] = 0;
+    }
+
+    // Coarsest level — over-smooth as a stand-in for direct solve.
+    u_idx[k_max] = jacobi_smooth(
+        gl,
+        &pipeline.poisson_jacobi_prog,
+        pyramid,
+        k_max,
+        2 * n_pre,
+        u_idx[k_max],
+        omega,
+    );
+
+    // Up sweep.
+    for k in (0..k_max).rev() {
+        u_idx[k] = prolongate(
+            gl,
+            &pipeline.poisson_prolongate_prog,
+            pyramid,
+            k,
+            u_idx[k],
+            u_idx[k + 1],
+        );
+        u_idx[k] = jacobi_smooth(
+            gl,
+            &pipeline.poisson_jacobi_prog,
+            pyramid,
+            k,
+            n_post,
+            u_idx[k],
+            omega,
+        );
+    }
+
+    u_idx[0]
+}
+
 // Renders the full mipmap chain for the SDF texture by explicitly
 // downsampling each level from its predecessor with a 2×2 box-filter shader.
 //
@@ -1311,12 +1920,11 @@ unsafe fn encode_output(
     gl: &ffi::Gles2,
     prog: &JfaEncodeProgram,
     jfa: &GlesTexture,
-    sdf_mip: &GlesTexture,
+    poisson_u: &GlesTexture,
     dst: &GlesTexture,
     bbw: i32,
     bbh: i32,
     max_dist: f32,
-    mip_count: i32,
 ) {
     gl.FramebufferTexture2D(
         ffi::DRAW_FRAMEBUFFER,
@@ -1328,30 +1936,18 @@ unsafe fn encode_output(
 
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_input, 0);
-    gl.Uniform1i(prog.uniform_sdf_mip, 1);
+    gl.Uniform1i(prog.uniform_poisson_u, 1);
     gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
     gl.Uniform1f(prog.uniform_max_dist, max_dist);
 
-    // LoD scaling: a pixel at depth `2^k * lod_base` samples mip k. With
-    // lod_base = 4, depths 4 / 8 / 16 / 32 / 64 / 128 px map to mip 0 / 1 / 2
-    // / 3 / 4 / 5. Tunable in this one spot.
-    let lod_base: f32 = 4.0;
-    gl.Uniform1f(prog.uniform_lod_base, lod_base);
-    gl.Uniform1f(prog.uniform_max_lod, mip_count as f32);
-
     gl.Viewport(0, 0, bbw, bbh);
 
-    // Bind the mipmapped SDF on TEXTURE1 with mipmap-aware sampler params.
-    // generate_sdf_mipmaps already set these, but re-asserting them costs
-    // nothing and protects against accidental state mutation between passes.
+    // Poisson u on TEXTURE1 with NEAREST sampling — we want exact texel
+    // values for the central-difference gradient.
     gl.ActiveTexture(ffi::TEXTURE1);
-    gl.BindTexture(ffi::TEXTURE_2D, sdf_mip.tex_id());
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_MIN_FILTER,
-        ffi::LINEAR_MIPMAP_LINEAR as i32,
-    );
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.BindTexture(ffi::TEXTURE_2D, poisson_u.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
     gl.TexParameteri(
         ffi::TEXTURE_2D,
         ffi::TEXTURE_WRAP_S,
