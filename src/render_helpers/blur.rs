@@ -297,7 +297,6 @@ struct JfaPoissonResidualRestrictProgram {
     program: ffi::types::GLuint,
     uniform_u_fine: ffi::types::GLint,
     uniform_rhs_fine: ffi::types::GLint,
-    uniform_mask_coarse: ffi::types::GLint,
     uniform_fine_texel: ffi::types::GLint,
     uniform_h_sq_fine: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
@@ -491,7 +490,6 @@ unsafe fn compile_jfa_poisson_residual_restrict(
         program,
         uniform_u_fine: gl.GetUniformLocation(program, c"niri_u_fine".as_ptr()),
         uniform_rhs_fine: gl.GetUniformLocation(program, c"niri_rhs_fine".as_ptr()),
-        uniform_mask_coarse: gl.GetUniformLocation(program, c"niri_mask_coarse".as_ptr()),
         uniform_fine_texel: gl.GetUniformLocation(program, c"niri_fine_texel".as_ptr()),
         uniform_h_sq_fine: gl.GetUniformLocation(program, c"niri_h_sq_fine".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
@@ -1072,7 +1070,16 @@ fn render_jfa_mask(
             gl.ClearColor(0.0, 0.0, 0.0, 0.0);
             gl.Clear(ffi::COLOR_BUFFER_BIT);
         }
-        let final_u_idx = run_v_cycle(gl, pipeline, &textures.pyramid, 3, 3, 0.8);
+        // Two V-cycles with 5 pre/post Jacobi sweeps. One cycle gives ~10×
+        // error reduction; two gives ~100×, enough that the remaining
+        // residual is invisible in the gradient. We thread the final u_idx
+        // through each cycle so the next one picks up from the right
+        // ping-pong slot.
+        let mut final_u_idx = 0;
+        for _ in 0..2 {
+            final_u_idx =
+                run_v_cycle(gl, pipeline, &textures.pyramid, 5, 5, 0.8, final_u_idx);
+        }
         let poisson_u = if final_u_idx == 0 {
             &textures.pyramid[0].u_a
         } else {
@@ -1570,7 +1577,6 @@ unsafe fn residual_restrict(
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_u_fine, 0);
     gl.Uniform1i(prog.uniform_rhs_fine, 1);
-    gl.Uniform1i(prog.uniform_mask_coarse, 2);
     gl.Uniform2f(
         prog.uniform_fine_texel,
         1.0 / fine.size.w as f32,
@@ -1588,15 +1594,6 @@ unsafe fn residual_restrict(
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
 
-    gl.ActiveTexture(ffi::TEXTURE2);
-    // Mask read from the same texture we're writing to. Per GL spec this
-    // is undefined; in practice drivers return pre-draw values for
-    // non-MSAA single-sample textures. Fallback documented in design
-    // notes if this manifests as artefacts.
-    gl.BindTexture(ffi::TEXTURE_2D, coarse.rhs.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
     gl.VertexAttribPointer(
@@ -1609,7 +1606,15 @@ unsafe fn residual_restrict(
     );
 
     gl.Viewport(0, 0, coarse.size.w, coarse.size.h);
+
+    // Restrict only the R channel; G (mask) was populated once per frame
+    // by restrict_mask_pyramid and must not be touched here, otherwise
+    // we'd be reading and writing the same texture (undefined per GL
+    // spec; observed driver behaviour was unstable).
+    gl.ColorMask(ffi::TRUE, ffi::FALSE, ffi::FALSE, ffi::FALSE);
     gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.ColorMask(ffi::TRUE, ffi::TRUE, ffi::TRUE, ffi::TRUE);
+
     gl.DisableVertexAttribArray(prog.attrib_vert as u32);
     gl.ActiveTexture(ffi::TEXTURE0);
 
@@ -1722,9 +1727,11 @@ unsafe fn run_v_cycle(
     n_pre: i32,
     n_post: i32,
     omega: f32,
+    initial_u_idx: usize,
 ) -> usize {
     let k_max = pyramid.len() - 1;
     let mut u_idx: Vec<usize> = vec![0; pyramid.len()];
+    u_idx[0] = initial_u_idx;
 
     // Down sweep.
     for k in 0..k_max {
