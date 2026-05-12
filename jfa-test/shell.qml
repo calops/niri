@@ -30,10 +30,64 @@ ShellRoot {
         }
 
         BackgroundEffect.blurRegion: Region {
+            // Solid square next to the mouse cursor.
             Region {
                 x: root.cx - 200
                 y: root.cy - 200
                 width: 400
+                height: 400
+            }
+
+            // Hollow square (square-with-square-hole) to the right of the
+            // solid one. Built from four rectangles forming a frame:
+            //   outer extent: 400×400, offset +500 px to the right of cx
+            //   inner hole:   200×200, centered
+            //
+            //   ┌─────────────┐  ── top strip (400 × 100)
+            //   │             │
+            //   ├──┐       ┌──┤  ── left strip (100 × 200), right strip (100 × 200)
+            //   │  │       │  │
+            //   ├──┘       └──┤
+            //   │             │
+            //   └─────────────┘  ── bottom strip (400 × 100)
+            Region {
+                x: root.cx + 300
+                y: root.cy - 200
+                width: 400
+                height: 100
+            }
+            Region {
+                x: root.cx + 300
+                y: root.cy + 100
+                width: 400
+                height: 100
+            }
+            Region {
+                x: root.cx + 300
+                y: root.cy - 100
+                width: 100
+                height: 200
+            }
+            Region {
+                x: root.cx + 600
+                y: root.cy - 100
+                width: 100
+                height: 200
+            }
+
+            // Cross (two overlapping rectangles) below the solid square.
+            // Center at (cx, cy + 500). 400 × 400 overall extent with
+            // 100 px arm thickness.
+            Region {
+                x: root.cx - 200
+                y: root.cy + 450
+                width: 400
+                height: 100
+            }
+            Region {
+                x: root.cx - 50
+                y: root.cy + 300
+                width: 100
                 height: 400
             }
         }
