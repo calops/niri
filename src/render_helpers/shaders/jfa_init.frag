@@ -12,11 +12,11 @@ out vec4 frag_color;
 void main() {
     vec4 s = texture(niri_input, v_coords);
     if (s.r < 0.5) {
-        // Exterior pixel: seed with its own coordinates.
+        // Exterior: seed with own coords.
         vec2 coord = v_coords * niri_output_size;
         frag_color = vec4(coord, 0.0, 1.0);
     } else {
-        // Interior pixel: unseeded, will receive propagated boundary seed.
+        // Interior: unseeded.
         frag_color = vec4(-1.0, -1.0, 0.0, 0.0);
     }
 }
