@@ -258,6 +258,15 @@ struct JfaStepProgram {
 }
 
 #[derive(Debug)]
+struct JfaSdfBakeProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_max_dist: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
 struct JfaDensityBlurProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
@@ -360,6 +369,19 @@ unsafe fn compile_jfa_step(gl: &ffi::Gles2) -> Result<JfaStepProgram, GlesError>
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_step: gl.GetUniformLocation(program, c"niri_step".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+unsafe fn compile_jfa_sdf_bake(gl: &ffi::Gles2) -> Result<JfaSdfBakeProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_sdf_bake.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaSdfBakeProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -876,7 +898,7 @@ fn render_jfa_mask(
         compute_density(
             gl,
             &pipeline.density_prog,
-            &textures.bin,
+            jfa_result,
             &textures.density_h,
             &textures.density,
             bbw,
@@ -1126,10 +1148,18 @@ unsafe fn run_jfa_steps<'a>(
     read_tex
 }
 
+// Computes a two-scale smoothed-distance field. The horizontal pass reads the
+// JFA result (per-pixel nearest exterior coord) and stores the per-sample
+// distance, blurred horizontally with two radii. The vertical pass reads that
+// intermediate and blurs vertically. Output: R = small-radius blur (sharp near
+// boundary), G = large-radius blur (smooth interior). The gradient of each
+// gives an inward-pointing vector at every interior pixel — including deep in
+// the rect, where blurring a binary mask would produce a flat 1.0 with zero
+// gradient.
 unsafe fn compute_density(
     gl: &ffi::Gles2,
     prog: &JfaDensityBlurProgram,
-    bin: &GlesTexture,
+    jfa_input: &GlesTexture,
     h_intermediate: &GlesTexture,
     final_density: &GlesTexture,
     bbw: i32,
@@ -1172,7 +1202,7 @@ unsafe fn compute_density(
         gl.DisableVertexAttribArray(prog.attrib_vert as u32);
     };
 
-    pass(bin, h_intermediate, 0);
+    pass(jfa_input, h_intermediate, 0);
     pass(h_intermediate, final_density, 1);
 }
 
