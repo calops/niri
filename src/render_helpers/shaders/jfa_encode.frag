@@ -33,9 +33,11 @@ void main() {
     float lod = log2(max(dc, niri_lod_base) / niri_lod_base);
     lod = clamp(lod, 0.0, niri_max_lod);
 
-    // Central-difference gradient at the chosen LoD. Step is one mip-0 texel;
-    // textureLod's linear filter handles the smoothing at the chosen level.
-    vec2 st = 1.0 / niri_output_size;
+    // Central-difference gradient at the chosen LoD. The step must be at
+    // least one mip-`lod` texel; otherwise both samples land inside the same
+    // mip-`lod` texel and the gradient collapses to per-texel interpolation
+    // noise. exp2(lod) is the mip-`lod` texel size in mip-0 texel units.
+    vec2 st = exp2(lod) / niri_output_size;
     float r = textureLod(niri_sdf_mip, uv + vec2(st.x, 0.0), lod).r;
     float l = textureLod(niri_sdf_mip, uv - vec2(st.x, 0.0), lod).r;
     float t = textureLod(niri_sdf_mip, uv + vec2(0.0, st.y), lod).r;
