@@ -267,17 +267,6 @@ struct JfaSdfBakeProgram {
 }
 
 #[derive(Debug)]
-struct JfaDensityBlurProgram {
-    program: ffi::types::GLuint,
-    uniform_input: ffi::types::GLint,
-    uniform_output_size: ffi::types::GLint,
-    uniform_axis: ffi::types::GLint,
-    uniform_radius_low: ffi::types::GLint,
-    uniform_radius_high: ffi::types::GLint,
-    attrib_vert: ffi::types::GLint,
-}
-
-#[derive(Debug)]
 struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
@@ -381,21 +370,6 @@ unsafe fn compile_jfa_sdf_bake(gl: &ffi::Gles2) -> Result<JfaSdfBakeProgram, Gle
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
-    })
-}
-
-unsafe fn compile_jfa_density_blur(gl: &ffi::Gles2) -> Result<JfaDensityBlurProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur_custom.vert");
-    let frag_src = include_str!("shaders/jfa_density_blur.frag");
-    let program = unsafe { link_program(gl, vert_src, frag_src)? };
-    Ok(JfaDensityBlurProgram {
-        program,
-        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
-        uniform_axis: gl.GetUniformLocation(program, c"niri_axis".as_ptr()),
-        uniform_radius_low: gl.GetUniformLocation(program, c"niri_radius_low".as_ptr()),
-        uniform_radius_high: gl.GetUniformLocation(program, c"niri_radius_high".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
