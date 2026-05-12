@@ -1076,7 +1076,74 @@ fn render_jfa_mask(
         // After the final swap, `read_tex` holds the most recent write —
         // i.e. the final JFA distance field.
 
-        // Encode: reads JFA result, writes textures.encoded.
+        // Density blur pass 1: horizontal. Reads textures.bin (binary mask),
+        // writes textures.density_h with R = density_low (2px), G = density_high (20px).
+        let radius_low: i32 = 2;
+        let radius_high: i32 = 20;
+
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            textures.density_h.tex_id(),
+            0,
+        );
+
+        gl.UseProgram(pipeline.density_prog.program);
+        gl.Uniform1i(pipeline.density_prog.uniform_input, 0);
+        gl.Uniform2f(
+            pipeline.density_prog.uniform_output_size,
+            bbw as f32,
+            bbh as f32,
+        );
+        gl.Uniform1i(pipeline.density_prog.uniform_axis, 0);
+        gl.Uniform1i(pipeline.density_prog.uniform_radius_low, radius_low);
+        gl.Uniform1i(pipeline.density_prog.uniform_radius_high, radius_high);
+
+        gl.Viewport(0, 0, bbw, bbh);
+        gl.BindTexture(ffi::TEXTURE_2D, textures.bin.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+        gl.EnableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
+        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+        gl.VertexAttribPointer(
+            pipeline.density_prog.attrib_vert as u32,
+            2,
+            ffi::FLOAT,
+            ffi::FALSE,
+            0,
+            MASK_VERTICES.as_ptr().cast(),
+        );
+        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        gl.DisableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
+
+        // Density blur pass 2: vertical. Reads textures.density_h, writes textures.density.
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            textures.density.tex_id(),
+            0,
+        );
+
+        gl.Uniform1i(pipeline.density_prog.uniform_axis, 1);
+
+        gl.BindTexture(ffi::TEXTURE_2D, textures.density_h.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+        gl.EnableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
+        gl.VertexAttribPointer(
+            pipeline.density_prog.attrib_vert as u32,
+            2,
+            ffi::FLOAT,
+            ffi::FALSE,
+            0,
+            MASK_VERTICES.as_ptr().cast(),
+        );
+        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        gl.DisableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
+
+        // Encode: reads JFA result + density, writes textures.encoded.
         gl.FramebufferTexture2D(
             ffi::DRAW_FRAMEBUFFER, ffi::COLOR_ATTACHMENT0,
             ffi::TEXTURE_2D, textures.encoded.tex_id(), 0,
@@ -1084,11 +1151,30 @@ fn render_jfa_mask(
 
         gl.UseProgram(pipeline.encode_prog.program);
         gl.Uniform1i(pipeline.encode_prog.uniform_input, 0);
+        gl.Uniform1i(pipeline.encode_prog.uniform_density, 1);
         gl.Uniform2f(pipeline.encode_prog.uniform_output_size, bbw as f32, bbh as f32);
-        gl.Uniform1f(pipeline.encode_prog.uniform_max_dist, max_dim as f32 / 2.0);
+
+        // Bbox-relative normalization: deep interior reads near R=1.0 regardless
+        // of bbox aspect.
+        let max_dist = (std::cmp::min(bbw, bbh) as f32) / 2.0;
+        gl.Uniform1f(pipeline.encode_prog.uniform_max_dist, max_dist);
+
+        // Pixel distance over which the blend transitions from sharp (low-radius)
+        // gradient to smooth (high-radius) gradient. Matches the high blur radius.
+        gl.Uniform1f(pipeline.encode_prog.uniform_edge_threshold_px, 20.0);
 
         gl.Viewport(0, 0, bbw, bbh);
+
+        // Bind density on TEXTURE1, JFA result on TEXTURE0.
+        gl.ActiveTexture(ffi::TEXTURE1);
+        gl.BindTexture(ffi::TEXTURE_2D, textures.density.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+        gl.ActiveTexture(ffi::TEXTURE0);
         gl.BindTexture(ffi::TEXTURE_2D, read_tex.tex_id());
+
         gl.EnableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
         gl.VertexAttribPointer(
