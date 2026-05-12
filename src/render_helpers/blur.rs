@@ -1,4 +1,4 @@
-use std::cmp::max;
+use std::cmp::{max, min};
 use std::iter::{once, zip};
 use std::rc::Rc;
 
@@ -835,37 +835,9 @@ fn render_jfa_mask(
     textures: &JfaTextures,
 ) {
     unsafe {
-        // Clear mask texture to zero before rendering.
-        let mut clear_fbo = 0u32;
-        gl.GenFramebuffers(1, &mut clear_fbo);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, clear_fbo);
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            mask_tex_id,
-            0,
-        );
-        gl.ClearColor(0.0, 0.0, 0.0, 0.0);
-        gl.Clear(ffi::COLOR_BUFFER_BIT);
-        gl.DeleteFramebuffers(1, &mut clear_fbo);
-
-        if jfa_pipeline.is_none() {
-            match (|| -> Result<JfaPipeline, GlesError> {
-                Ok(JfaPipeline {
-                    binary_prog: compile_jfa_binary(gl)?,
-                    init_prog: compile_jfa_init(gl)?,
-                    step_prog: compile_jfa_step(gl)?,
-                    density_prog: compile_jfa_density_blur(gl)?,
-                    encode_prog: compile_jfa_encode(gl)?,
-                })
-            })() {
-                Ok(p) => *jfa_pipeline = Some(p),
-                Err(err) => {
-                    warn!("error compiling JFA shaders: {err:?}");
-                    return;
-                }
-            }
+        clear_mask_texture(gl, mask_tex_id);
+        if !ensure_jfa_pipeline(gl, jfa_pipeline) {
+            return;
         }
         let pipeline = jfa_pipeline.as_ref().unwrap();
 
@@ -873,312 +845,270 @@ fn render_jfa_mask(
         gl.GenFramebuffers(1, &mut fbo);
         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
 
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            textures.bin.tex_id(),
-            0,
+        render_binary_mask(
+            gl,
+            &pipeline.binary_prog,
+            options,
+            &textures.bin,
+            bbx,
+            bby,
+            bbw,
+            bbh,
+            source_w,
+            source_h,
         );
-
-        gl.UseProgram(pipeline.binary_prog.program);
-        gl.Uniform1i(
-            pipeline.binary_prog.uniform_subregion_count,
-            options.subregion_rects.len() as i32,
+        jfa_init_pass(
+            gl,
+            &pipeline.init_prog,
+            &textures.bin,
+            &textures.jfa_a,
+            bbw,
+            bbh,
         );
-
-        // Convert UV rects to source-pixel coords.
-        let rects_raw_px: Vec<[f32; 4]> = options
-            .subregion_rects
-            .iter()
-            .map(|r| {
-                [
-                    r[0] * source_w as f32,
-                    r[1] * source_h as f32,
-                    r[2] * source_w as f32,
-                    r[3] * source_h as f32,
-                ]
-            })
-            .collect();
-
-        // Clamped inside the padded border for the binary mask.
-        let rects_px: Vec<[f32; 4]> = rects_raw_px
-            .iter()
-            .map(|r| {
-                [
-                    r[0].max((bbx + 1) as f32),
-                    r[1].max((bby + 1) as f32),
-                    r[2].min((bbx + bbw - 2) as f32),
-                    r[3].min((bby + bbh - 2) as f32),
-                ]
-            })
-            .collect();
-
-        // Blit dest: the actual region position on screen (unclamped, then clamped to mask bounds).
-        let blit_x1 = rects_raw_px.iter().map(|r| r[0] as i32).min().unwrap_or(bbx + 1).max(0);
-        let blit_y1 = rects_raw_px.iter().map(|r| r[1] as i32).min().unwrap_or(bby + 1).max(0);
-        let blit_x2 = rects_raw_px.iter().map(|r| r[2] as i32).max().unwrap_or(bbx + bbw - 1).min(source_w);
-        let blit_y2 = rects_raw_px.iter().map(|r| r[3] as i32).max().unwrap_or(bby + bbh - 1).min(source_h);
-        gl.Uniform4fv(
-            pipeline.binary_prog.uniform_subregion_rects,
-            rects_px.len() as i32,
-            rects_px.as_ptr() as *const f32,
+        let jfa_result = run_jfa_steps(
+            gl,
+            &pipeline.step_prog,
+            &textures.jfa_a,
+            &textures.jfa_b,
+            bbw,
+            bbh,
         );
-        gl.Uniform2f(
-            pipeline.binary_prog.uniform_mask_size,
-            bbw as f32,
-            bbh as f32,
-        );
-        gl.Uniform2f(
-            pipeline.binary_prog.uniform_bbox_origin,
-            bbx as f32,
-            bby as f32,
-        );
-
-        gl.Viewport(0, 0, bbw, bbh);
-        gl.EnableVertexAttribArray(pipeline.binary_prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            pipeline.binary_prog.attrib_vert as u32,
+        compute_density(
+            gl,
+            &pipeline.density_prog,
+            &textures.bin,
+            &textures.density_h,
+            &textures.density,
+            bbw,
+            bbh,
             2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
+            20,
         );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.binary_prog.attrib_vert as u32);
-
-        gl.BindTexture(ffi::TEXTURE_2D, textures.bin.tex_id());
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_MIN_FILTER,
-            ffi::NEAREST as i32,
+        encode_output(
+            gl,
+            &pipeline.encode_prog,
+            jfa_result,
+            &textures.density,
+            &textures.encoded,
+            bbw,
+            bbh,
         );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_MAG_FILTER,
-            ffi::NEAREST as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_S,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_T,
-            ffi::CLAMP_TO_EDGE as i32,
+        blit_to_mask_texture(
+            gl,
+            &textures.encoded,
+            mask_tex_id,
+            bbw,
+            bbh,
+            source_w,
+            source_h,
+            options,
+            bbx,
+            bby,
         );
 
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            textures.jfa_a.tex_id(),
-            0,
-        );
+        gl.DeleteFramebuffers(1, &mut fbo);
+        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
 
-        gl.UseProgram(pipeline.init_prog.program);
-        gl.Uniform1i(pipeline.init_prog.uniform_input, 0);
-        gl.Uniform2f(
-            pipeline.init_prog.uniform_output_size,
-            bbw as f32,
-            bbh as f32,
-        );
-
-        gl.Viewport(0, 0, bbw, bbh);
-        gl.BindTexture(ffi::TEXTURE_2D, textures.bin.tex_id());
-        gl.EnableVertexAttribArray(pipeline.init_prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            pipeline.init_prog.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.init_prog.attrib_vert as u32);
-
-
-        let max_dim = max(bbw, bbh);
-
-        gl.BindTexture(ffi::TEXTURE_2D, textures.jfa_a.tex_id());
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_MIN_FILTER,
-            ffi::NEAREST as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_MAG_FILTER,
-            ffi::NEAREST as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_S,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_T,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-
-        // JFA with power-of-two steps.
-        let mut step = 1;
-        while step * 2 <= max_dim {
-            step *= 2;
-        }
-        let mut read_tex: &GlesTexture = &textures.jfa_a;
-        let mut write_tex: &GlesTexture = &textures.jfa_b;
-
-        while step > 0 {
-            gl.FramebufferTexture2D(
-                ffi::DRAW_FRAMEBUFFER,
-                ffi::COLOR_ATTACHMENT0,
-                ffi::TEXTURE_2D,
-                write_tex.tex_id(),
-                0,
-            );
-
-            gl.UseProgram(pipeline.step_prog.program);
-            gl.Uniform1i(pipeline.step_prog.uniform_input, 0);
-            gl.Uniform2f(
-                pipeline.step_prog.uniform_output_size,
-                bbw as f32,
-                bbh as f32,
-            );
-            gl.Uniform1i(pipeline.step_prog.uniform_step, step);
-
-            gl.Viewport(0, 0, bbw, bbh);
-            gl.BindTexture(ffi::TEXTURE_2D, read_tex.tex_id());
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-            gl.EnableVertexAttribArray(pipeline.step_prog.attrib_vert as u32);
-            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-            gl.VertexAttribPointer(pipeline.step_prog.attrib_vert as u32, 2, ffi::FLOAT, ffi::FALSE, 0, MASK_VERTICES.as_ptr().cast());
-            gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-            gl.DisableVertexAttribArray(pipeline.step_prog.attrib_vert as u32);
-
-            gl.BindTexture(ffi::TEXTURE_2D, write_tex.tex_id());
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
-
-            std::mem::swap(&mut read_tex, &mut write_tex);
-            step /= 2;
-        }
-
-        // After the final swap, `read_tex` holds the most recent write —
-        // i.e. the final JFA distance field.
-
-        // Density blur pass 1: horizontal. Reads textures.bin (binary mask),
-        // writes textures.density_h with R = density_low (2px), G = density_high (20px).
-        let radius_low: i32 = 2;
-        let radius_high: i32 = 20;
-
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            textures.density_h.tex_id(),
-            0,
-        );
-
-        gl.UseProgram(pipeline.density_prog.program);
-        gl.Uniform1i(pipeline.density_prog.uniform_input, 0);
-        gl.Uniform2f(
-            pipeline.density_prog.uniform_output_size,
-            bbw as f32,
-            bbh as f32,
-        );
-        gl.Uniform1i(pipeline.density_prog.uniform_axis, 0);
-        gl.Uniform1i(pipeline.density_prog.uniform_radius_low, radius_low);
-        gl.Uniform1i(pipeline.density_prog.uniform_radius_high, radius_high);
-
-        gl.Viewport(0, 0, bbw, bbh);
-        gl.BindTexture(ffi::TEXTURE_2D, textures.bin.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-        gl.EnableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            pipeline.density_prog.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
-
-        // Density blur pass 2: vertical. Reads textures.density_h, writes textures.density.
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            textures.density.tex_id(),
-            0,
-        );
-
-        gl.Uniform1i(pipeline.density_prog.uniform_axis, 1);
-
-        gl.BindTexture(ffi::TEXTURE_2D, textures.density_h.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-        gl.EnableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
-        gl.VertexAttribPointer(
-            pipeline.density_prog.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.density_prog.attrib_vert as u32);
-
-        // Encode: reads JFA result + density, writes textures.encoded.
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER, ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D, textures.encoded.tex_id(), 0,
-        );
-
-        gl.UseProgram(pipeline.encode_prog.program);
-        gl.Uniform1i(pipeline.encode_prog.uniform_input, 0);
-        gl.Uniform1i(pipeline.encode_prog.uniform_density, 1);
-        gl.Uniform2f(pipeline.encode_prog.uniform_output_size, bbw as f32, bbh as f32);
-
-        // Bbox-relative normalization: deep interior reads near R=1.0 regardless
-        // of bbox aspect.
-        let max_dist = (std::cmp::min(bbw, bbh) as f32) / 2.0;
-        gl.Uniform1f(pipeline.encode_prog.uniform_max_dist, max_dist);
-
-        // Pixel distance over which the blend transitions from sharp (low-radius)
-        // gradient to smooth (high-radius) gradient. Matches the high blur radius.
-        gl.Uniform1f(pipeline.encode_prog.uniform_edge_threshold_px, 20.0);
-
-        gl.Viewport(0, 0, bbw, bbh);
-
-        // Bind density on TEXTURE1, JFA result on TEXTURE0.
-        gl.ActiveTexture(ffi::TEXTURE1);
-        gl.BindTexture(ffi::TEXTURE_2D, textures.density.tex_id());
+        // Set final mask sampler params.
+        gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
-        gl.ActiveTexture(ffi::TEXTURE0);
-        gl.BindTexture(ffi::TEXTURE_2D, read_tex.tex_id());
+    }
+}
 
-        gl.EnableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
+unsafe fn clear_mask_texture(gl: &ffi::Gles2, mask_tex_id: ffi::types::GLuint) {
+    let mut clear_fbo = 0u32;
+    gl.GenFramebuffers(1, &mut clear_fbo);
+    gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, clear_fbo);
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        mask_tex_id,
+        0,
+    );
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(ffi::COLOR_BUFFER_BIT);
+    gl.DeleteFramebuffers(1, &mut clear_fbo);
+}
+
+unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipeline>) -> bool {
+    if jfa_pipeline.is_some() {
+        return true;
+    }
+    match (|| -> Result<JfaPipeline, GlesError> {
+        Ok(JfaPipeline {
+            binary_prog: compile_jfa_binary(gl)?,
+            init_prog: compile_jfa_init(gl)?,
+            step_prog: compile_jfa_step(gl)?,
+            density_prog: compile_jfa_density_blur(gl)?,
+            encode_prog: compile_jfa_encode(gl)?,
+        })
+    })() {
+        Ok(p) => {
+            *jfa_pipeline = Some(p);
+            true
+        }
+        Err(err) => {
+            warn!("error compiling JFA shaders: {err:?}");
+            false
+        }
+    }
+}
+
+unsafe fn render_binary_mask(
+    gl: &ffi::Gles2,
+    prog: &JfaBinaryProgram,
+    options: &BlurOptions,
+    dst: &GlesTexture,
+    bbx: i32,
+    bby: i32,
+    bbw: i32,
+    bbh: i32,
+    source_w: i32,
+    source_h: i32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(
+        prog.uniform_subregion_count,
+        options.subregion_rects.len() as i32,
+    );
+
+    // UV rects → source-pixel coords, then clamp inside the padded bbox border.
+    let rects_px: Vec<[f32; 4]> = options
+        .subregion_rects
+        .iter()
+        .map(|r| {
+            [
+                (r[0] * source_w as f32).max((bbx + 1) as f32),
+                (r[1] * source_h as f32).max((bby + 1) as f32),
+                (r[2] * source_w as f32).min((bbx + bbw - 2) as f32),
+                (r[3] * source_h as f32).min((bby + bbh - 2) as f32),
+            ]
+        })
+        .collect();
+
+    gl.Uniform4fv(
+        prog.uniform_subregion_rects,
+        rects_px.len() as i32,
+        rects_px.as_ptr() as *const f32,
+    );
+    gl.Uniform2f(prog.uniform_mask_size, bbw as f32, bbh as f32);
+    gl.Uniform2f(prog.uniform_bbox_origin, bbx as f32, bby as f32);
+
+    gl.Viewport(0, 0, bbw, bbh);
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+
+    gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+}
+
+unsafe fn jfa_init_pass(
+    gl: &ffi::Gles2,
+    prog: &JfaInitProgram,
+    src: &GlesTexture,
+    dst: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+
+    gl.Viewport(0, 0, bbw, bbh);
+    gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+
+    gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+}
+
+unsafe fn run_jfa_steps<'a>(
+    gl: &ffi::Gles2,
+    prog: &JfaStepProgram,
+    initial: &'a GlesTexture,
+    scratch: &'a GlesTexture,
+    bbw: i32,
+    bbh: i32,
+) -> &'a GlesTexture {
+    let max_dim = max(bbw, bbh);
+    let mut step = 1;
+    while step * 2 <= max_dim {
+        step *= 2;
+    }
+
+    let mut read_tex: &GlesTexture = initial;
+    let mut write_tex: &GlesTexture = scratch;
+
+    while step > 0 {
+        gl.FramebufferTexture2D(
+            ffi::DRAW_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            write_tex.tex_id(),
+            0,
+        );
+
+        gl.UseProgram(prog.program);
+        gl.Uniform1i(prog.uniform_input, 0);
+        gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+        gl.Uniform1i(prog.uniform_step, step);
+
+        gl.Viewport(0, 0, bbw, bbh);
+        gl.BindTexture(ffi::TEXTURE_2D, read_tex.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+
+        gl.EnableVertexAttribArray(prog.attrib_vert as u32);
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
         gl.VertexAttribPointer(
-            pipeline.encode_prog.attrib_vert as u32,
+            prog.attrib_vert as u32,
             2,
             ffi::FLOAT,
             ffi::FALSE,
@@ -1186,54 +1116,203 @@ fn render_jfa_mask(
             MASK_VERTICES.as_ptr().cast(),
         );
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
+        gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 
-        // Blit encoded result to the source-resolution mask texture.
-        let mut read_fbo = 0u32;
-        gl.GenFramebuffers(1, &mut read_fbo);
-        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, read_fbo);
-        gl.FramebufferTexture2D(
-            ffi::READ_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            textures.encoded.tex_id(),
-            0,
-        );
+        std::mem::swap(&mut read_tex, &mut write_tex);
+        step /= 2;
+    }
 
+    // After the final swap, `read_tex` holds the most recent write.
+    read_tex
+}
+
+unsafe fn compute_density(
+    gl: &ffi::Gles2,
+    prog: &JfaDensityBlurProgram,
+    bin: &GlesTexture,
+    h_intermediate: &GlesTexture,
+    final_density: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+    radius_low: i32,
+    radius_high: i32,
+) {
+    let pass = |src: &GlesTexture, dst: &GlesTexture, axis: i32| {
         gl.FramebufferTexture2D(
             ffi::DRAW_FRAMEBUFFER,
             ffi::COLOR_ATTACHMENT0,
             ffi::TEXTURE_2D,
-            mask_tex_id,
+            dst.tex_id(),
             0,
         );
 
-        gl.BlitFramebuffer(
-            1, 1, bbw - 1, bbh - 1,
-            blit_x1, blit_y1, blit_x2, blit_y2,
-            ffi::COLOR_BUFFER_BIT,
-            ffi::LINEAR,
-        );
+        gl.UseProgram(prog.program);
+        gl.Uniform1i(prog.uniform_input, 0);
+        gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+        gl.Uniform1i(prog.uniform_axis, axis);
+        gl.Uniform1i(prog.uniform_radius_low, radius_low);
+        gl.Uniform1i(prog.uniform_radius_high, radius_high);
 
-        gl.DeleteFramebuffers(1, &mut read_fbo);
-        gl.DeleteFramebuffers(1, &mut fbo);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+        gl.Viewport(0, 0, bbw, bbh);
+        gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
 
+        gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+        gl.VertexAttribPointer(
+            prog.attrib_vert as u32,
+            2,
+            ffi::FLOAT,
+            ffi::FALSE,
+            0,
+            MASK_VERTICES.as_ptr().cast(),
+        );
+        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    };
 
-        gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_S,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_T,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-    }
+    pass(bin, h_intermediate, 0);
+    pass(h_intermediate, final_density, 1);
+}
+
+unsafe fn encode_output(
+    gl: &ffi::Gles2,
+    prog: &JfaEncodeProgram,
+    jfa: &GlesTexture,
+    density: &GlesTexture,
+    dst: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform1i(prog.uniform_density, 1);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+    // Bbox-relative normalization: deep interior reads near R=1.0 regardless
+    // of bbox aspect.
+    gl.Uniform1f(prog.uniform_max_dist, (max(1, min(bbw, bbh)) as f32) / 2.0);
+    // Pixel distance over which the blend transitions from sharp (low-radius)
+    // gradient to smooth (high-radius) gradient.
+    gl.Uniform1f(prog.uniform_edge_threshold_px, 20.0);
+
+    gl.Viewport(0, 0, bbw, bbh);
+
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, density.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
+unsafe fn blit_to_mask_texture(
+    gl: &ffi::Gles2,
+    src_encoded: &GlesTexture,
+    mask_tex_id: ffi::types::GLuint,
+    bbw: i32,
+    bbh: i32,
+    source_w: i32,
+    source_h: i32,
+    options: &BlurOptions,
+    bbx: i32,
+    bby: i32,
+) {
+    // Blit dest: union of region rects in source pixels (clamped to source bounds).
+    let rects_raw_px: Vec<[f32; 4]> = options
+        .subregion_rects
+        .iter()
+        .map(|r| {
+            [
+                r[0] * source_w as f32,
+                r[1] * source_h as f32,
+                r[2] * source_w as f32,
+                r[3] * source_h as f32,
+            ]
+        })
+        .collect();
+
+    let blit_x1 = rects_raw_px
+        .iter()
+        .map(|r| r[0] as i32)
+        .min()
+        .unwrap_or(bbx + 1)
+        .max(0);
+    let blit_y1 = rects_raw_px
+        .iter()
+        .map(|r| r[1] as i32)
+        .min()
+        .unwrap_or(bby + 1)
+        .max(0);
+    let blit_x2 = rects_raw_px
+        .iter()
+        .map(|r| r[2] as i32)
+        .max()
+        .unwrap_or(bbx + bbw - 1)
+        .min(source_w);
+    let blit_y2 = rects_raw_px
+        .iter()
+        .map(|r| r[3] as i32)
+        .max()
+        .unwrap_or(bby + bbh - 1)
+        .min(source_h);
+
+    let mut read_fbo = 0u32;
+    gl.GenFramebuffers(1, &mut read_fbo);
+    gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, read_fbo);
+    gl.FramebufferTexture2D(
+        ffi::READ_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        src_encoded.tex_id(),
+        0,
+    );
+
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        mask_tex_id,
+        0,
+    );
+
+    gl.BlitFramebuffer(
+        1,
+        1,
+        bbw - 1,
+        bbh - 1,
+        blit_x1,
+        blit_y1,
+        blit_x2,
+        blit_y2,
+        ffi::COLOR_BUFFER_BIT,
+        ffi::LINEAR,
+    );
+
+    gl.DeleteFramebuffers(1, &mut read_fbo);
 }
 
 impl Blur {
