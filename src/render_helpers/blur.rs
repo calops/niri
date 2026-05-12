@@ -313,15 +313,6 @@ struct JfaPoissonProlongateProgram {
 }
 
 #[derive(Debug)]
-struct JfaSdfDownsampleProgram {
-    program: ffi::types::GLuint,
-    uniform_input: ffi::types::GLint,
-    uniform_src_lod: ffi::types::GLint,
-    uniform_src_texel: ffi::types::GLint,
-    attrib_vert: ffi::types::GLint,
-}
-
-#[derive(Debug)]
 struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
@@ -518,21 +509,6 @@ unsafe fn compile_jfa_poisson_prolongate(
         uniform_u_fine: gl.GetUniformLocation(program, c"niri_u_fine".as_ptr()),
         uniform_correction: gl.GetUniformLocation(program, c"niri_correction".as_ptr()),
         uniform_rhs_fine: gl.GetUniformLocation(program, c"niri_rhs_fine".as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
-    })
-}
-
-unsafe fn compile_jfa_sdf_downsample(
-    gl: &ffi::Gles2,
-) -> Result<JfaSdfDownsampleProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur_custom.vert");
-    let frag_src = include_str!("shaders/jfa_sdf_downsample.frag");
-    let program = unsafe { link_program(gl, vert_src, frag_src)? };
-    Ok(JfaSdfDownsampleProgram {
-        program,
-        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_src_lod: gl.GetUniformLocation(program, c"niri_src_lod".as_ptr()),
-        uniform_src_texel: gl.GetUniformLocation(program, c"niri_src_texel".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -1806,114 +1782,6 @@ unsafe fn run_v_cycle(
     }
 
     u_idx[0]
-}
-
-// Renders the full mipmap chain for the SDF texture by explicitly
-// downsampling each level from its predecessor with a 2×2 box-filter shader.
-//
-// We avoid `glGenerateMipmap` because driver support for half-float mip
-// generation is inconsistent — RGBA16F mipmaps work on some drivers but
-// silently produce only level 0 on others. Rendering the chain ourselves
-// guarantees every level we'll sample actually exists.
-//
-// Each mip level's storage is allocated via `glTexImage2D` on the fly. This
-// is idempotent across frames; calling it with the same parameters just
-// re-initializes the level.
-unsafe fn generate_sdf_mipmaps(
-    gl: &ffi::Gles2,
-    prog: &JfaSdfDownsampleProgram,
-    sdf: &GlesTexture,
-    bbw: i32,
-    bbh: i32,
-) -> i32 {
-    let mip_count = (max(bbw, bbh) as f32).log2().floor() as i32;
-    if mip_count <= 0 {
-        return 0;
-    }
-
-    gl.BindTexture(ffi::TEXTURE_2D, sdf.tex_id());
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_MIN_FILTER,
-        ffi::LINEAR_MIPMAP_LINEAR as i32,
-    );
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_WRAP_S,
-        ffi::CLAMP_TO_EDGE as i32,
-    );
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_WRAP_T,
-        ffi::CLAMP_TO_EDGE as i32,
-    );
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_BASE_LEVEL, 0);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAX_LEVEL, mip_count);
-
-    // Allocate storage for each level above 0. Sizes follow the standard
-    // mipmap rule: level k = max(1, floor(level_(k-1) / 2)).
-    for k in 1..=mip_count {
-        let mw = max(1, bbw >> k);
-        let mh = max(1, bbh >> k);
-        gl.TexImage2D(
-            ffi::TEXTURE_2D,
-            k,
-            ffi::RGBA16F as i32,
-            mw,
-            mh,
-            0,
-            ffi::RGBA,
-            ffi::HALF_FLOAT,
-            std::ptr::null(),
-        );
-    }
-
-    gl.UseProgram(prog.program);
-    gl.Uniform1i(prog.uniform_input, 0);
-    gl.ActiveTexture(ffi::TEXTURE0);
-    gl.BindTexture(ffi::TEXTURE_2D, sdf.tex_id());
-
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-
-    // Render each mip level by downsampling from the previous one.
-    for k in 1..=mip_count {
-        let src_w = max(1, bbw >> (k - 1));
-        let src_h = max(1, bbh >> (k - 1));
-        let dst_w = max(1, bbw >> k);
-        let dst_h = max(1, bbh >> k);
-
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            sdf.tex_id(),
-            k,
-        );
-
-        gl.Uniform1f(prog.uniform_src_lod, (k - 1) as f32);
-        gl.Uniform2f(
-            prog.uniform_src_texel,
-            1.0 / src_w as f32,
-            1.0 / src_h as f32,
-        );
-
-        gl.Viewport(0, 0, dst_w, dst_h);
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    }
-
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
-
-    mip_count
 }
 
 unsafe fn encode_output(
