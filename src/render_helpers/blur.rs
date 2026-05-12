@@ -794,8 +794,6 @@ fn render_jfa_mask(
     jfa_pipeline: &mut Option<JfaPipeline>,
     jfa_textures: &[GlesTexture],
 ) {
-    info!("JFA: bbox [{},{}] {}x{}, source {}x{}, {} rects",
-        bbx, bby, bbw, bbh, source_w, source_h, options.subregion_rects.len());
     unsafe {
         // Clear mask texture to zero before rendering.
         let mut clear_fbo = 0u32;
@@ -850,23 +848,38 @@ fn render_jfa_mask(
             options.subregion_rects.len() as i32,
         );
 
-        // Convert UV rects to source-pixel coords, clamped inside the 1px padded border.
-        let rects_px: Vec<[f32; 4]> = options
+        // Convert UV rects to source-pixel coords.
+        let rects_raw_px: Vec<[f32; 4]> = options
             .subregion_rects
             .iter()
             .map(|r| {
                 [
-                    (r[0] * source_w as f32).max((bbx + 1) as f32),
-                    (r[1] * source_h as f32).max((bby + 1) as f32),
-                    (r[2] * source_w as f32).min((bbx + bbw - 1) as f32),
-                    (r[3] * source_h as f32).min((bby + bbh - 1) as f32),
+                    r[0] * source_w as f32,
+                    r[1] * source_h as f32,
+                    r[2] * source_w as f32,
+                    r[3] * source_h as f32,
                 ]
             })
             .collect();
-        if !rects_px.is_empty() {
-            info!("JFA: first rect in px: [{:.0},{:.0}]-[{:.0},{:.0}]",
-                rects_px[0][0], rects_px[0][1], rects_px[0][2], rects_px[0][3]);
-        }
+
+        // Clamped inside the padded border for the binary mask.
+        let rects_px: Vec<[f32; 4]> = rects_raw_px
+            .iter()
+            .map(|r| {
+                [
+                    r[0].max((bbx + 1) as f32),
+                    r[1].max((bby + 1) as f32),
+                    r[2].min((bbx + bbw - 2) as f32),
+                    r[3].min((bby + bbh - 2) as f32),
+                ]
+            })
+            .collect();
+
+        // Blit dest: the actual region position on screen (unclamped, then clamped to mask bounds).
+        let blit_x1 = rects_raw_px.iter().map(|r| r[0] as i32).min().unwrap_or(bbx + 1).max(0);
+        let blit_y1 = rects_raw_px.iter().map(|r| r[1] as i32).min().unwrap_or(bby + 1).max(0);
+        let blit_x2 = rects_raw_px.iter().map(|r| r[2] as i32).max().unwrap_or(bbx + bbw - 1).min(source_w);
+        let blit_y2 = rects_raw_px.iter().map(|r| r[3] as i32).max().unwrap_or(bby + bbh - 1).min(source_h);
         gl.Uniform4fv(
             pipeline.binary_prog.uniform_subregion_rects,
             rects_px.len() as i32,
@@ -896,9 +909,6 @@ fn render_jfa_mask(
         );
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
         gl.DisableVertexAttribArray(pipeline.binary_prog.attrib_vert as u32);
-
-        info!("JFA: binary mask rendered, {} rects at {}x{}",
-            rects_px.len(), bbw, bbh);
 
         gl.BindTexture(ffi::TEXTURE_2D, tex[0].tex_id());
         gl.TexParameteri(
@@ -953,10 +963,8 @@ fn render_jfa_mask(
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
         gl.DisableVertexAttribArray(pipeline.init_prog.attrib_vert as u32);
 
-        info!("JFA: seeds initialized");
 
         let max_dim = max(bbw, bbh);
-        info!("JFA: running ~{} steps (max_dim={})", (max_dim as f32).log2().ceil() as i32, max_dim);
 
         gl.BindTexture(ffi::TEXTURE_2D, tex[1].tex_id());
         gl.TexParameteri(
@@ -980,7 +988,7 @@ fn render_jfa_mask(
             ffi::CLAMP_TO_EDGE as i32,
         );
 
-        let mut step = max_dim / 2;
+        let mut step = max_dim;
         let mut read_idx = 1;
         let mut write_idx = 2;
 
@@ -1043,7 +1051,6 @@ fn render_jfa_mask(
             step /= 2;
         }
 
-        info!("JFA: steps complete");
 
         // Blur the JFA output to smooth the medial axis.
         gl.FramebufferTexture2D(
@@ -1068,7 +1075,7 @@ fn render_jfa_mask(
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
         gl.DisableVertexAttribArray(pipeline.blur_prog.attrib_vert as u32);
 
-        // Encode from blurred texture.
+        // Encode directly from raw JFA output.
         gl.FramebufferTexture2D(
             ffi::DRAW_FRAMEBUFFER,
             ffi::COLOR_ATTACHMENT0,
@@ -1079,7 +1086,6 @@ fn render_jfa_mask(
 
         gl.UseProgram(pipeline.encode_prog.program);
         gl.Uniform1i(pipeline.encode_prog.uniform_input, 0);
-        gl.Uniform1i(pipeline.encode_prog.uniform_seeds, 1);
         gl.Uniform2f(
             pipeline.encode_prog.uniform_output_size,
             bbw as f32,
@@ -1088,10 +1094,7 @@ fn render_jfa_mask(
         gl.Uniform1f(pipeline.encode_prog.uniform_max_dist, max_dim as f32 / 2.0);
 
         gl.Viewport(0, 0, bbw, bbh);
-        gl.BindTexture(ffi::TEXTURE_2D, tex[3].tex_id());
-        gl.ActiveTexture(ffi::TEXTURE1);
         gl.BindTexture(ffi::TEXTURE_2D, tex[read_idx].tex_id());
-        gl.ActiveTexture(ffi::TEXTURE0);
         gl.EnableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
         gl.VertexAttribPointer(
@@ -1105,7 +1108,6 @@ fn render_jfa_mask(
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
         gl.DisableVertexAttribArray(pipeline.encode_prog.attrib_vert as u32);
 
-        info!("JFA: encoded, max_dist={}", max_dim);
 
         let mut read_fbo = 0u32;
         gl.GenFramebuffers(1, &mut read_fbo);
@@ -1126,10 +1128,10 @@ fn render_jfa_mask(
             0,
         );
 
-        // Blit interior (skip 1px border) into mask texture at the region position.
+        // Blit interior of JFA output into mask texture at the region's screen position.
         gl.BlitFramebuffer(
             1, 1, bbw - 1, bbh - 1,
-            bbx + 1, bby + 1, bbx + bbw - 1, bby + bbh - 1,
+            blit_x1, blit_y1, blit_x2, blit_y2,
             ffi::COLOR_BUFFER_BIT,
             ffi::LINEAR,
         );
@@ -1138,7 +1140,6 @@ fn render_jfa_mask(
         gl.DeleteFramebuffers(1, &mut fbo);
         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
 
-        info!("JFA: blitted to mask texture");
 
         gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
