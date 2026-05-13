@@ -32,6 +32,12 @@ pub struct Blur {
     cached_mask_h: i32,
     jfa_pipeline: Option<JfaPipeline>,
     jfa_textures: Option<JfaTextures>,
+    /// 1×N RGBA32F texture holding the subregion rects (one texel per
+    /// rect, RGBA = x1,y1,x2,y2 in source pixels). Sampled by
+    /// `mask_binary.frag` via texelFetch. Grown when the rect count
+    /// exceeds capacity; never shrunk.
+    rects_texture: Option<GlesTexture>,
+    rects_capacity: i32,
     /// Cache for the JFA mask pipeline. The whole pipeline is computed in
     /// bbox-local coordinates, so its output (`jfa_textures.encoded`) is
     /// invariant under cursor motion — only the absolute bbox origin
@@ -583,6 +589,8 @@ impl Blur {
             cached_mask_h: 0,
             jfa_pipeline: None,
             jfa_textures: None,
+            rects_texture: None,
+            rects_capacity: 0,
             cached_jfa_rects_local: Vec::new(),
             cached_jfa_bbox_size: None,
         })
@@ -827,6 +835,19 @@ impl Blur {
             None
         };
 
+        // Grow the rect-data texture if needed. We size it to the next
+        // power-of-two ≥ rect_count to amortise reallocations across small
+        // count fluctuations. The texture isn't shrunk.
+        if jfa_bbox.is_some() {
+            let needed = options.subregion_rects.len() as i32;
+            if needed > self.rects_capacity {
+                let capacity = ((needed as u32).next_power_of_two() as i32).max(16);
+                let size = Size::new(capacity, 1);
+                self.rects_texture = Some(create_rgba32f_buffer(renderer, size)?);
+                self.rects_capacity = capacity;
+            }
+        }
+
         // Decide whether the previous frame's `textures.encoded` is still
         // valid: the JFA pipeline runs entirely in bbox-local coordinates,
         // so its output is invariant under cursor motion (only the bbox
@@ -888,6 +909,7 @@ impl Blur {
                     if let Some((bbx, bby, bbw, bbh)) = jfa_bbox {
                         let mask_tex_id = mask_tex.tex_id();
                         let textures = self.jfa_textures.as_ref().unwrap();
+                        let rects_tex = self.rects_texture.as_ref().unwrap();
                         render_jfa_mask(
                             gl,
                             options,
@@ -900,6 +922,7 @@ impl Blur {
                             source_size.h,
                             &mut self.jfa_pipeline,
                             textures,
+                            rects_tex,
                             jfa_cache_hit,
                         );
                     } else {
@@ -1099,6 +1122,7 @@ fn render_jfa_mask(
     source_h: i32,
     jfa_pipeline: &mut Option<JfaPipeline>,
     textures: &JfaTextures,
+    rects_tex: &GlesTexture,
     cache_hit: bool,
 ) {
     unsafe {
@@ -1154,6 +1178,7 @@ fn render_jfa_mask(
             &pipeline.binary_prog,
             options,
             &textures.bin,
+            rects_tex,
             bbx,
             bby,
             bbw,
@@ -1333,6 +1358,7 @@ unsafe fn render_binary_mask(
     prog: &JfaBinaryProgram,
     options: &BlurOptions,
     dst: &GlesTexture,
+    rects_tex: &GlesTexture,
     bbx: i32,
     bby: i32,
     bbw: i32,
@@ -1340,20 +1366,6 @@ unsafe fn render_binary_mask(
     source_w: i32,
     source_h: i32,
 ) {
-    gl.FramebufferTexture2D(
-        ffi::DRAW_FRAMEBUFFER,
-        ffi::COLOR_ATTACHMENT0,
-        ffi::TEXTURE_2D,
-        dst.tex_id(),
-        0,
-    );
-
-    gl.UseProgram(prog.program);
-    gl.Uniform1i(
-        prog.uniform_subregion_count,
-        options.subregion_rects.len() as i32,
-    );
-
     // UV rects → source-pixel coords, then clamp inside the padded bbox border.
     let rects_px: Vec<[f32; 4]> = options
         .subregion_rects
@@ -1368,14 +1380,45 @@ unsafe fn render_binary_mask(
         })
         .collect();
 
-    gl.Uniform4fv(
-        prog.uniform_subregion_rects,
+    // Upload the rect array to the dedicated RGBA32F texture. The texture
+    // is bound to TEXTURE1; the binary-mask fragment shader reads it via
+    // texelFetch so there's no fixed compile-time cap on the rect count.
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
+    gl.TexSubImage2D(
+        ffi::TEXTURE_2D,
+        0,
+        0,
+        0,
         rects_px.len() as i32,
-        rects_px.as_ptr() as *const f32,
+        1,
+        ffi::RGBA,
+        ffi::FLOAT,
+        rects_px.as_ptr() as *const _,
     );
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(
+        prog.uniform_subregion_count,
+        options.subregion_rects.len() as i32,
+    );
+    gl.Uniform1i(prog.uniform_subregion_rects, 1);
     gl.Uniform2f(prog.uniform_mask_size, bbw as f32, bbh as f32);
     gl.Uniform2f(prog.uniform_bbox_origin, bbx as f32, bby as f32);
 
+    gl.ActiveTexture(ffi::TEXTURE0);
     gl.Viewport(0, 0, bbw, bbh);
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);

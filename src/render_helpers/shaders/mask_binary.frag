@@ -5,7 +5,10 @@ precision highp float;
 in vec2 v_coords;
 
 uniform int niri_subregion_count;
-uniform vec4 niri_subregion_rects[64];
+// 1D texture holding the subregion rects: one texel per rect, RGBA32F
+// = (x1, y1, x2, y2) in source pixels. Sampled with texelFetch so there's
+// no fixed compile-time cap on the rect count.
+uniform sampler2D niri_subregion_rects;
 uniform vec2 niri_mask_size;
 uniform vec2 niri_bbox_origin;
 
@@ -34,9 +37,8 @@ void main() {
     vec2 pmax = pixel + vec2(0.5);
 
     float coverage = 0.0;
-    for (int i = 0; i < 64; i++) {
-        if (i >= niri_subregion_count) break;
-        vec4 r = niri_subregion_rects[i];
+    for (int i = 0; i < niri_subregion_count; i++) {
+        vec4 r = texelFetch(niri_subregion_rects, ivec2(i, 0), 0);
         vec2 tl = r.xy;
         vec2 br = r.zw;
 
