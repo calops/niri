@@ -37,11 +37,11 @@ void main() {
     // wherever the gradient is naturally small (e.g. the centre of a
     // large convex region), producing visible aliasing.
     //
-    // Instead, scale the central-difference gradient by 1 / (2 * max_dist)
-    // so the result is roughly in [-1, 1]: the `2` accounts for the step
-    // being two texels (samples at uv±st), and `max_dist` is the typical
-    // gradient magnitude near the boundary. Renderers that want a unit
-    // vector can renormalise on their end (glass.frag already does).
+    // The Poisson solve uses a scaled RHS (f = 1/max_dist² inside) so u
+    // stays in a precision-friendly range; the gradient is correspond-
+    // ingly small, with magnitude ~1/max_dist near the boundary. Scale
+    // by max_dist/2 to restore the [-1, 1] range (the /2 accounts for
+    // the central-difference step spanning two texels).
     vec2 st = 1.0 / niri_output_size;
     float r = texture(niri_poisson_u, uv + vec2(st.x, 0.0)).r;
     float l = texture(niri_poisson_u, uv - vec2(st.x, 0.0)).r;
@@ -49,7 +49,7 @@ void main() {
     float b = texture(niri_poisson_u, uv - vec2(0.0, st.y)).r;
 
     vec2 grad = vec2(r - l, t - b);
-    vec2 dir = grad / (2.0 * niri_max_dist);
+    vec2 dir = grad * niri_max_dist * 0.5;
 
     frag_color = vec4(mask, dir.x * 0.5 + 0.5, dir.y * 0.5 + 0.5, 1.0);
 }

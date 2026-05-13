@@ -270,6 +270,7 @@ struct JfaSdfBakeProgram {
 struct JfaPoissonInitRhsProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
+    uniform_f_scale: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -367,6 +368,39 @@ struct JfaTextures {
 
 const MASK_VERTICES: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 
+// Allocates an RGBA32F GlesTexture directly via raw GL, bypassing
+// smithay's `Fourcc → GL` mapping (which only knows RGBA8 / RGBA16F).
+// Used for the multigrid `u` textures, where half-float precision is
+// insufficient near gradient minima.
+//
+// Requires GL_EXT_color_buffer_float (for color-renderability) and
+// GL_OES_texture_float_linear (only if the texture is sampled with
+// LINEAR filtering — our prolongation pass does this on the coarse `u`,
+// so the extension is required for correct V-cycle behaviour).
+fn create_rgba32f_buffer(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Buffer>,
+) -> Result<GlesTexture, GlesError> {
+    let tex = renderer.with_context(|gl| unsafe {
+        let mut tex = 0;
+        gl.GenTextures(1, &mut tex);
+        gl.BindTexture(ffi::TEXTURE_2D, tex);
+        gl.TexImage2D(
+            ffi::TEXTURE_2D,
+            0,
+            ffi::RGBA32F as i32,
+            size.w,
+            size.h,
+            0,
+            ffi::RGBA,
+            ffi::FLOAT,
+            std::ptr::null(),
+        );
+        tex
+    })?;
+    Ok(unsafe { GlesTexture::from_raw(renderer, Some(ffi::RGBA32F), false, tex, size) })
+}
+
 unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError> {
     let vert_src = include_str!("shaders/blur_custom.vert");
     let frag_src = include_str!("shaders/mask.frag");
@@ -445,6 +479,7 @@ unsafe fn compile_jfa_poisson_init_rhs(
     Ok(JfaPoissonInitRhsProgram {
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_f_scale: gl.GetUniformLocation(program, c"niri_f_scale".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -732,10 +767,10 @@ impl Blur {
                             let mh = std::cmp::max(1, bbh >> k);
                             let lvl_size = Size::new(mw, mh);
                             pyramid.push(MultigridLevel {
-                                u_a: renderer
-                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
-                                u_b: renderer
-                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                                // u textures need 32-bit float precision; half-
+                                // float bands the gradient near interior maxima.
+                                u_a: create_rgba32f_buffer(renderer, lvl_size)?,
+                                u_b: create_rgba32f_buffer(renderer, lvl_size)?,
                                 rhs: renderer
                                     .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
                                 size: lvl_size,
@@ -1046,6 +1081,11 @@ fn render_jfa_mask(
         // 2. Restrict the mask through the pyramid.
         // 3. Zero all u_a textures (initial guess u = 0).
         // 4. Run one V-cycle.
+        // Scale the RHS so the Poisson solution u stays in a
+        // precision-friendly range for RGBA16F (peak u ~ 1/16 instead of
+        // ~bbox²/16). The encode pass multiplies the gradient back by
+        // max_dist to restore the [-1, 1] range expected by renderers.
+        let f_scale = 1.0 / (max_dist * max_dist);
         init_rhs_level0(
             gl,
             &pipeline.poisson_init_rhs_prog,
@@ -1053,6 +1093,7 @@ fn render_jfa_mask(
             &textures.pyramid[0].rhs,
             textures.pyramid[0].size.w,
             textures.pyramid[0].size.h,
+            f_scale,
         );
         restrict_mask_pyramid(
             gl,
@@ -1096,6 +1137,7 @@ fn render_jfa_mask(
             bbh,
             max_dist,
         );
+
         blit_to_mask_texture(
             gl,
             &textures.encoded,
@@ -1387,6 +1429,7 @@ unsafe fn init_rhs_level0(
     dst_rhs: &GlesTexture,
     level_w: i32,
     level_h: i32,
+    f_scale: f32,
 ) {
     gl.FramebufferTexture2D(
         ffi::DRAW_FRAMEBUFFER,
@@ -1398,6 +1441,7 @@ unsafe fn init_rhs_level0(
 
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform1f(prog.uniform_f_scale, f_scale);
 
     gl.Viewport(0, 0, level_w, level_h);
     gl.ActiveTexture(ffi::TEXTURE0);
