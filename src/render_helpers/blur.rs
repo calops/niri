@@ -32,6 +32,14 @@ pub struct Blur {
     cached_mask_h: i32,
     jfa_pipeline: Option<JfaPipeline>,
     jfa_textures: Option<JfaTextures>,
+    /// Cache for the JFA mask pipeline. The whole pipeline is computed in
+    /// bbox-local coordinates, so its output (`jfa_textures.encoded`) is
+    /// invariant under cursor motion — only the absolute bbox origin
+    /// changes. When these two values match the previous frame, we skip
+    /// the entire pipeline and just re-blit the cached encoded texture at
+    /// the new screen position.
+    cached_jfa_rects_local: Vec<[f32; 4]>,
+    cached_jfa_bbox_size: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -575,6 +583,8 @@ impl Blur {
             cached_mask_h: 0,
             jfa_pipeline: None,
             jfa_textures: None,
+            cached_jfa_rects_local: Vec::new(),
+            cached_jfa_bbox_size: None,
         })
     }
 
@@ -721,6 +731,10 @@ impl Blur {
 
         let need_render = render_mask || need_new_mask;
 
+        // Tracks whether the JFA pipeline allocated new textures this frame;
+        // used below to invalidate the per-bbox cache.
+        let mut jfa_need_alloc = false;
+
         // Use JFA for explicit subregions; fall back to analytical SDF when
         // there's a single region covering the whole window (or none at all).
         let jfa_bbox = if need_render && !options.subregion_rects.is_empty() {
@@ -768,6 +782,7 @@ impl Blur {
                         Some(t) => t.size != bbox_size,
                         None => true,
                     };
+                    jfa_need_alloc = need_alloc;
                     if need_alloc {
                         // Build the multigrid pyramid sized to the bbox.
                         // Level 0 is bbox_size; each subsequent level halves
@@ -812,6 +827,55 @@ impl Blur {
             None
         };
 
+        // Decide whether the previous frame's `textures.encoded` is still
+        // valid: the JFA pipeline runs entirely in bbox-local coordinates,
+        // so its output is invariant under cursor motion (only the bbox
+        // origin in screen pixels changes). We can skip the full pipeline
+        // and just re-blit when (a) the bbox has the same dimensions and
+        // (b) every rect occupies the same offset within the bbox.
+        //
+        // Cache miss on:
+        // - textures freshly allocated this frame (encoded is uninitialised)
+        // - bbox dimensions changed
+        // - any rect's bbox-local pixel position changed
+        let jfa_cache_hit = match jfa_bbox {
+            Some((bbx, bby, bbw, bbh)) if !jfa_need_alloc => {
+                let rects_local: Vec<[f32; 4]> = options
+                    .subregion_rects
+                    .iter()
+                    .map(|r| {
+                        [
+                            r[0] * source_size.w as f32 - bbx as f32,
+                            r[1] * source_size.h as f32 - bby as f32,
+                            r[2] * source_size.w as f32 - bbx as f32,
+                            r[3] * source_size.h as f32 - bby as f32,
+                        ]
+                    })
+                    .collect();
+                let bbox_size = (bbw, bbh);
+                let hit = self.cached_jfa_bbox_size == Some(bbox_size)
+                    && self.cached_jfa_rects_local.len() == rects_local.len()
+                    && self
+                        .cached_jfa_rects_local
+                        .iter()
+                        .zip(rects_local.iter())
+                        .all(|(a, b)| {
+                            (a[0] - b[0]).abs() < 0.01
+                                && (a[1] - b[1]).abs() < 0.01
+                                && (a[2] - b[2]).abs() < 0.01
+                                && (a[3] - b[3]).abs() < 0.01
+                        });
+                self.cached_jfa_rects_local = rects_local;
+                self.cached_jfa_bbox_size = Some(bbox_size);
+                hit
+            }
+            _ => {
+                self.cached_jfa_rects_local.clear();
+                self.cached_jfa_bbox_size = None;
+                false
+            }
+        };
+
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
@@ -836,6 +900,7 @@ impl Blur {
                             source_size.h,
                             &mut self.jfa_pipeline,
                             textures,
+                            jfa_cache_hit,
                         );
                     } else {
                         // Compile mask shader lazily, cache for reuse.
@@ -1034,17 +1099,55 @@ fn render_jfa_mask(
     source_h: i32,
     jfa_pipeline: &mut Option<JfaPipeline>,
     textures: &JfaTextures,
+    cache_hit: bool,
 ) {
     unsafe {
         clear_mask_texture(gl, mask_tex_id);
-        if !ensure_jfa_pipeline(gl, jfa_pipeline) {
-            return;
-        }
-        let pipeline = jfa_pipeline.as_ref().unwrap();
 
         let mut fbo = 0u32;
         gl.GenFramebuffers(1, &mut fbo);
         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+
+        if cache_hit {
+            // textures.encoded is still valid from a previous frame
+            // (bbox-local geometry hasn't changed), so we skip the JFA +
+            // Poisson pipeline and just re-blit at the new screen
+            // position.
+            blit_to_mask_texture(
+                gl,
+                &textures.encoded,
+                mask_tex_id,
+                bbw,
+                bbh,
+                source_w,
+                source_h,
+                options,
+                bbx,
+                bby,
+            );
+            gl.DeleteFramebuffers(1, &mut fbo);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+            gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            return;
+        }
+
+        if !ensure_jfa_pipeline(gl, jfa_pipeline) {
+            gl.DeleteFramebuffers(1, &mut fbo);
+            return;
+        }
+        let pipeline = jfa_pipeline.as_ref().unwrap();
 
         render_binary_mask(
             gl,
