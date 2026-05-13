@@ -313,6 +313,16 @@ struct JfaPoissonProlongateProgram {
 }
 
 #[derive(Debug)]
+struct JfaEncodedBlurProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_axis: ffi::types::GLint,
+    uniform_radius: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
 struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
@@ -333,6 +343,7 @@ struct JfaPipeline {
     poisson_jacobi_prog: JfaPoissonJacobiProgram,
     poisson_residual_restrict_prog: JfaPoissonResidualRestrictProgram,
     poisson_prolongate_prog: JfaPoissonProlongateProgram,
+    encoded_blur_prog: JfaEncodedBlurProgram,
     encode_prog: JfaEncodeProgram,
 }
 
@@ -546,6 +557,22 @@ unsafe fn compile_jfa_poisson_prolongate(
     })
 }
 
+unsafe fn compile_jfa_encoded_blur(
+    gl: &ffi::Gles2,
+) -> Result<JfaEncodedBlurProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_encoded_blur.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaEncodedBlurProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_axis: gl.GetUniformLocation(program, c"niri_axis".as_ptr()),
+        uniform_radius: gl.GetUniformLocation(program, c"niri_radius".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
 unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesError> {
     let vert_src = include_str!("shaders/blur_custom.vert");
     let frag_src = include_str!("shaders/jfa_encode.frag");
@@ -742,11 +769,25 @@ impl Blur {
                     bbox[3] = bbox[3].max(rect[3]);
                 }
                 // Expand bbox by 1px on each side for a guaranteed exterior border.
-                let bbx = ((bbox[0] * source_size.w as f32).floor() as i32 - 1).max(0);
-                let bby = ((bbox[1] * source_size.h as f32).floor() as i32 - 1).max(0);
-                let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32).ceil() as i32 + 2)
+                //
+                // Subregion rects arrive as UV coords (f32) that round-tripped
+                // through a divide-by-blur-width: an integer pixel coord like
+                // 200 becomes 200/1920 in f32, then multiplied back by 1920
+                // here gives 199.99999 or 200.00001 (±1 ULP). A naïve floor()
+                // then jitters between 199 and 200 across frames, which
+                // propagates to bbox-size oscillation and visible "wobble"
+                // even though the geometric input is integer-stable.
+                //
+                // The ULP at value ~200 in f32 is ~2.4e-5. A 1e-4 epsilon is
+                // an order of magnitude above ULP and well below 0.5, so it
+                // snaps integer-close values to the integer without altering
+                // genuinely fractional positions.
+                const EPS: f32 = 1e-4;
+                let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - 1).max(0);
+                let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - 1).max(0);
+                let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2)
                     .max(1).min(source_size.w - bbx);
-                let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32).ceil() as i32 + 2)
+                let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2)
                     .max(1).min(source_size.h - bby);
                 if bbw > 0 && bbh > 0 {
                     let bbox_size = Size::new(bbw, bbh);
@@ -1127,6 +1168,31 @@ fn render_jfa_mask(
             &textures.pyramid[0].u_b
         };
 
+        // Smooth `u` itself before computing the gradient. Bilinear
+        // prolongation at each multigrid level deposits coarse-grid
+        // "tile" structure into level-0 u; the gradient of a tile-shaped
+        // function is polygonal. Attacking the smoothness problem at
+        // the source of u produces a smoother direction field than
+        // post-processing the encoded output would.
+        //
+        // Ping-pongs between u_a and u_b at level 0. After the blur, the
+        // final value lands back in the same texture that held the
+        // V-cycle's output (`poisson_u`); the other becomes scratch.
+        let scratch_u = if final_u_idx == 0 {
+            &textures.pyramid[0].u_b
+        } else {
+            &textures.pyramid[0].u_a
+        };
+        blur_encoded(
+            gl,
+            &pipeline.encoded_blur_prog,
+            poisson_u,
+            scratch_u,
+            bbw,
+            bbh,
+            5,
+        );
+
         encode_output(
             gl,
             &pipeline.encode_prog,
@@ -1194,6 +1260,7 @@ unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipe
             poisson_jacobi_prog: compile_jfa_poisson_jacobi(gl)?,
             poisson_residual_restrict_prog: compile_jfa_poisson_residual_restrict(gl)?,
             poisson_prolongate_prog: compile_jfa_poisson_prolongate(gl)?,
+            encoded_blur_prog: compile_jfa_encoded_blur(gl)?,
             encode_prog: compile_jfa_encode(gl)?,
         })
     })() {
@@ -1891,6 +1958,71 @@ unsafe fn encode_output(
         MASK_VERTICES.as_ptr().cast(),
     );
     gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
+// Post-process the encoded SDF + direction texture with a small
+// separable box blur. Smooths out the polygonal corner artefacts that
+// the multigrid prolongation leaves at coarse-grid resolutions.
+//
+// Uses `scratch` as the horizontal-pass intermediate; the final result
+// lands back in `encoded`.
+unsafe fn blur_encoded(
+    gl: &ffi::Gles2,
+    prog: &JfaEncodedBlurProgram,
+    encoded: &GlesTexture,
+    scratch: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+    radius: i32,
+) {
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+    gl.Uniform1i(prog.uniform_radius, radius);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+
+    // Horizontal pass: encoded → scratch.
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        scratch.tex_id(),
+        0,
+    );
+    gl.Uniform1i(prog.uniform_axis, 0);
+    gl.BindTexture(ffi::TEXTURE_2D, encoded.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.Viewport(0, 0, bbw, bbh);
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+
+    // Vertical pass: scratch → encoded.
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        encoded.tex_id(),
+        0,
+    );
+    gl.Uniform1i(prog.uniform_axis, 1);
+    gl.BindTexture(ffi::TEXTURE_2D, scratch.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.Viewport(0, 0, bbw, bbh);
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+
     gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 }
 

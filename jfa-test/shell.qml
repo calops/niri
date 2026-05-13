@@ -33,8 +33,12 @@ ShellRoot {
             anchors.fill: parent
             hoverEnabled: true
             onPositionChanged: function (mouse) {
-                root.cx = mouse.x
-                root.cy = mouse.y
+                // Snap to integer pixels to eliminate sub-pixel cursor
+                // jitter — verifies that wobble in the mask pipeline
+                // comes from fractional rect positions, not absolute
+                // pixel coords.
+                root.cx = Math.round(mouse.x)
+                root.cy = Math.round(mouse.y)
             }
             onWheel: function (wheel) {
                 // 120 units per detent on a standard wheel. ×1.1 per detent
