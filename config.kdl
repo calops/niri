@@ -231,7 +231,7 @@ window-rule {
   match app-id="^kitty-circle$"
   geometry-corner-radius 1000 1000 1000 1000
   background-effect {
-    shader-pipeline "shaders/jfa-debug"
+    shader-pipeline "shaders/magnify"
   }
 }
 window-rule {
