@@ -95,7 +95,7 @@ pub struct PopupsRule {
 }
 
 /// Resolved popup-specific rules.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ResolvedPopupsRules {
     /// Extra opacity to draw popups with.
     pub opacity: Option<f32>,

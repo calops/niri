@@ -1595,10 +1595,13 @@ impl State {
             shaders_changed = true;
         }
 
-        if config.blur.custom_shader.as_ref() != old_config.blur.custom_shader.as_ref() {
-            let dir = config.blur.custom_shader.as_deref();
+        // Custom blur pipelines are resolved per-window from
+        // `BlurOptions::custom_shader` and cached lazily in `Shaders`
+        // keyed by path. Drop the cache when blur config or window rules
+        // changed so path overrides and shader-file edits get picked up.
+        if config.blur != old_config.blur || config.window_rules != old_config.window_rules {
             self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_blur_program(renderer, dir);
+                shaders::clear_custom_blur_cache(renderer);
             });
             shaders_changed = true;
         }

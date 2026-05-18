@@ -849,9 +849,9 @@ impl Tty {
             if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
                 shaders::set_custom_open_program(gles_renderer, Some(src));
             }
-            if let Some(dir) = config.blur.custom_shader.as_deref() {
-                shaders::set_custom_blur_program(gles_renderer, Some(dir));
-            }
+            // Custom blur pipelines are resolved per-window from
+            // `BlurOptions::custom_shader` and cached lazily in
+            // `Shaders.custom_blur` keyed by path. No eager set here.
             drop(config);
 
             niri.update_shaders();

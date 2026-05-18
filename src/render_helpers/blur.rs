@@ -57,6 +57,10 @@ pub struct BlurOptions {
     pub subregion_rects: Vec<[f32; 4]>,
     pub light_pos: (f32, f32),
     pub light_source: Option<niri_config::LightSource>,
+    /// Path to the directory of the custom blur pipeline to use for this
+    /// window, or `None` to use the default Kawase blur. Cached in
+    /// `Shaders` keyed verbatim by the path string.
+    pub shader_pipeline: Option<String>,
 }
 
 impl BlurOptions {
@@ -87,6 +91,7 @@ impl From<niri_config::Blur> for BlurOptions {
             subregion_rects: Vec::new(),
             light_pos: (0.0, 0.0),
             light_source: config.light_source,
+            shader_pipeline: config.shader_pipeline,
         }
     }
 }
@@ -2153,9 +2158,16 @@ impl Blur {
         let _span = tracy_client::span!("Blur::render");
         trace!("rendering blur");
 
-        let custom = Shaders::get(renderer).custom_blur.borrow().clone();
-        if let Some(custom) = custom {
-            return self.render_custom(renderer, source, &custom, &options);
+        // Per-window custom blur pipeline: if `options.shader_pipeline` is
+        // set, look up (or compile-on-first-use) the corresponding
+        // pipeline from the cache. Falls through to the default Kawase
+        // blur if not set or if the pipeline failed to compile.
+        if let Some(path) = options.shader_pipeline.clone() {
+            let custom =
+                crate::render_helpers::shaders::get_or_compile_custom_blur(renderer, &path);
+            if let Some(custom) = custom {
+                return self.render_custom(renderer, source, &custom, &options);
+            }
         }
 
         ensure!(

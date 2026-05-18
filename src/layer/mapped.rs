@@ -248,7 +248,7 @@ impl MappedLayer {
             surface_anim_scale,
             self.blur_config.clone(),
             radius,
-            self.rules.background_effect,
+            self.rules.background_effect.clone(),
             should_block_out,
             xray_pos,
             &mut |elem| push(elem.into()),
@@ -277,7 +277,7 @@ impl MappedLayer {
         let surface = self.surface.wl_surface();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {
             let popup_rules = match popup {
-                PopupKind::Xdg(_) => self.rules.popups,
+                PopupKind::Xdg(_) => self.rules.popups.clone(),
                 // IME popups aren't affected by rules for regular popups.
                 PopupKind::InputMethod(_) => niri_config::ResolvedPopupsRules::default(),
             };
@@ -300,7 +300,7 @@ impl MappedLayer {
             let geometry = Rectangle::new(location + offset.to_f64(), popup_geo.size.to_f64());
             let surface_off = popup_geo.loc.upscale(-1).to_f64();
             let surface_anim_scale = Scale::from(1.);
-            let mut effect = popup_rules.background_effect;
+            let mut effect = popup_rules.background_effect.clone();
             // Default xray to false for pop-ups since they're always on top of something.
             if effect.xray.is_none() {
                 effect.xray = Some(false);

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use glam::Mat3;
 use smithay::backend::renderer::gles::{
@@ -21,7 +22,11 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
-    pub custom_blur: RefCell<Option<CustomBlurProgram>>,
+    /// Cache of compiled custom blur pipelines keyed by the path string
+    /// from `config.blur.custom_shader` (resolved per-window via
+    /// niri-config merge). The `Option` inside is so we cache compilation
+    /// failures and don't retry-storm on a bad path.
+    pub custom_blur: RefCell<HashMap<String, Option<CustomBlurProgram>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,7 +165,7 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
-            custom_blur: RefCell::new(None),
+            custom_blur: RefCell::new(HashMap::new()),
         }
     }
 
@@ -198,12 +203,6 @@ impl Shaders {
         self.custom_open.replace(program)
     }
 
-    pub fn replace_custom_blur_program(
-        &self,
-        program: Option<CustomBlurProgram>,
-    ) -> Option<CustomBlurProgram> {
-        self.custom_blur.replace(program)
-    }
 
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
         match program {
@@ -362,16 +361,6 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     }
 }
 
-pub fn set_custom_blur_program(renderer: &mut GlesRenderer, dir: Option<&str>) {
-    let program = dir.and_then(|dir| try_load_program(dir, renderer));
-
-    if let Some(prev) = Shaders::get(renderer).replace_custom_blur_program(program) {
-        if let Err(err) = prev.destroy(renderer) {
-            warn!("error destroying previous custom blur shader: {err:?}");
-        }
-    }
-}
-
 fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlurProgram> {
     let path = std::path::Path::new(dir);
     let configs = super::custom_blur::load_custom_blur_pipeline(path)
@@ -392,6 +381,52 @@ fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlur
         configs.len()
     );
     Some(program)
+}
+
+/// Look up a custom blur pipeline by path string. Compiles lazily on
+/// first request for a given path; subsequent calls return the cached
+/// result. Compile failures are cached too so we don't retry-storm on
+/// a bad path.
+pub fn get_or_compile_custom_blur(
+    renderer: &mut GlesRenderer,
+    path: &str,
+) -> Option<CustomBlurProgram> {
+    // Cache hit: short-scope the &Shaders borrow so we can re-borrow
+    // renderer mutably on miss.
+    let cached = Shaders::get(renderer)
+        .custom_blur
+        .borrow()
+        .get(path)
+        .cloned();
+    if let Some(entry) = cached {
+        return entry;
+    }
+    // Cache miss: compile (needs &mut renderer), then write into the
+    // cache. We re-acquire &Shaders after the compile so the borrows
+    // don't overlap.
+    let program = try_load_program(path, renderer);
+    Shaders::get(renderer)
+        .custom_blur
+        .borrow_mut()
+        .insert(path.to_owned(), program.clone());
+    program
+}
+
+/// Drop every cached custom blur program and destroy its GL state. Use
+/// on config reload so shader-file edits are picked up.
+pub fn clear_custom_blur_cache(renderer: &mut GlesRenderer) {
+    let drained: Vec<_> = Shaders::get(renderer)
+        .custom_blur
+        .borrow_mut()
+        .drain()
+        .collect();
+    for (path, program) in drained {
+        if let Some(program) = program {
+            if let Err(err) = program.destroy(renderer) {
+                warn!("error destroying cached custom blur program {path}: {err:?}");
+            }
+        }
+    }
 }
 
 pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {

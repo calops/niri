@@ -1013,7 +1013,7 @@ pub struct Blur {
     pub offset: f64,
     pub noise: f64,
     pub saturation: f64,
-    pub custom_shader: Option<String>,
+    pub shader_pipeline: Option<String>,
     pub light_source: Option<LightSource>,
 }
 
@@ -1025,7 +1025,7 @@ impl Default for Blur {
             offset: 3.,
             noise: 0.02,
             saturation: 1.5,
-            custom_shader: None,
+            shader_pipeline: None,
             light_source: None,
         }
     }
@@ -1054,7 +1054,7 @@ pub struct BlurPart {
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
-    pub custom_shader: Option<String>,
+    pub shader_pipeline: Option<String>,
     #[knuffel(child)]
     pub light_source: Option<LightSource>,
 }
@@ -1068,12 +1068,12 @@ impl MergeWith<BlurPart> for Blur {
 
         merge_clone!((self, part), passes);
         merge!((self, part), offset, noise, saturation);
-        merge_clone_opt!((self, part), custom_shader);
+        merge_clone_opt!((self, part), shader_pipeline);
         merge_clone_opt!((self, part), light_source);
     }
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct BackgroundEffectRule {
     #[knuffel(child, unwrap(argument))]
     pub xray: Option<bool>,
@@ -1083,10 +1083,12 @@ pub struct BackgroundEffectRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub shader_pipeline: Option<String>,
 }
 
 /// Resolved background effect rule.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct BackgroundEffect {
     /// Whether to render with xray effect (see through).
     ///
@@ -1105,6 +1107,7 @@ pub struct BackgroundEffect {
 
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    pub shader_pipeline: Option<String>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
@@ -1118,6 +1121,8 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
         if let Some(x) = part.saturation {
             self.saturation = Some(x.0);
         }
+
+        merge_clone_opt!((self, part), shader_pipeline);
     }
 }
 

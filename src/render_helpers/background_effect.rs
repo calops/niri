@@ -30,12 +30,13 @@ pub struct BackgroundEffect {
     options: Options,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Options {
     pub blur: bool,
     pub xray: bool,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    pub shader_pipeline: Option<String>,
 }
 
 impl Options {
@@ -126,6 +127,7 @@ impl BackgroundEffect {
             xray: effect.xray == Some(true),
             noise: effect.noise,
             saturation: effect.saturation,
+            shader_pipeline: effect.shader_pipeline.clone(),
         };
 
         // If we have some background effect but xray wasn't explicitly set, default it to true
@@ -170,7 +172,10 @@ impl BackgroundEffect {
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred.
         let blur = self.options.blur && !self.blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config.clone()));
+        let mut blur_options = blur.then_some(BlurOptions::from(self.blur_config.clone()));
+        if let (Some(opts), Some(cs)) = (blur_options.as_mut(), &self.options.shader_pipeline) {
+            opts.shader_pipeline = Some(cs.clone());
+        }
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {
