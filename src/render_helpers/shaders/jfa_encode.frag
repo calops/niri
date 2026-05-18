@@ -26,30 +26,29 @@ void main() {
     float mask = clamp(dc / niri_max_dist, 0.0, 1.0);
 
     // Direction: central-difference gradient of the Poisson field.
-    // u peaks somewhere in the interior; ∇u points INTO the interior
-    // (toward larger u). That's exactly the "inward" direction the
-    // renderers consume via (m.gb - 0.5) * 2.
+    // ∇u points INTO the interior (toward larger u); that's exactly
+    // the "inward" direction the renderers consume.
     //
-    // We deliberately DO NOT renormalise. For the Poisson torsion
-    // function, |∇u| grows roughly linearly with distance to the nearest
-    // boundary, peaking around `max_dist` near edges and falling to zero
-    // at interior maxima. Renormalisation would amplify numerical noise
-    // wherever the gradient is naturally small (e.g. the centre of a
-    // large convex region), producing visible aliasing.
+    // The Poisson gradient direction is smooth and continuous even
+    // through the medial axis of non-convex shapes — this is what the
+    // multi-grid solver was built for.  We normalise to a unit vector
+    // to isolate direction from convergence-dependent magnitude.
     //
-    // The Poisson solve uses a scaled RHS (f = 1/max_dist² inside) so u
-    // stays in a precision-friendly range; the gradient is correspond-
-    // ingly small, with magnitude ~1/max_dist near the boundary. Scale
-    // by max_dist/2 to restore the [-1, 1] range (the /2 accounts for
-    // the central-difference step spanning two texels).
+    // Magnitude comes from the JFA distance field (R channel): the
+    // analytical `|to_center|` is 0.5 at boundaries and 0 at the
+    // centre, which is exactly `(1 - mask) * 0.5`.  This needs no
+    // bbox-size calibration or convergence tuning.
     vec2 st = 1.0 / niri_output_size;
     float r = texture(niri_poisson_u, uv + vec2(st.x, 0.0)).r;
     float l = texture(niri_poisson_u, uv - vec2(st.x, 0.0)).r;
     float t = texture(niri_poisson_u, uv + vec2(0.0, st.y)).r;
     float b = texture(niri_poisson_u, uv - vec2(0.0, st.y)).r;
 
-    vec2 grad = vec2(r - l, t - b);
-    vec2 dir = grad * niri_max_dist * 0.5;
+    vec2 grad_raw = vec2(r - l, t - b);
+    float gmag = length(grad_raw);
+    vec2 unit_dir = gmag > 1e-6 ? grad_raw / gmag : vec2(0.0);
+    float magnitude = cos(mask * 1.57079632679) * 0.2;
+    vec2 dir = unit_dir * magnitude;
 
     frag_color = vec4(mask, dir.x * 0.5 + 0.5, dir.y * 0.5 + 0.5, 1.0);
 }

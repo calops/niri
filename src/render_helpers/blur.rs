@@ -342,6 +342,16 @@ struct JfaEncodeProgram {
 }
 
 #[derive(Debug)]
+struct JfaEncodeDebugProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_poisson_u: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_max_dist: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
 struct JfaPipeline {
     binary_prog: JfaBinaryProgram,
     init_prog: JfaInitProgram,
@@ -353,6 +363,7 @@ struct JfaPipeline {
     poisson_residual_restrict_prog: JfaPoissonResidualRestrictProgram,
     poisson_prolongate_prog: JfaPoissonProlongateProgram,
     encode_prog: JfaEncodeProgram,
+    encode_debug_prog: JfaEncodeDebugProgram,
 }
 
 #[derive(Debug)]
@@ -579,6 +590,20 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
     })
 }
 
+unsafe fn compile_jfa_encode_debug(gl: &ffi::Gles2) -> Result<JfaEncodeDebugProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/jfa_encode_debug.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(JfaEncodeDebugProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_poisson_u: gl.GetUniformLocation(program, c"niri_poisson_u".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
 impl Blur {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
         let program = Shaders::get(renderer).blur.clone()?;
@@ -786,9 +811,11 @@ impl Blur {
                 let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - 1).max(0);
                 let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - 1).max(0);
                 let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2)
-                    .max(1).min(source_size.w - bbx);
+                    .max(1)
+                    .min(source_size.w - bbx);
                 let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2)
-                    .max(1).min(source_size.h - bby);
+                    .max(1)
+                    .min(source_size.h - bby);
                 if bbw > 0 && bbh > 0 {
                     let bbox_size = Size::new(bbw, bbh);
                     let need_alloc = match &self.jfa_textures {
@@ -812,8 +839,7 @@ impl Blur {
                                 // float bands the gradient near interior maxima.
                                 u_a: create_rgba32f_buffer(renderer, lvl_size)?,
                                 u_b: create_rgba32f_buffer(renderer, lvl_size)?,
-                                rhs: renderer
-                                    .create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                                rhs: renderer.create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
                                 size: lvl_size,
                             });
                             if mw == 1 || mh == 1 {
@@ -1115,6 +1141,19 @@ impl Blur {
     }
 }
 
+// When true, replaces the normal encode pass with a gradient-magnitude
+// heatmap (jfa_encode_debug.frag).  Interior pixels are coloured by the
+// decoded direction magnitude `|∇u * max_dist * 0.5|`:
+//
+//   blue → 0.0         green → 0.25        yellow → 0.5         red → 1.0+
+//
+// The analytical `|to_center|` peaks at 0.5 at a straight boundary.
+// If the heatmap shows green at boundaries the Poisson gradient is too
+// weak; if it shows red it's too strong.  Once calibrated, adjust the
+// `* 0.5` factor in `jfa_encode.frag` line 52 so that boundary pixels
+// read yellow.
+const JFA_DEBUG_ENCODE: bool = false;
+
 fn render_jfa_mask(
     gl: &ffi::Gles2,
     options: &BlurOptions,
@@ -1241,11 +1280,7 @@ fn render_jfa_mask(
             textures.pyramid[0].size.h,
             f_scale,
         );
-        restrict_mask_pyramid(
-            gl,
-            &pipeline.poisson_restrict_mask_prog,
-            &textures.pyramid,
-        );
+        restrict_mask_pyramid(gl, &pipeline.poisson_restrict_mask_prog, &textures.pyramid);
         for lvl in &textures.pyramid {
             gl.FramebufferTexture2D(
                 ffi::DRAW_FRAMEBUFFER,
@@ -1268,8 +1303,7 @@ fn render_jfa_mask(
         // per-cycle damping.
         let mut final_u_idx = 0;
         for _ in 0..2 {
-            final_u_idx =
-                run_v_cycle(gl, pipeline, &textures.pyramid, 12, 12, 0.8, final_u_idx);
+            final_u_idx = run_v_cycle(gl, pipeline, &textures.pyramid, 12, 12, 0.8, final_u_idx);
         }
         let poisson_u = if final_u_idx == 0 {
             &textures.pyramid[0].u_a
@@ -1277,16 +1311,29 @@ fn render_jfa_mask(
             &textures.pyramid[0].u_b
         };
 
-        encode_output(
-            gl,
-            &pipeline.encode_prog,
-            jfa_result,
-            poisson_u,
-            &textures.encoded,
-            bbw,
-            bbh,
-            max_dist,
-        );
+        if JFA_DEBUG_ENCODE {
+            encode_output_debug(
+                gl,
+                &pipeline.encode_debug_prog,
+                jfa_result,
+                poisson_u,
+                &textures.encoded,
+                bbw,
+                bbh,
+                max_dist,
+            );
+        } else {
+            encode_output(
+                gl,
+                &pipeline.encode_prog,
+                jfa_result,
+                poisson_u,
+                &textures.encoded,
+                bbw,
+                bbh,
+                max_dist,
+            );
+        }
 
         blit_to_mask_texture(
             gl,
@@ -1308,8 +1355,16 @@ fn render_jfa_mask(
         gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_WRAP_S,
+            ffi::CLAMP_TO_EDGE as i32,
+        );
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_WRAP_T,
+            ffi::CLAMP_TO_EDGE as i32,
+        );
     }
 }
 
@@ -1345,6 +1400,7 @@ unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipe
             poisson_residual_restrict_prog: compile_jfa_poisson_residual_restrict(gl)?,
             poisson_prolongate_prog: compile_jfa_poisson_prolongate(gl)?,
             encode_prog: compile_jfa_encode(gl)?,
+            encode_debug_prog: compile_jfa_encode_debug(gl)?,
         })
     })() {
         Ok(p) => {
@@ -1401,10 +1457,26 @@ unsafe fn render_binary_mask(
         ffi::FLOAT,
         rects_px.as_ptr() as *const _,
     );
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
 
     gl.FramebufferTexture2D(
         ffi::DRAW_FRAMEBUFFER,
@@ -1439,10 +1511,26 @@ unsafe fn render_binary_mask(
     gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 
     gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
 }
 
 unsafe fn jfa_init_pass(
@@ -1481,10 +1569,26 @@ unsafe fn jfa_init_pass(
     gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 
     gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
 }
 
 unsafe fn run_jfa_steps<'a>(
@@ -1520,8 +1624,16 @@ unsafe fn run_jfa_steps<'a>(
 
         gl.Viewport(0, 0, bbw, bbh);
         gl.BindTexture(ffi::TEXTURE_2D, read_tex.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_MIN_FILTER,
+            ffi::NEAREST as i32,
+        );
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_MAG_FILTER,
+            ffi::NEAREST as i32,
+        );
 
         gl.EnableVertexAttribArray(prog.attrib_vert as u32);
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1570,8 +1682,16 @@ unsafe fn bake_sdf(
 
     gl.Viewport(0, 0, bbw, bbh);
     gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1614,8 +1734,16 @@ unsafe fn init_rhs_level0(
     gl.Viewport(0, 0, level_w, level_h);
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, bin.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1716,8 +1844,16 @@ unsafe fn jacobi_smooth(
     // RHS stays bound on TEXTURE1 across all sweeps.
     gl.ActiveTexture(ffi::TEXTURE1);
     gl.BindTexture(ffi::TEXTURE_2D, lvl.rhs.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1748,8 +1884,16 @@ unsafe fn jacobi_smooth(
 
         gl.ActiveTexture(ffi::TEXTURE0);
         gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_MIN_FILTER,
+            ffi::NEAREST as i32,
+        );
+        gl.TexParameteri(
+            ffi::TEXTURE_2D,
+            ffi::TEXTURE_MAG_FILTER,
+            ffi::NEAREST as i32,
+        );
 
         gl.Viewport(0, 0, lvl.size.w, lvl.size.h);
         gl.DrawArrays(ffi::TRIANGLES, 0, 6);
@@ -1775,7 +1919,11 @@ unsafe fn residual_restrict(
 ) {
     let fine = &pyramid[fine_level];
     let coarse = &pyramid[fine_level + 1];
-    let fine_u = if fine_u_idx == 0 { &fine.u_a } else { &fine.u_b };
+    let fine_u = if fine_u_idx == 0 {
+        &fine.u_a
+    } else {
+        &fine.u_b
+    };
     let h_sq_fine = (1u64 << (2 * fine_level)) as f32;
 
     gl.FramebufferTexture2D(
@@ -1798,13 +1946,29 @@ unsafe fn residual_restrict(
 
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, fine_u.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.ActiveTexture(ffi::TEXTURE1);
     gl.BindTexture(ffi::TEXTURE_2D, fine.rhs.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1856,8 +2020,16 @@ unsafe fn prolongate(
 ) -> usize {
     let fine = &pyramid[fine_level];
     let coarse = &pyramid[fine_level + 1];
-    let fine_u = if fine_u_idx == 0 { &fine.u_a } else { &fine.u_b };
-    let fine_dst = if fine_u_idx == 0 { &fine.u_b } else { &fine.u_a };
+    let fine_u = if fine_u_idx == 0 {
+        &fine.u_a
+    } else {
+        &fine.u_b
+    };
+    let fine_dst = if fine_u_idx == 0 {
+        &fine.u_b
+    } else {
+        &fine.u_a
+    };
     let coarse_u = if coarse_u_idx == 0 {
         &coarse.u_a
     } else {
@@ -1879,8 +2051,16 @@ unsafe fn prolongate(
 
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, fine_u.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.ActiveTexture(ffi::TEXTURE1);
     gl.BindTexture(ffi::TEXTURE_2D, coarse_u.tex_id());
@@ -1901,8 +2081,16 @@ unsafe fn prolongate(
 
     gl.ActiveTexture(ffi::TEXTURE2);
     gl.BindTexture(ffi::TEXTURE_2D, fine.rhs.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
 
     gl.EnableVertexAttribArray(prog.attrib_vert as u32);
     gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
@@ -1930,8 +2118,8 @@ unsafe fn prolongate(
 // Caller must have:
 //   1. Initialised pyramid[0].rhs via init_rhs_level0.
 //   2. Restricted the mask through the pyramid via restrict_mask_pyramid.
-//   3. Cleared all pyramid[k].u_a to zero (initial guess u = 0 for k=0,
-//      correction initial guess e = 0 for k > 0).
+//   3. Cleared all pyramid[k].u_a to zero (initial guess u = 0 for k=0, correction initial guess e
+//      = 0 for k > 0).
 unsafe fn run_v_cycle(
     gl: &ffi::Gles2,
     pipeline: &JfaPipeline,
@@ -2003,6 +2191,71 @@ unsafe fn run_v_cycle(
     u_idx[0]
 }
 
+unsafe fn encode_output_debug(
+    gl: &ffi::Gles2,
+    prog: &JfaEncodeDebugProgram,
+    jfa: &GlesTexture,
+    poisson_u: &GlesTexture,
+    dst: &GlesTexture,
+    bbw: i32,
+    bbh: i32,
+    max_dist: f32,
+) {
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_input, 0);
+    gl.Uniform1i(prog.uniform_poisson_u, 1);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
+    gl.Uniform1f(prog.uniform_max_dist, max_dist);
+
+    gl.Viewport(0, 0, bbw, bbh);
+
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, poisson_u.tex_id());
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
+
+    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        MASK_VERTICES.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+}
+
 unsafe fn encode_output(
     gl: &ffi::Gles2,
     prog: &JfaEncodeProgram,
@@ -2033,8 +2286,16 @@ unsafe fn encode_output(
     // values for the central-difference gradient.
     gl.ActiveTexture(ffi::TEXTURE1);
     gl.BindTexture(ffi::TEXTURE_2D, poisson_u.tex_id());
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
     gl.TexParameteri(
         ffi::TEXTURE_2D,
         ffi::TEXTURE_WRAP_S,
