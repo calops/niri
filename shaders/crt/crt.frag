@@ -34,7 +34,7 @@ const float u_scanlineWidth = 0.35;
 const float u_phosphorStrength = 0.6;
 
 // Phosphor dot spacing in output pixels (smaller = denser dots)
-// Typical range 1.5 to 4.0
+// Subtle 1.5 | Balanced 2.5 | Heavy 3.5
 const float u_phosphorScale = 2.0;
 
 // Bloom strength: 0.0 = none, 1.0 = heavy glow
