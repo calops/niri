@@ -26,7 +26,7 @@ const float u_chromatic = 0.008;
 const float u_scanlineStrength = 0.6;
 
 // Scanline gap width: 0.25 = thin lines (wide gap), 0.5 = thick lines
-// Heavy = thicker dark bands
+// Subtle 0.5 | Balanced 0.45 | Heavy 0.35
 const float u_scanlineWidth = 0.35;
 
 // Phosphor mask strength: 0.0 = off, 1.0 = strong dots
