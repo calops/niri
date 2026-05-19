@@ -10,32 +10,32 @@ prefer-no-csd
 animations {
     slowdown 1.000000;
 
-    window-open {
-        duration-ms 5000
-        curve "ease-out-expo"
-        custom-shader r#"
-            vec4 open_color(vec3 coords_geo, vec3 size_geo) {
-                float progress = niri_clamped_progress;
-                float inv = 1.0 - progress;
-                float x = coords_geo.x;
-                float y = coords_geo.y;
-                float s = niri_random_seed * 6.283;
-
-                float drip = sin(x * 12.57 + s) * 0.18
-                           + sin(x * 25.13 + s * 1.7) * 0.09
-                           + sin(x * 43.98 + s * 0.4) * 0.04;
-
-                float offset = inv + drip * inv;
-
-                float stretch = 1.0 + abs(drip) * 0.3 * inv;
-                float remapped_y = (y - 0.5) / stretch + 0.5;
-
-                vec3 shifted = vec3(x, remapped_y + offset, 1.0);
-                vec3 coords_tex = niri_geo_to_tex * shifted;
-                return texture2D(niri_tex, coords_tex.st);
-            }
-        "#
-    }
+    // window-open {
+    //     duration-ms 5000
+    //     curve "ease-out-expo"
+    //     custom-shader r#"
+    //         vec4 open_color(vec3 coords_geo, vec3 size_geo) {
+    //             float progress = niri_clamped_progress;
+    //             float inv = 1.0 - progress;
+    //             float x = coords_geo.x;
+    //             float y = coords_geo.y;
+    //             float s = niri_random_seed * 6.283;
+    //
+    //             float drip = sin(x * 12.57 + s) * 0.18
+    //                        + sin(x * 25.13 + s * 1.7) * 0.09
+    //                        + sin(x * 43.98 + s * 0.4) * 0.04;
+    //
+    //             float offset = inv + drip * inv;
+    //
+    //             float stretch = 1.0 + abs(drip) * 0.3 * inv;
+    //             float remapped_y = (y - 0.5) / stretch + 0.5;
+    //
+    //             vec3 shifted = vec3(x, remapped_y + offset, 1.0);
+    //             vec3 coords_tex = niri_geo_to_tex * shifted;
+    //             return texture2D(niri_tex, coords_tex.st);
+    //         }
+    //     "#
+    // }
 }
 overview { zoom 0.25; }
 
@@ -115,7 +115,7 @@ environment {
 
 blur {
     noise 0
-    shader-pipeline "shaders/crt"
+    shader-pipeline "shaders/overshifted3"
     light-source 0.0 0.333
 }
 
