@@ -35,7 +35,7 @@ const float u_phosphorStrength = 0.6;
 
 // Phosphor dot spacing in output pixels (smaller = denser dots)
 // Subtle 1.5 | Balanced 2.5 | Heavy 3.5
-const float u_phosphorScale = 2.0;
+const float u_phosphorScale = 3.5;
 
 // Bloom strength: 0.0 = none, 1.0 = heavy glow
 // Subtle 0.05 | Balanced 0.15 | Heavy 0.3
