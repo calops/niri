@@ -14,24 +14,24 @@ ShellRoot {
     readonly property int numColumns: Math.floor(2 * circBaseR / columnWidth)
 
     readonly property var circleColumns: {
-        var cols = [];
-        var r = circBaseR;
+        var cols = []
+        var r = circBaseR
         for (var i = 0; i < numColumns; i++) {
-            var colCenterX = -r + columnWidth / 2.0 + i * columnWidth;
-            var t = Math.abs(colCenterX) / r;
-            if (t > 1.0)
-                continue;
-            var halfChord = Math.sqrt(1.0 - t * t) * r;
+            var colCenterX = -r + columnWidth / 2.0 + i * columnWidth
+            var t = Math.abs(colCenterX) / r
+            if (t > 1.0) continue
+            var halfChord = Math.sqrt(1.0 - t * t) * r
             cols.push({
                 rx: colCenterX - columnWidth / 2.0,
                 ry: -halfChord,
                 rw: columnWidth,
                 rh: 2 * halfChord
-            });
+            })
         }
-        cols;
+        cols
     }
 
+    readonly property int circleOffset: 300
     property var circleItems: []
 
     Component {
@@ -44,6 +44,19 @@ ShellRoot {
             height: Math.round(col.rh * root.shapeScale + 2 * root.overlap)
             property var col
         }
+    }
+
+    Component.onCompleted: {
+        var items = []
+        var cols = root.circleColumns
+        for (var c = 0; c < 2; c++) {
+            var parent = c === 0 ? circleContainer : circleContainer2
+            for (var i = 0; i < cols.length; i++) {
+                var item = columnComp.createObject(parent, {col: cols[i]})
+                items.push(item)
+            }
+        }
+        root.circleItems = items
     }
 
     PanelWindow {
@@ -63,13 +76,13 @@ ShellRoot {
             anchors.fill: parent
             hoverEnabled: true
             onPositionChanged: function (mouse) {
-                root.cx = Math.round(mouse.x);
-                root.cy = Math.round(mouse.y);
+                root.cx = Math.round(mouse.x)
+                root.cy = Math.round(mouse.y)
             }
             onWheel: function (wheel) {
-                var step = Math.pow(1.1, wheel.angleDelta.y / 120);
-                root.shapeScale = Math.max(0.1, Math.min(5.0, root.shapeScale * step));
-                wheel.accepted = true;
+                var step = Math.pow(1.1, wheel.angleDelta.y / 120)
+                root.shapeScale = Math.max(0.1, Math.min(5.0, root.shapeScale * step))
+                wheel.accepted = true
             }
         }
 
@@ -77,17 +90,12 @@ ShellRoot {
             id: circleContainer
             x: root.cx
             y: root.cy
+        }
 
-            Component.onCompleted: {
-                var items = [];
-                for (var i = 0; i < root.circleColumns.length; i++) {
-                    var item = columnComp.createObject(this, {
-                        col: root.circleColumns[i]
-                    });
-                    items.push(item);
-                }
-                root.circleItems = items;
-            }
+        Item {
+            id: circleContainer2
+            x: root.cx + root.circleOffset
+            y: root.cy
         }
 
         BackgroundEffect.blurRegion: Region {

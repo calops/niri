@@ -33,9 +33,9 @@ const float u_scanlineWidth = 0.35;
 // Subtle 0.0 | Balanced 0.3 | Heavy 0.6
 const float u_phosphorStrength = 0.6;
 
-// Phosphor dot spacing in output pixels (smaller = denser dots)
-// Subtle 1.5 | Balanced 2.5 | Heavy 3.5
-const float u_phosphorScale = 3.5;
+// Phosphor dot spacing in output pixels (larger = bigger visible dots)
+// Subtle 1.5 | Balanced 2.5 | Heavy 5.0
+const float u_phosphorScale = 5.0;
 
 // Bloom strength: 0.0 = none, 1.0 = heavy glow
 // Subtle 0.05 | Balanced 0.15 | Heavy 0.3
@@ -107,9 +107,9 @@ void main() {
     vec2 pixel_coord = gl_FragCoord.xy / u_phosphorScale;
     vec2 cell_uv = fract(pixel_coord);
 
-    float r_dot = 1.0 - smoothstep(0.3, 0.35, length(cell_uv - vec2(0.25, 0.5)));
-    float g_dot = 1.0 - smoothstep(0.3, 0.35, length(cell_uv - vec2(0.5, 0.5)));
-    float b_dot = 1.0 - smoothstep(0.3, 0.35, length(cell_uv - vec2(0.75, 0.5)));
+    float r_dot = 1.0 - smoothstep(0.35, 0.45, length(cell_uv - vec2(0.25, 0.5)));
+    float g_dot = 1.0 - smoothstep(0.35, 0.45, length(cell_uv - vec2(0.5, 0.5)));
+    float b_dot = 1.0 - smoothstep(0.35, 0.45, length(cell_uv - vec2(0.75, 0.5)));
 
     color.r = mix(color.r, color.r * r_dot, u_phosphorStrength);
     color.g = mix(color.g, color.g * g_dot, u_phosphorStrength);

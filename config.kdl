@@ -115,7 +115,7 @@ environment {
 
 blur {
     noise 0
-    shader-pipeline "shaders/magnify"
+    shader-pipeline "shaders/crt"
     light-source 0.0 0.333
 }
 
