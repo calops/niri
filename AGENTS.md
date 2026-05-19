@@ -52,7 +52,7 @@ The entire JFA pipeline runs in bbox-local coordinates. If the bbox size and per
 | File | Role |
 |------|------|
 | `src/render_helpers/blur.rs` (2601 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, all JFA/Poisson structs and pipeline stages, multigrid V-cycle |
-| `src/render_helpers/custom_blur.rs` (75 lines) | Parses `pipeline.kdl` → `Vec<CustomBlurPassConfig>` |
+| `src/render_helpers/custom_blur.rs` (95 lines) | Parses `pipeline.kdl` → `PipelineConfig` (mask_pass + render_passes) |
 | `src/render_helpers/shaders/mod.rs` (440 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `src/render_helpers/background_effect.rs` (337 lines) | `BackgroundEffect`, `Options`, `RenderParams` — ties blur config to window/layer rendering |
 | `src/render_helpers/framebuffer_effect.rs` (497 lines) | `FramebufferEffect` — captures framebuffer, runs blur, draws result |
@@ -79,13 +79,19 @@ All in `src/render_helpers/shaders/`:
 ## User-provided pipeline format
 
 A directory containing:
-- `pipeline.kdl` — KDL manifest listing passes:
+- `pipeline.kdl` — KDL manifest listing render passes and optionally a mask pass:
   ```kdl
-  pass "name" file="shader.frag" scale=1.0
+  mask-pass "circle_mask" file="circle_mask.frag" scale=1.0
+  render-pass "glass" file="glass.frag" scale=1.0
+  render-pass "post" file="post.frag" scale=1.0
   ```
 - `.frag` files referenced in the manifest
 
-Each pass receives these uniforms: `niri_input` (TEXTURE0), `niri_output_size`, `niri_input_size`, `niri_half_pixel`, `niri_pass`, `niri_pass_count`, `niri_geo_size`, `niri_corner_radius`, `niri_mask` (TEXTURE1, the mask texture), `niri_light_pos`.
+Each **render pass** receives these uniforms: `niri_input` (TEXTURE0), `niri_output_size`, `niri_input_size`, `niri_half_pixel`, `niri_pass`, `niri_pass_count`, `niri_geo_size`, `niri_corner_radius`, `niri_mask` (TEXTURE1, the mask texture), `niri_light_pos`.
+
+The optional **mask pass** receives: `niri_subregion_count` (int), `niri_subregion_rects` (sampler2D at TEXTURE1, a 1×N RGBA32F texture of rects in source pixels), `niri_mask_size` (vec2, the render target size), `niri_bbox_origin` (vec2, always (0,0)), `niri_geo_size` (vec2), `niri_corner_radius` (vec4). It outputs to `frag_color` in the same convention as `mask.frag`: R=mask, G=dir_x*0.5+0.5, B=dir_y*0.5+0.5.
+
+When a `mask-pass` is present, the built-in mask heuristic (JFA+Poisson vs. analytical SDF) is bypassed; the custom mask pass runs at full source resolution instead.
 
 See `shaders/` directory for example pipelines (crt, magnify, overshifted3, etc.).
 
@@ -99,9 +105,10 @@ Window/Layer render loop
 
 Blur::render() (blur.rs line 2413)
   → if shader_pipeline set: get_or_compile_custom_blur() → Blur::render_custom()
-    → if subregion_rects non-empty & not single-full: render_jfa_mask() [JFA+Poisson pipeline]
+    → if custom mask pass declared: render custom mask pass (at full source resolution)
+    → else if subregion_rects non-empty & not single-full: render_jfa_mask() [JFA+Poisson pipeline]
     → else: render analytical SDF mask
-    → for each custom pass: bind textures, set uniforms, draw fullscreen quad
+    → for each custom render pass: bind textures, set uniforms, draw fullscreen quad
   → else: default Kawase down/up passes
 ```
 

@@ -3,14 +3,37 @@ use std::path::Path;
 use anyhow::{ensure, Context as _};
 
 #[derive(Debug, Clone)]
-pub struct CustomBlurPassConfig {
+pub struct CustomMaskPassConfig {
     pub name: String,
     pub source: String,
     pub scale: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct CustomRenderPassConfig {
+    pub name: String,
+    pub source: String,
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    pub mask_pass: Option<CustomMaskPassConfig>,
+    pub render_passes: Vec<CustomRenderPassConfig>,
+}
+
 #[derive(knuffel::Decode, Debug)]
-struct PipelinePass {
+struct RenderPass {
+    #[knuffel(argument)]
+    name: String,
+    #[knuffel(property)]
+    file: String,
+    #[knuffel(property, default = 1.0)]
+    scale: f32,
+}
+
+#[derive(knuffel::Decode, Debug)]
+struct MaskPass {
     #[knuffel(argument)]
     name: String,
     #[knuffel(property)]
@@ -21,11 +44,13 @@ struct PipelinePass {
 
 #[derive(knuffel::Decode, Debug)]
 struct PipelineManifest {
-    #[knuffel(children)]
-    passes: Vec<PipelinePass>,
+    #[knuffel(child)]
+    mask_pass: Option<MaskPass>,
+    #[knuffel(children(name = "render-pass"))]
+    render_passes: Vec<RenderPass>,
 }
 
-pub fn load_custom_blur_pipeline(dir: &Path) -> anyhow::Result<Vec<CustomBlurPassConfig>> {
+pub fn load_custom_blur_pipeline(dir: &Path) -> anyhow::Result<PipelineConfig> {
     ensure!(
         dir.is_dir(),
         "custom shader path is not a directory: {}",
@@ -41,15 +66,38 @@ pub fn load_custom_blur_pipeline(dir: &Path) -> anyhow::Result<Vec<CustomBlurPas
             .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
 
     ensure!(
-        !manifest.passes.is_empty(),
-        "pipeline must have at least one pass"
+        !manifest.render_passes.is_empty(),
+        "pipeline must have at least one render-pass"
     );
 
-    let mut passes = Vec::with_capacity(manifest.passes.len());
-    for (i, pass) in manifest.passes.iter().enumerate() {
+    let mask_pass = if let Some(mask) = manifest.mask_pass {
+        ensure!(
+            mask.scale > 0.0,
+            "mask-pass ({:?}): scale must be positive",
+            mask.name
+        );
+        let frag_path = dir.join(&mask.file);
+        let source = std::fs::read_to_string(&frag_path).with_context(|| {
+            format!(
+                "failed to read mask-pass ({:?}): {}",
+                mask.name,
+                frag_path.display()
+            )
+        })?;
+        Some(CustomMaskPassConfig {
+            name: mask.name,
+            source,
+            scale: mask.scale,
+        })
+    } else {
+        None
+    };
+
+    let mut render_passes = Vec::with_capacity(manifest.render_passes.len());
+    for (i, pass) in manifest.render_passes.iter().enumerate() {
         ensure!(
             pass.scale > 0.0,
-            "pass {} ({:?}): scale must be positive",
+            "render-pass {} ({:?}): scale must be positive",
             i,
             pass.name
         );
@@ -57,19 +105,22 @@ pub fn load_custom_blur_pipeline(dir: &Path) -> anyhow::Result<Vec<CustomBlurPas
         let frag_path = dir.join(&pass.file);
         let source = std::fs::read_to_string(&frag_path).with_context(|| {
             format!(
-                "failed to read pass {} ({:?}): {}",
+                "failed to read render-pass {} ({:?}): {}",
                 i,
                 pass.name,
                 frag_path.display()
             )
         })?;
 
-        passes.push(CustomBlurPassConfig {
+        render_passes.push(CustomRenderPassConfig {
             name: pass.name.clone(),
             source,
             scale: pass.scale,
         });
     }
 
-    Ok(passes)
+    Ok(PipelineConfig {
+        mask_pass,
+        render_passes,
+    })
 }

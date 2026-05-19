@@ -1,1 +1,1 @@
-pass "viz" file="viz.frag" scale=1.0
+render-pass "viz" file="viz.frag" scale=1.0

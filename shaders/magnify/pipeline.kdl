@@ -1,2 +1,2 @@
-pass "magnify" file="magnify.frag" scale=1.0
-pass "glass" file="glass.frag" scale=1.0
+render-pass "magnify" file="magnify.frag" scale=1.0
+render-pass "glass" file="glass.frag" scale=1.0

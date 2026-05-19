@@ -363,22 +363,24 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
 
 fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlurProgram> {
     let path = std::path::Path::new(dir);
-    let configs = super::custom_blur::load_custom_blur_pipeline(path)
+    let config = super::custom_blur::load_custom_blur_pipeline(path)
         .inspect_err(|err| warn!("error loading custom blur shader from {dir}: {err:?}"))
         .ok()?;
 
-    if configs.is_empty() {
-        warn!("custom blur pipeline has no passes, ignoring");
-        return None;
+    if let Some(mask_cfg) = &config.mask_pass {
+        info!(
+            "custom blur pipeline has mask pass ({:?}) from {dir}",
+            mask_cfg.name
+        );
     }
 
-    let program = CustomBlurProgram::compile(renderer, &configs)
+    let program = CustomBlurProgram::compile(renderer, &config)
         .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
         .ok()?;
 
     info!(
-        "loaded custom blur shader with {} passes from {dir}",
-        configs.len()
+        "loaded custom blur shader with {} render passes from {dir}",
+        config.render_passes.len()
     );
     Some(program)
 }

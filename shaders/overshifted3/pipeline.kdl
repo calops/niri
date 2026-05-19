@@ -1,3 +1,3 @@
-pass "down0" file="down.frag" scale=0.5
-pass "up0" file="up.frag" scale=2.0
-pass "glass" file="glass.frag" scale=1.0
+render-pass "down0" file="down.frag" scale=0.5
+render-pass "up0" file="up.frag" scale=2.0
+render-pass "glass" file="glass.frag" scale=1.0

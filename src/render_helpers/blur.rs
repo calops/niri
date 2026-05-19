@@ -9,6 +9,7 @@ use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Textu
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
+use crate::render_helpers::custom_blur::PipelineConfig;
 use crate::render_helpers::shaders::Shaders;
 
 #[derive(Debug)]
@@ -170,6 +171,7 @@ struct CustomBlurPassProgram {
 
 #[derive(Debug)]
 struct CustomBlurProgramInner {
+    mask_program: Option<CustomMaskProgram>,
     passes: Vec<CustomBlurPassProgram>,
     scales: Vec<f32>,
 }
@@ -212,28 +214,79 @@ unsafe fn compile_custom_pass(
     })
 }
 
+unsafe fn compile_custom_mask_pass(
+    gl: &ffi::Gles2,
+    frag_src: &str,
+) -> Result<CustomMaskProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+
+    let subregion_count = c"niri_subregion_count";
+    let subregion_rects = c"niri_subregion_rects";
+    let mask_size = c"niri_mask_size";
+    let bbox_origin = c"niri_bbox_origin";
+    let geo_size = c"niri_geo_size";
+    let corner_radius = c"niri_corner_radius";
+    let vert = c"vert";
+
+    Ok(CustomMaskProgram {
+        program,
+        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
+        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
+        uniform_mask_size: gl.GetUniformLocation(program, mask_size.as_ptr()),
+        uniform_bbox_origin: gl.GetUniformLocation(program, bbox_origin.as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
+        uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+    })
+}
+
 impl CustomBlurProgram {
     pub fn compile(
         renderer: &mut GlesRenderer,
-        pass_configs: &[crate::render_helpers::custom_blur::CustomBlurPassConfig],
+        config: &PipelineConfig,
     ) -> anyhow::Result<Self> {
-        let scales: Vec<f32> = pass_configs.iter().map(|c| c.scale).collect();
+        let scales: Vec<f32> = config.render_passes.iter().map(|c| c.scale).collect();
         renderer
             .with_context(move |gl| unsafe {
-                let mut passes = Vec::with_capacity(pass_configs.len());
-                for (i, config) in pass_configs.iter().enumerate() {
-                    let pass = compile_custom_pass(gl, &config.source).with_context(|| {
-                        format!("error compiling custom blur pass {} ({:?})", i, config.name)
+                let mask_program = if let Some(mask_cfg) = &config.mask_pass {
+                    Some(
+                        compile_custom_mask_pass(gl, &mask_cfg.source)
+                            .with_context(|| {
+                                format!(
+                                    "error compiling custom mask pass ({:?})",
+                                    mask_cfg.name
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+
+                let mut passes = Vec::with_capacity(config.render_passes.len());
+                for (i, render_cfg) in config.render_passes.iter().enumerate() {
+                    let pass = compile_custom_pass(gl, &render_cfg.source).with_context(|| {
+                        format!(
+                            "error compiling custom render pass {} ({:?})",
+                            i, render_cfg.name
+                        )
                     })?;
                     passes.push(pass);
                 }
-                Ok(Self(Rc::new(CustomBlurProgramInner { passes, scales })))
+                Ok(Self(Rc::new(CustomBlurProgramInner {
+                    mask_program,
+                    passes,
+                    scales,
+                })))
             })
             .context("error making GL context current")?
     }
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         renderer.with_context(move |gl| unsafe {
+            if let Some(mask) = &self.0.mask_program {
+                gl.DeleteProgram(mask.program);
+            }
             for pass in &self.0.passes {
                 gl.DeleteProgram(pass.program);
             }
@@ -244,6 +297,18 @@ impl CustomBlurProgram {
 #[derive(Debug)]
 struct MaskProgram {
     program: ffi::types::GLuint,
+    uniform_geo_size: ffi::types::GLint,
+    uniform_corner_radius: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct CustomMaskProgram {
+    program: ffi::types::GLuint,
+    uniform_subregion_count: ffi::types::GLint,
+    uniform_subregion_rects: ffi::types::GLint,
+    uniform_mask_size: ffi::types::GLint,
+    uniform_bbox_origin: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
@@ -769,13 +834,19 @@ impl Blur {
 
         let need_render = render_mask || need_new_mask;
 
+        let has_custom_mask = custom_program.0.mask_program.is_some();
+
         // Tracks whether the JFA pipeline allocated new textures this frame;
         // used below to invalidate the per-bbox cache.
         let mut jfa_need_alloc = false;
 
         // Use JFA for explicit subregions; fall back to analytical SDF when
         // there's a single region covering the whole window (or none at all).
-        let jfa_bbox = if need_render && !options.subregion_rects.is_empty() {
+        // When a custom mask pass is declared in the pipeline, we bypass this
+        // heuristic entirely and let the user shader decide.
+        let jfa_bbox = if has_custom_mask {
+            None
+        } else if need_render && !options.subregion_rects.is_empty() {
             let rects = &options.subregion_rects;
             let single_full = rects.len() == 1
                 && rects[0][0] <= 0.001
@@ -869,7 +940,9 @@ impl Blur {
         // Grow the rect-data texture if needed. We size it to the next
         // power-of-two ≥ rect_count to amortise reallocations across small
         // count fluctuations. The texture isn't shrunk.
-        if jfa_bbox.is_some() {
+        if jfa_bbox.is_some()
+            || (has_custom_mask && !options.subregion_rects.is_empty())
+        {
             let needed = options.subregion_rects.len() as i32;
             if needed > self.rects_capacity {
                 let capacity = ((needed as u32).next_power_of_two() as i32).max(16);
@@ -937,7 +1010,154 @@ impl Blur {
 
             if let Some(mask_tex) = &self.mask_texture {
                 if need_render {
-                    if let Some((bbx, bby, bbw, bbh)) = jfa_bbox {
+                    if has_custom_mask {
+                        let mask_prog = custom_program.0.mask_program.as_ref().unwrap();
+
+                        // Upload rect data to the 1D RGBA32F texture.
+                        if !options.subregion_rects.is_empty() {
+                            let rects_px: Vec<[f32; 4]> = options
+                                .subregion_rects
+                                .iter()
+                                .map(|r| {
+                                    [
+                                        r[0] * source_size.w as f32,
+                                        r[1] * source_size.h as f32,
+                                        r[2] * source_size.w as f32,
+                                        r[3] * source_size.h as f32,
+                                    ]
+                                })
+                                .collect();
+
+                            let rects_tex = self.rects_texture.as_ref().unwrap();
+                            gl.ActiveTexture(ffi::TEXTURE1);
+                            gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
+                            gl.TexSubImage2D(
+                                ffi::TEXTURE_2D,
+                                0,
+                                0,
+                                0,
+                                rects_px.len() as i32,
+                                1,
+                                ffi::RGBA,
+                                ffi::FLOAT,
+                                rects_px.as_ptr() as *const _,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_MIN_FILTER,
+                                ffi::NEAREST as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_MAG_FILTER,
+                                ffi::NEAREST as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_S,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_T,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+                            gl.ActiveTexture(ffi::TEXTURE0);
+                        }
+
+                        let mut mask_fbo = 0u32;
+                        gl.GenFramebuffers(1, &mut mask_fbo);
+                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
+                        gl.FramebufferTexture2D(
+                            ffi::DRAW_FRAMEBUFFER,
+                            ffi::COLOR_ATTACHMENT0,
+                            ffi::TEXTURE_2D,
+                            mask_tex.tex_id(),
+                            0,
+                        );
+
+                        gl.UseProgram(mask_prog.program);
+                        if mask_prog.uniform_subregion_count >= 0 {
+                            gl.Uniform1i(
+                                mask_prog.uniform_subregion_count,
+                                options.subregion_rects.len() as i32,
+                            );
+                        }
+                        if mask_prog.uniform_subregion_rects >= 0 {
+                            gl.Uniform1i(mask_prog.uniform_subregion_rects, 1);
+                        }
+                        if mask_prog.uniform_mask_size >= 0 {
+                            gl.Uniform2f(
+                                mask_prog.uniform_mask_size,
+                                mask_w as f32,
+                                mask_h as f32,
+                            );
+                        }
+                        if mask_prog.uniform_bbox_origin >= 0 {
+                            gl.Uniform2f(
+                                mask_prog.uniform_bbox_origin,
+                                0.0,
+                                0.0,
+                            );
+                        }
+                        if mask_prog.uniform_geo_size >= 0 {
+                            gl.Uniform2f(
+                                mask_prog.uniform_geo_size,
+                                geo_size.0,
+                                geo_size.1,
+                            );
+                        }
+                        if mask_prog.uniform_corner_radius >= 0 {
+                            gl.Uniform4f(
+                                mask_prog.uniform_corner_radius,
+                                corner_radius[0],
+                                corner_radius[1],
+                                corner_radius[2],
+                                corner_radius[3],
+                            );
+                        }
+
+                        gl.Viewport(0, 0, mask_w, mask_h);
+                        gl.EnableVertexAttribArray(mask_prog.attrib_vert as u32);
+                        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+                        gl.VertexAttribPointer(
+                            mask_prog.attrib_vert as u32,
+                            2,
+                            ffi::FLOAT,
+                            ffi::FALSE,
+                            0,
+                            MASK_VERTICES.as_ptr().cast(),
+                        );
+
+                        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+                        gl.DisableVertexAttribArray(mask_prog.attrib_vert as u32);
+
+                        gl.DeleteFramebuffers(1, &mut mask_fbo);
+                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+
+                        // Set texture params on the rendered mask.
+                        gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
+                        gl.TexParameteri(
+                            ffi::TEXTURE_2D,
+                            ffi::TEXTURE_MIN_FILTER,
+                            ffi::LINEAR as i32,
+                        );
+                        gl.TexParameteri(
+                            ffi::TEXTURE_2D,
+                            ffi::TEXTURE_MAG_FILTER,
+                            ffi::LINEAR as i32,
+                        );
+                        gl.TexParameteri(
+                            ffi::TEXTURE_2D,
+                            ffi::TEXTURE_WRAP_S,
+                            ffi::CLAMP_TO_EDGE as i32,
+                        );
+                        gl.TexParameteri(
+                            ffi::TEXTURE_2D,
+                            ffi::TEXTURE_WRAP_T,
+                            ffi::CLAMP_TO_EDGE as i32,
+                        );
+                    } else if let Some((bbx, bby, bbw, bbh)) = jfa_bbox {
                         let mask_tex_id = mask_tex.tex_id();
                         let textures = self.jfa_textures.as_ref().unwrap();
                         let rects_tex = self.rects_texture.as_ref().unwrap();
