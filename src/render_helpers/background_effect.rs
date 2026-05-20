@@ -36,7 +36,7 @@ pub struct Options {
     pub xray: bool,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
-    pub shader_pipeline: Option<String>,
+    pub shader_pipeline: Option<niri_config::ShaderPipeline>,
 }
 
 impl Options {

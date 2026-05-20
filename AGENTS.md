@@ -52,13 +52,13 @@ The entire JFA pipeline runs in bbox-local coordinates. If the bbox size and per
 | File | Role |
 |------|------|
 | `src/render_helpers/blur.rs` (2601 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, all JFA/Poisson structs and pipeline stages, multigrid V-cycle |
-| `src/render_helpers/custom_blur.rs` (95 lines) | Parses `pipeline.kdl` → `PipelineConfig` (mask_pass + render_passes) |
+| `src/render_helpers/custom_blur.rs` (95 lines) | `PipelineConfig`, `resolve_pipeline()` reads .frag files from inline config paths, `cache_key()` hashes sources |
 | `src/render_helpers/shaders/mod.rs` (440 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `src/render_helpers/background_effect.rs` (337 lines) | `BackgroundEffect`, `Options`, `RenderParams` — ties blur config to window/layer rendering |
 | `src/render_helpers/framebuffer_effect.rs` (497 lines) | `FramebufferEffect` — captures framebuffer, runs blur, draws result |
 | `src/render_helpers/effect_buffer.rs` (325 lines) | `EffectBuffer` — cached offscreen texture + on-demand blur (xray path) |
 | `src/render_helpers/xray.rs` (382 lines) | `Xray`, `XrayElement` — transparency rendering |
-| `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `BackgroundEffect`, `BackgroundEffectRule`, `LightSource` config types |
+| `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`, `RenderPassPart`, `BackgroundEffect`, `BackgroundEffectRule`, `LightSource` config types |
 | `src/handlers/background_effect.rs` (124 lines) | Wayland protocol handler for `ext-background-effect` blur regions |
 | `src/window/mapped.rs` | Window render calls `background_effect::render_for_tile()` (line 721) |
 | `src/layer/mapped.rs` | Layer shell calls `background_effect::render_for_tile()` (line 240) |
@@ -114,7 +114,7 @@ Blur::render() (blur.rs line 2413)
 
 ## Caching
 
-- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<String, Option<CustomBlurProgram>>>` — compiled lazily on first use, failures cached as `None`. Cleared on config reload (`shaders/mod.rs` line 417).
+- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use, keyed by a hash of all shader source strings. Failures cached as `None`. Cleared on config reload (`shaders/mod.rs` line 417).
 - **JFA output:** The entire pipeline runs in bbox-local coords; caching by bbox size + local rect offsets avoids recomputation when only the cursor/scroll position changes.
 - **Mask shader:** `Blur.mask_program` is compiled once per `Blur` instance and reused.
 - **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks).
@@ -136,20 +136,22 @@ Blur::render() (blur.rs line 2413)
 ## Config integration
 
 ```kdl
-// Global blur config
+// Global blur config (pipeline inline, file= paths point to .frag shader files)
 blur {
     passes 3
     offset 3.
     noise 0.02
     saturation 1.5
-    shader-pipeline "/path/to/shader"
+    shader-pipeline {
+        render-pass "crt" file="/path/to/crt.frag" scale=1.0
+    }
     light-source 0.5 0.5
 }
 
 // Per-window override
 window-rule {
     match app-id="kitty"
-    blur { noise 0.5 saturation 2.0 shader-pipeline ".../glass-liquid" }
+    blur { noise 0.5 saturation 2.0 shader-pipeline { render-pass "glass" file="/path/to/glass.frag" scale=1.0 } }
     background-effect {
         xray true
         blur true
@@ -157,7 +159,7 @@ window-rule {
 }
 ```
 
-`shader_pipeline` is merged via `merge_clone_opt!` through `Blur` → `BlurPart` and `BackgroundEffect` → `BackgroundEffectRule`.
+`shader_pipeline` is merged via `merge_clone_opt!` through `Blur` → `BlurPart` and `BackgroundEffect` → `BackgroundEffectRule`. The pipeline is cached in `Shaders::custom_blur` keyed by a hash of all shader source strings.
 
 ## Update policy
 

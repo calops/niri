@@ -1013,7 +1013,7 @@ pub struct Blur {
     pub offset: f64,
     pub noise: f64,
     pub saturation: f64,
-    pub shader_pipeline: Option<String>,
+    pub shader_pipeline: Option<ShaderPipeline>,
     pub light_source: Option<LightSource>,
 }
 
@@ -1039,6 +1039,34 @@ pub struct LightSource {
     pub y: f32,
 }
 
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct MaskPassPart {
+    #[knuffel(argument)]
+    pub name: String,
+    #[knuffel(property)]
+    pub file: String,
+    #[knuffel(property, default = 1.0)]
+    pub scale: f32,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct RenderPassPart {
+    #[knuffel(argument)]
+    pub name: String,
+    #[knuffel(property)]
+    pub file: String,
+    #[knuffel(property, default = 1.0)]
+    pub scale: f32,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct ShaderPipeline {
+    #[knuffel(child)]
+    pub mask_pass: Option<MaskPassPart>,
+    #[knuffel(children(name = "render-pass"))]
+    pub render_passes: Vec<RenderPassPart>,
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct BlurPart {
     #[knuffel(child)]
@@ -1053,8 +1081,8 @@ pub struct BlurPart {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
-    #[knuffel(child, unwrap(argument))]
-    pub shader_pipeline: Option<String>,
+    #[knuffel(child)]
+    pub shader_pipeline: Option<ShaderPipeline>,
     #[knuffel(child)]
     pub light_source: Option<LightSource>,
 }
@@ -1083,8 +1111,8 @@ pub struct BackgroundEffectRule {
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
-    #[knuffel(child, unwrap(argument))]
-    pub shader_pipeline: Option<String>,
+    #[knuffel(child)]
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 /// Resolved background effect rule.
@@ -1107,7 +1135,7 @@ pub struct BackgroundEffect {
 
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
-    pub shader_pipeline: Option<String>,
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 impl MergeWith<BackgroundEffectRule> for BackgroundEffect {

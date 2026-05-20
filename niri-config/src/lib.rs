@@ -1678,7 +1678,7 @@ mod tests {
                 offset: 3.0,
                 noise: 0.02,
                 saturation: 1.5,
-                custom_shader: None,
+                shader_pipeline: None,
                 light_source: None,
             },
             gestures: Gestures {
@@ -1918,6 +1918,7 @@ mod tests {
                         blur: None,
                         noise: None,
                         saturation: None,
+                        shader_pipeline: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -1927,6 +1928,7 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            shader_pipeline: None,
                         },
                     },
                 },
@@ -1969,6 +1971,7 @@ mod tests {
                         blur: None,
                         noise: None,
                         saturation: None,
+                        shader_pipeline: None,
                     },
                     popups: PopupsRule {
                         opacity: None,
@@ -1978,6 +1981,7 @@ mod tests {
                             blur: None,
                             noise: None,
                             saturation: None,
+                            shader_pipeline: None,
                         },
                     },
                 },

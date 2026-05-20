@@ -22,11 +22,10 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
-    /// Cache of compiled custom blur pipelines keyed by the path string
-    /// from `config.blur.custom_shader` (resolved per-window via
-    /// niri-config merge). The `Option` inside is so we cache compilation
-    /// failures and don't retry-storm on a bad path.
-    pub custom_blur: RefCell<HashMap<String, Option<CustomBlurProgram>>>,
+    /// Cache of compiled custom blur pipelines keyed by a hash of all
+    /// shader source strings in the pipeline. The `Option` inside caches
+    /// compilation failures so we don't retry-storm on bad pipelines.
+    pub custom_blur: RefCell<HashMap<u64, Option<CustomBlurProgram>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -361,56 +360,57 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     }
 }
 
-fn try_load_program(dir: &str, renderer: &mut GlesRenderer) -> Option<CustomBlurProgram> {
-    let path = std::path::Path::new(dir);
-    let config = super::custom_blur::load_custom_blur_pipeline(path)
-        .inspect_err(|err| warn!("error loading custom blur shader from {dir}: {err:?}"))
-        .ok()?;
-
-    if let Some(mask_cfg) = &config.mask_pass {
-        info!(
-            "custom blur pipeline has mask pass ({:?}) from {dir}",
-            mask_cfg.name
-        );
-    }
-
-    let program = CustomBlurProgram::compile(renderer, &config)
-        .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
-        .ok()?;
-
-    info!(
-        "loaded custom blur shader with {} render passes from {dir}",
-        config.render_passes.len()
-    );
-    Some(program)
-}
-
-/// Look up a custom blur pipeline by path string. Compiles lazily on
-/// first request for a given path; subsequent calls return the cached
-/// result. Compile failures are cached too so we don't retry-storm on
-/// a bad path.
+/// Look up a custom blur pipeline by its inline config definition. Compiles
+/// lazily on first request; subsequent calls with the same shader source
+/// texts (same hash) return the cached result. Compile failures are cached
+/// too so we don't retry-storm on a bad pipeline.
 pub fn get_or_compile_custom_blur(
     renderer: &mut GlesRenderer,
-    path: &str,
+    pipeline: &niri_config::ShaderPipeline,
 ) -> Option<CustomBlurProgram> {
+    // Resolve file paths → shader source strings.  If any file fails to
+    // read, the pipeline is invalid and we return `None` without caching
+    // (the error is transient — the file may appear on a later frame).
+    let config = match super::custom_blur::resolve_pipeline(pipeline) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!("error loading custom blur pipeline: {err:?}");
+            return None;
+        }
+    };
+
+    let key = config.cache_key();
+
     // Cache hit: short-scope the &Shaders borrow so we can re-borrow
     // renderer mutably on miss.
     let cached = Shaders::get(renderer)
         .custom_blur
         .borrow()
-        .get(path)
+        .get(&key)
         .cloned();
     if let Some(entry) = cached {
         return entry;
     }
+
     // Cache miss: compile (needs &mut renderer), then write into the
     // cache. We re-acquire &Shaders after the compile so the borrows
     // don't overlap.
-    let program = try_load_program(path, renderer);
+    if let Some(mask_cfg) = &config.mask_pass {
+        info!("custom blur pipeline has mask pass ({:?})", mask_cfg.name);
+    }
+    let program = CustomBlurProgram::compile(renderer, &config)
+        .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
+        .ok();
+
+    info!(
+        "loaded custom blur shader with {} render passes",
+        config.render_passes.len()
+    );
+
     Shaders::get(renderer)
         .custom_blur
         .borrow_mut()
-        .insert(path.to_owned(), program.clone());
+        .insert(key, program.clone());
     program
 }
 
@@ -422,10 +422,10 @@ pub fn clear_custom_blur_cache(renderer: &mut GlesRenderer) {
         .borrow_mut()
         .drain()
         .collect();
-    for (path, program) in drained {
+    for (key, program) in drained {
         if let Some(program) = program {
             if let Err(err) = program.destroy(renderer) {
-                warn!("error destroying cached custom blur program {path}: {err:?}");
+                warn!("error destroying cached custom blur program {key}: {err:?}");
             }
         }
     }
