@@ -11,12 +11,14 @@ uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
 uniform vec2 niri_geo_size;
 uniform vec4 niri_corner_radius;
-uniform vec2 niri_light_pos;
+uniform vec4 niri_window_screen_rect;
 
 out vec4 frag_color;
 
 const float u_noise = 0.005;
 const float u_centerThreshold = 0.1;
+
+const vec2 light_pos = vec2(0.0, 0.7);
 
 float rand(vec2 co) {
     return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
@@ -43,7 +45,8 @@ void main() {
     float slope = (1.0 - mask) * 5.0;
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
-    vec2 to_light = niri_light_pos - uv;
+    vec2 screen_uv = niri_window_screen_rect.xy + uv * niri_window_screen_rect.zw;
+    vec2 to_light = light_pos - screen_uv;
     vec3 light_dir = normalize(vec3(to_light, 0.04));
     vec3 half_dir = normalize(light_dir + vec3(0.0, 0.0, 1.0));
 

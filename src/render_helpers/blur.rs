@@ -56,8 +56,7 @@ pub struct BlurOptions {
     pub geo_size: (f32, f32),
     pub corner_radius: [f32; 4],
     pub subregion_rects: Vec<[f32; 4]>,
-    pub light_pos: (f32, f32),
-    pub light_source: Option<niri_config::LightSource>,
+    pub window_screen_rect: [f32; 4],
     /// Inline custom shader pipeline definition, or `None` to use the
     /// default Kawase blur. Cached in `Shaders` keyed by a hash of the
     /// shader source strings.
@@ -76,8 +75,8 @@ impl BlurOptions {
         self
     }
 
-    pub fn with_light_pos(mut self, pos: (f32, f32)) -> Self {
-        self.light_pos = pos;
+    pub fn with_window_screen_rect(mut self, rect: [f32; 4]) -> Self {
+        self.window_screen_rect = rect;
         self
     }
 }
@@ -90,8 +89,7 @@ impl From<niri_config::Blur> for BlurOptions {
             geo_size: (0.0, 0.0),
             corner_radius: [0.0; 4],
             subregion_rects: Vec::new(),
-            light_pos: (0.0, 0.0),
-            light_source: config.light_source,
+            window_screen_rect: [0.0; 4],
             shader_pipeline: config.shader_pipeline,
         }
     }
@@ -165,7 +163,7 @@ struct CustomBlurPassProgram {
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
     uniform_mask: ffi::types::GLint,
-    uniform_light_pos: ffi::types::GLint,
+    uniform_window_screen_rect: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -195,7 +193,7 @@ unsafe fn compile_custom_pass(
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
     let mask = c"niri_mask";
-    let light_pos = c"niri_light_pos";
+    let window_screen_rect = c"niri_window_screen_rect";
     let vert = c"vert";
 
     Ok(CustomBlurPassProgram {
@@ -209,7 +207,7 @@ unsafe fn compile_custom_pass(
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         uniform_mask: gl.GetUniformLocation(program, mask.as_ptr()),
-        uniform_light_pos: gl.GetUniformLocation(program, light_pos.as_ptr()),
+        uniform_window_screen_rect: gl.GetUniformLocation(program, window_screen_rect.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -1297,11 +1295,13 @@ impl Blur {
                     gl.Uniform1i(pass.uniform_mask, 1);
                 }
 
-                if pass.uniform_light_pos >= 0 {
-                    gl.Uniform2f(
-                        pass.uniform_light_pos,
-                        options.light_pos.0,
-                        options.light_pos.1,
+                if pass.uniform_window_screen_rect >= 0 {
+                    gl.Uniform4f(
+                        pass.uniform_window_screen_rect,
+                        options.window_screen_rect[0],
+                        options.window_screen_rect[1],
+                        options.window_screen_rect[2],
+                        options.window_screen_rect[3],
                     );
                 }
 

@@ -120,7 +120,6 @@ blur {
         render-pass "up0" file="shaders/overshifted3/up.frag" scale=2.0
         render-pass "glass" file="shaders/overshifted3/glass.frag" scale=1.0
     }
-    light-source 0.0 0.333
 }
 
 spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-circle -o scrollbar=never"

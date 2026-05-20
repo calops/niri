@@ -58,7 +58,7 @@ The entire JFA pipeline runs in bbox-local coordinates. If the bbox size and per
 | `src/render_helpers/framebuffer_effect.rs` (497 lines) | `FramebufferEffect` — captures framebuffer, runs blur, draws result |
 | `src/render_helpers/effect_buffer.rs` (325 lines) | `EffectBuffer` — cached offscreen texture + on-demand blur (xray path) |
 | `src/render_helpers/xray.rs` (382 lines) | `Xray`, `XrayElement` — transparency rendering |
-| `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`, `RenderPassPart`, `BackgroundEffect`, `BackgroundEffectRule`, `LightSource` config types |
+| `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`, `RenderPassPart`, `BackgroundEffect`, `BackgroundEffectRule` config types |
 | `src/handlers/background_effect.rs` (124 lines) | Wayland protocol handler for `ext-background-effect` blur regions |
 | `src/window/mapped.rs` | Window render calls `background_effect::render_for_tile()` (line 721) |
 | `src/layer/mapped.rs` | Layer shell calls `background_effect::render_for_tile()` (line 240) |
@@ -87,7 +87,7 @@ A directory containing:
   ```
 - `.frag` files referenced in the manifest
 
-Each **render pass** receives these uniforms: `niri_input` (TEXTURE0), `niri_output_size`, `niri_input_size`, `niri_half_pixel`, `niri_pass`, `niri_pass_count`, `niri_geo_size`, `niri_corner_radius`, `niri_mask` (TEXTURE1, the mask texture), `niri_light_pos`.
+Each **render pass** receives these uniforms: `niri_input` (TEXTURE0), `niri_output_size`, `niri_input_size`, `niri_half_pixel`, `niri_pass`, `niri_pass_count`, `niri_geo_size`, `niri_corner_radius`, `niri_mask` (TEXTURE1, the mask texture), `niri_window_screen_rect` (vec4, window origin and size in screen UV: xy=origin, zw=size).
 
 The optional **mask pass** receives: `niri_subregion_count` (int), `niri_subregion_rects` (sampler2D at TEXTURE1, a 1×N RGBA32F texture of rects in source pixels), `niri_mask_size` (vec2, the render target size), `niri_bbox_origin` (vec2, always (0,0)), `niri_geo_size` (vec2), `niri_corner_radius` (vec4). It outputs to `frag_color` in the same convention as `mask.frag`: R=mask, G=dir_x*0.5+0.5, B=dir_y*0.5+0.5.
 
@@ -145,7 +145,6 @@ blur {
     shader-pipeline {
         render-pass "crt" file="/path/to/crt.frag" scale=1.0
     }
-    light-source 0.5 0.5
 }
 
 // Per-window override
