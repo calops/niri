@@ -9,7 +9,7 @@ uniform int niri_subregion_count;
 // = (x1, y1, x2, y2) in source pixels. Sampled with texelFetch so there's
 // no fixed compile-time cap on the rect count.
 uniform sampler2D niri_subregion_rects;
-uniform vec2 niri_mask_size;
+uniform vec2 niri_output_size;
 uniform vec2 niri_bbox_origin;
 
 out vec4 frag_color;
@@ -32,7 +32,7 @@ out vec4 frag_color;
 // understates coverage at overlaps by at most ~0.25 of one pixel, which
 // is invisible.
 void main() {
-    vec2 pixel = v_coords * niri_mask_size + niri_bbox_origin;
+    vec2 pixel = v_coords * niri_output_size + niri_bbox_origin;
     vec2 pmin = pixel - vec2(0.5);
     vec2 pmax = pixel + vec2(0.5);
 

@@ -18,7 +18,7 @@ This is layered on top of a GPU mask system that tells each shader pass which pi
 
 **Key files:**
 - `src/render_helpers/shaders/mask.frag` — the SDF shader
-- `src/render_helpers/blur.rs` — `MaskProgram` (line 245), `compile_mask_program()`, mask render logic (lines 960–1033)
+- `src/render_helpers/blur.rs` — `MaskProgram` (line 296), `compile_mask_program()`, mask render logic in `render_custom()`
 
 ### 2. JFA + Multigrid Poisson (shape-agnostic)
 
@@ -51,8 +51,8 @@ The entire JFA pipeline runs in bbox-local coordinates. If the bbox size and per
 
 | File | Role |
 |------|------|
-| `src/render_helpers/blur.rs` (2601 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, all JFA/Poisson structs and pipeline stages, multigrid V-cycle |
-| `src/render_helpers/custom_blur.rs` (95 lines) | `PipelineConfig`, `resolve_pipeline()` reads .frag files from inline config paths, `cache_key()` hashes sources |
+| `src/render_helpers/blur.rs` (~2700 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, all JFA/Poisson structs and pipeline stages, multigrid V-cycle. Constants: `MAX_KAWASE_PASSES`, `SINGLE_FULL_EPSILON`, `JFA_CACHE_EPSILON`, `MAX_MULTIGRID_LEVELS`, `JACOBI_OMEGA`, `JACOBI_SWEEPS`, `V_CYCLES`, `BBOX_BORDER`. Helper: `draw_fullscreen_quad()`.
+| `src/render_helpers/custom_blur.rs` | `PipelineConfig`, `resolve_pipeline()` reads .frag files from inline config paths, `cache_key()` hashes sources AND scales |
 | `src/render_helpers/shaders/mod.rs` (440 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `src/render_helpers/background_effect.rs` (337 lines) | `BackgroundEffect`, `Options`, `RenderParams` — ties blur config to window/layer rendering |
 | `src/render_helpers/framebuffer_effect.rs` (497 lines) | `FramebufferEffect` — captures framebuffer, runs blur, draws result |
@@ -73,7 +73,7 @@ All in `src/render_helpers/shaders/`:
 - `mask_binary.frag` — binary subregion mask
 - `jfa_init.frag`, `jfa_step.frag`, `jfa_sdf_bake.frag` — JFA stages
 - `jfa_poisson_init_rhs.frag`, `jfa_poisson_restrict_mask.frag`, `jfa_poisson_jacobi.frag`, `jfa_poisson_residual_restrict.frag`, `jfa_poisson_prolongate.frag` — multigrid Poisson stages
-- `jfa_encode.frag`, `jfa_encode_debug.frag` — final encode
+- `jfa_encode.frag` — final encode
 - `border.frag`, `shadow.frag`, `clipped_surface.frag`, `rounding_alpha.frag`, `postprocess.frag` — border/shadow/clipping/post-process
 
 ## User-provided pipeline format
@@ -89,7 +89,7 @@ A directory containing:
 
 Each **render pass** receives these uniforms: `niri_input` (TEXTURE0), `niri_output_size`, `niri_input_size`, `niri_half_pixel`, `niri_pass`, `niri_pass_count`, `niri_geo_size`, `niri_corner_radius`, `niri_mask` (TEXTURE1, the mask texture), `niri_window_screen_rect` (vec4, window origin and size in screen UV: xy=origin, zw=size).
 
-The optional **mask pass** receives: `niri_subregion_count` (int), `niri_subregion_rects` (sampler2D at TEXTURE1, a 1×N RGBA32F texture of rects in source pixels), `niri_mask_size` (vec2, the render target size), `niri_bbox_origin` (vec2, always (0,0)), `niri_geo_size` (vec2), `niri_corner_radius` (vec4). It outputs to `frag_color` in the same convention as `mask.frag`: R=mask, G=dir_x*0.5+0.5, B=dir_y*0.5+0.5.
+The optional **mask pass** receives: `niri_subregion_count` (int), `niri_subregion_rects` (sampler2D at TEXTURE1, a 1×N RGBA32F texture of rects in source pixels), `niri_output_size` (vec2, the render target size; shared uniform name with JFA/poisson passes), `niri_bbox_origin` (vec2, always (0,0)), `niri_geo_size` (vec2), `niri_corner_radius` (vec4). It outputs to `frag_color` in the same convention as `mask.frag`: R=mask, G=dir_x*0.5+0.5, B=dir_y*0.5+0.5.
 
 When a `mask-pass` is present, the built-in mask heuristic (JFA+Poisson vs. analytical SDF) is bypassed; the custom mask pass runs at full source resolution instead.
 
@@ -98,10 +98,11 @@ See `shaders/` directory for example pipelines (crt, magnify, overshifted3, etc.
 ## Rendering flow
 
 ```
-Window/Layer render loop
+Renderer/Layer render loop
   → background_effect::render_for_tile()
     → xray path: EffectBuffer::prepare() → EffectBuffer::render() → Blur::render()
     → non-xray path: FramebufferEffectElement::capture_framebuffer() → Blur::render()
+    → (both paths pass BlurOptions including shader_pipeline)
 
 Blur::render() (blur.rs line 2413)
   → if shader_pipeline set: get_or_compile_custom_blur() → Blur::render_custom()
@@ -114,7 +115,7 @@ Blur::render() (blur.rs line 2413)
 
 ## Caching
 
-- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use, keyed by a hash of all shader source strings. Failures cached as `None`. Cleared on config reload (`shaders/mod.rs` line 417).
+- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use, keyed by a hash of all shader source strings and pipeline scales. Failures cached as `None`. Cleared on config reload (`shaders/mod.rs` line 417). A warning is logged if the cache exceeds 100 entries.
 - **JFA output:** The entire pipeline runs in bbox-local coords; caching by bbox size + local rect offsets avoids recomputation when only the cursor/scroll position changes.
 - **Mask shader:** `Blur.mask_program` is compiled once per `Blur` instance and reused.
 - **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks).
@@ -158,7 +159,7 @@ window-rule {
 }
 ```
 
-`shader_pipeline` is merged via `merge_clone_opt!` through `Blur` → `BlurPart` and `BackgroundEffect` → `BackgroundEffectRule`. The pipeline is cached in `Shaders::custom_blur` keyed by a hash of all shader source strings.
+`shader_pipeline` is merged via `merge_clone_opt!` through `Blur` → `BlurPart` and `BackgroundEffect` → `BackgroundEffectRule`. The pipeline is cached in `Shaders::custom_blur` keyed by a hash of all shader source strings and pipeline scales.
 
 ## Update policy
 

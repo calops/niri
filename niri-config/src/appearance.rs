@@ -1030,7 +1030,7 @@ impl Default for Blur {
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct MaskPassPart {
+pub struct ShaderPassPart {
     #[knuffel(argument)]
     pub name: String,
     #[knuffel(property)]
@@ -1039,15 +1039,8 @@ pub struct MaskPassPart {
     pub scale: f32,
 }
 
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct RenderPassPart {
-    #[knuffel(argument)]
-    pub name: String,
-    #[knuffel(property)]
-    pub file: String,
-    #[knuffel(property, default = 1.0)]
-    pub scale: f32,
-}
+pub type MaskPassPart = ShaderPassPart;
+pub type RenderPassPart = ShaderPassPart;
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct ShaderPipeline {
@@ -1386,5 +1379,48 @@ mod tests {
         )
         "
         );
+    }
+
+    #[test]
+    fn parse_shader_pipeline() {
+        let pipeline = Config::parse_mem(
+            r##"
+            blur {
+                shader-pipeline {
+                    mask-pass "my_mask" file="/path/to/mask.frag" scale=0.5
+                    render-pass "pass1" file="/path/to/pass1.frag" scale=1.0
+                    render-pass "pass2" file="/path/to/pass2.frag"
+                }
+            }
+            "##,
+        )
+        .unwrap()
+        .blur
+        .shader_pipeline
+        .unwrap();
+
+        assert_debug_snapshot!(pipeline, @r#"
+        ShaderPipeline {
+            mask_pass: Some(
+                ShaderPassPart {
+                    name: "my_mask",
+                    file: "/path/to/mask.frag",
+                    scale: 0.5,
+                },
+            ),
+            render_passes: [
+                ShaderPassPart {
+                    name: "pass1",
+                    file: "/path/to/pass1.frag",
+                    scale: 1.0,
+                },
+                ShaderPassPart {
+                    name: "pass2",
+                    file: "/path/to/pass2.frag",
+                    scale: 1.0,
+                },
+            ],
+        }
+        "#);
     }
 }

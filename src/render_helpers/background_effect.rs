@@ -195,7 +195,7 @@ impl BackgroundEffect {
                 ctx,
                 params,
                 xray_pos,
-                blur,
+                blur_options,
                 noise,
                 saturation,
                 &mut |elem| push(elem.into()),

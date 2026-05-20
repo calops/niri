@@ -64,6 +64,10 @@ pub struct BlurOptions {
 }
 
 impl BlurOptions {
+    pub fn clamped_passes(&self) -> usize {
+        self.passes.clamp(1, MAX_KAWASE_PASSES) as usize
+    }
+
     pub fn with_geometry(mut self, geo_size: (f32, f32), corner_radius: [f32; 4]) -> Self {
         self.geo_size = geo_size;
         self.corner_radius = corner_radius;
@@ -221,7 +225,7 @@ unsafe fn compile_custom_mask_pass(
 
     let subregion_count = c"niri_subregion_count";
     let subregion_rects = c"niri_subregion_rects";
-    let mask_size = c"niri_mask_size";
+    let output_size = c"niri_output_size";
     let bbox_origin = c"niri_bbox_origin";
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
@@ -231,7 +235,7 @@ unsafe fn compile_custom_mask_pass(
         program,
         uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
         uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
-        uniform_mask_size: gl.GetUniformLocation(program, mask_size.as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, output_size.as_ptr()),
         uniform_bbox_origin: gl.GetUniformLocation(program, bbox_origin.as_ptr()),
         uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
@@ -305,7 +309,7 @@ struct CustomMaskProgram {
     program: ffi::types::GLuint,
     uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
-    uniform_mask_size: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
     uniform_bbox_origin: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
@@ -317,7 +321,7 @@ struct JfaBinaryProgram {
     program: ffi::types::GLuint,
     uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
-    uniform_mask_size: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
     uniform_bbox_origin: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
@@ -405,16 +409,6 @@ struct JfaEncodeProgram {
 }
 
 #[derive(Debug)]
-struct JfaEncodeDebugProgram {
-    program: ffi::types::GLuint,
-    uniform_input: ffi::types::GLint,
-    uniform_poisson_u: ffi::types::GLint,
-    uniform_output_size: ffi::types::GLint,
-    uniform_max_dist: ffi::types::GLint,
-    attrib_vert: ffi::types::GLint,
-}
-
-#[derive(Debug)]
 struct JfaPipeline {
     binary_prog: JfaBinaryProgram,
     init_prog: JfaInitProgram,
@@ -426,7 +420,6 @@ struct JfaPipeline {
     poisson_residual_restrict_prog: JfaPoissonResidualRestrictProgram,
     poisson_prolongate_prog: JfaPoissonProlongateProgram,
     encode_prog: JfaEncodeProgram,
-    encode_debug_prog: JfaEncodeDebugProgram,
 }
 
 #[derive(Debug)]
@@ -459,7 +452,62 @@ struct JfaTextures {
     size: Size<i32, Buffer>,
 }
 
-const MASK_VERTICES: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+const FULLSCREEN_TRI_STRIP: [f32; 12] =
+    [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+
+/// Maximum number of Kawase blur down+up passes.
+const MAX_KAWASE_PASSES: u8 = 31;
+
+/// Threshold for deciding a subregion covers the entire window (single-full heuristic).
+const SINGLE_FULL_EPSILON: f32 = 0.001;
+
+/// Per-component comparison epsilon for the JFA bbox-local rects cache.
+const JFA_CACHE_EPSILON: f32 = 0.01;
+
+/// Maximum number of multigrid levels in the Poisson pyramid.
+const MAX_MULTIGRID_LEVELS: usize = 6;
+
+/// Weighted-Jacobi damping factor for the Poisson smoother.
+const JACOBI_OMEGA: f32 = 0.8;
+
+/// Number of Jacobi sweeps per pre-/post-smoothing step in the V-cycle.
+const JACOBI_SWEEPS: i32 = 12;
+
+/// Number of V-cycles per Poisson solve.
+const V_CYCLES: usize = 2;
+
+/// Pixels of exterior border padding around the JFA bbox.
+const BBOX_BORDER: i32 = 1;
+
+unsafe fn check_gl_error(gl: &ffi::Gles2) {
+    let mut had_error = false;
+    loop {
+        let err = gl.GetError();
+        if err == ffi::NO_ERROR {
+            break;
+        }
+        had_error = true;
+        warn!("GL error: 0x{:x}", err);
+    }
+    if had_error {
+        warn!("GL errors detected during rendering pass");
+    }
+}
+
+unsafe fn draw_fullscreen_quad(gl: &ffi::Gles2, attrib_vert: ffi::types::GLint) {
+    gl.EnableVertexAttribArray(attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        FULLSCREEN_TRI_STRIP.as_ptr().cast(),
+    );
+    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    gl.DisableVertexAttribArray(attrib_vert as u32);
+}
 
 // Allocates an RGBA32F GlesTexture directly via raw GL, bypassing
 // smithay's `Fourcc → GL` mapping (which only knows RGBA8 / RGBA16F).
@@ -519,7 +567,7 @@ unsafe fn compile_jfa_binary(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesEr
         program,
         uniform_subregion_count: gl.GetUniformLocation(program, c"niri_subregion_count".as_ptr()),
         uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
-        uniform_mask_size: gl.GetUniformLocation(program, c"niri_mask_size".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
@@ -653,20 +701,6 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
     })
 }
 
-unsafe fn compile_jfa_encode_debug(gl: &ffi::Gles2) -> Result<JfaEncodeDebugProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur_custom.vert");
-    let frag_src = include_str!("shaders/jfa_encode_debug.frag");
-    let program = unsafe { link_program(gl, vert_src, frag_src)? };
-    Ok(JfaEncodeDebugProgram {
-        program,
-        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_poisson_u: gl.GetUniformLocation(program, c"niri_poisson_u".as_ptr()),
-        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
-        uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
-    })
-}
-
 impl Blur {
     pub fn new(renderer: &mut GlesRenderer) -> Option<Self> {
         let program = Shaders::get(renderer).blur.clone()?;
@@ -697,7 +731,7 @@ impl Blur {
         &mut self,
         create_texture: impl FnMut(Fourcc, Size<i32, Buffer>) -> Result<GlesTexture, GlesError>,
         source: &GlesTexture,
-        options: BlurOptions,
+        options: &BlurOptions,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Blur::prepare_textures");
 
@@ -708,7 +742,7 @@ impl Blur {
             return Ok(());
         }
 
-        let passes = options.passes.clamp(1, 31) as usize;
+        let passes = options.clamped_passes();
         self.ensure_kawase_textures(create_texture, source, passes)
     }
 
@@ -840,7 +874,7 @@ impl Blur {
         let need_new_mask = self
             .mask_texture
             .as_ref()
-            .map_or(true, |t| t.size() != mask_size);
+            .is_none_or(|t| t.size() != mask_size);
         if need_new_mask {
             let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
             self.mask_texture = Some(texture);
@@ -863,10 +897,10 @@ impl Blur {
         } else if need_render && !options.subregion_rects.is_empty() {
             let rects = &options.subregion_rects;
             let single_full = rects.len() == 1
-                && rects[0][0] <= 0.001
-                && rects[0][1] <= 0.001
-                && rects[0][2] >= 0.999
-                && rects[0][3] >= 0.999;
+                && rects[0][0] <= SINGLE_FULL_EPSILON
+                && rects[0][1] <= SINGLE_FULL_EPSILON
+                && rects[0][2] >= 1.0 - SINGLE_FULL_EPSILON
+                && rects[0][3] >= 1.0 - SINGLE_FULL_EPSILON;
             if single_full {
                 info!("single full-window subregion, using analytical SDF");
                 None
@@ -893,12 +927,12 @@ impl Blur {
                 // snaps integer-close values to the integer without altering
                 // genuinely fractional positions.
                 const EPS: f32 = 1e-4;
-                let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - 1).max(0);
-                let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - 1).max(0);
-                let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2)
+                let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
+                let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
+                let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                     .max(1)
                     .min(source_size.w - bbx);
-                let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2)
+                let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                     .max(1)
                     .min(source_size.h - bby);
                 if bbw > 0 && bbh > 0 {
@@ -912,7 +946,7 @@ impl Blur {
                         // Build the multigrid pyramid sized to the bbox.
                         // Level 0 is bbox_size; each subsequent level halves
                         // both dimensions (floor, min 1).
-                        let pyramid_max_levels = 6usize;
+                        let pyramid_max_levels = MAX_MULTIGRID_LEVELS;
                         let mut pyramid: Vec<MultigridLevel> =
                             Vec::with_capacity(pyramid_max_levels);
                         for k in 0..pyramid_max_levels {
@@ -999,10 +1033,10 @@ impl Blur {
                         .iter()
                         .zip(rects_local.iter())
                         .all(|(a, b)| {
-                            (a[0] - b[0]).abs() < 0.01
-                                && (a[1] - b[1]).abs() < 0.01
-                                && (a[2] - b[2]).abs() < 0.01
-                                && (a[3] - b[3]).abs() < 0.01
+                            (a[0] - b[0]).abs() < JFA_CACHE_EPSILON
+                                && (a[1] - b[1]).abs() < JFA_CACHE_EPSILON
+                                && (a[2] - b[2]).abs() < JFA_CACHE_EPSILON
+                                && (a[3] - b[3]).abs() < JFA_CACHE_EPSILON
                         });
                 self.cached_jfa_rects_local = rects_local;
                 self.cached_jfa_bbox_size = Some(bbox_size);
@@ -1024,11 +1058,12 @@ impl Blur {
 
             if let Some(mask_tex) = &self.mask_texture {
                 if need_render {
-                    if has_custom_mask {
-                        let mask_prog = custom_program.0.mask_program.as_ref().unwrap();
+                    if let Some(mask_prog) = custom_program.0.mask_program.as_ref() {
 
-                        // Upload rect data to the 1D RGBA32F texture.
-                        if !options.subregion_rects.is_empty() {
+                        if let (Some(rects_tex), true) = (
+                            self.rects_texture.as_ref(),
+                            !options.subregion_rects.is_empty(),
+                        ) {
                             let rects_px: Vec<[f32; 4]> = options
                                 .subregion_rects
                                 .iter()
@@ -1042,7 +1077,6 @@ impl Blur {
                                 })
                                 .collect();
 
-                            let rects_tex = self.rects_texture.as_ref().unwrap();
                             gl.ActiveTexture(ffi::TEXTURE1);
                             gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
                             gl.TexSubImage2D(
@@ -1100,9 +1134,9 @@ impl Blur {
                         if mask_prog.uniform_subregion_rects >= 0 {
                             gl.Uniform1i(mask_prog.uniform_subregion_rects, 1);
                         }
-                        if mask_prog.uniform_mask_size >= 0 {
+                        if mask_prog.uniform_output_size >= 0 {
                             gl.Uniform2f(
-                                mask_prog.uniform_mask_size,
+                                mask_prog.uniform_output_size,
                                 mask_w as f32,
                                 mask_h as f32,
                             );
@@ -1132,22 +1166,11 @@ impl Blur {
                         }
 
                         gl.Viewport(0, 0, mask_w, mask_h);
-                        gl.EnableVertexAttribArray(mask_prog.attrib_vert as u32);
-                        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-                        gl.VertexAttribPointer(
-                            mask_prog.attrib_vert as u32,
-                            2,
-                            ffi::FLOAT,
-                            ffi::FALSE,
-                            0,
-                            MASK_VERTICES.as_ptr().cast(),
-                        );
+                        draw_fullscreen_quad(gl, mask_prog.attrib_vert);
 
-                        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-                        gl.DisableVertexAttribArray(mask_prog.attrib_vert as u32);
-
-                        gl.DeleteFramebuffers(1, &mut mask_fbo);
+                        gl.DeleteFramebuffers(1, &mask_fbo);
                         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                        check_gl_error(gl);
 
                         // Set texture params on the rendered mask.
                         gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
@@ -1171,10 +1194,12 @@ impl Blur {
                             ffi::TEXTURE_WRAP_T,
                             ffi::CLAMP_TO_EDGE as i32,
                         );
-                    } else if let Some((bbx, bby, bbw, bbh)) = jfa_bbox {
+                    } else if let (Some((bbx, bby, bbw, bbh)), Some(textures), Some(rects_tex)) = (
+                        jfa_bbox,
+                        self.jfa_textures.as_ref(),
+                        self.rects_texture.as_ref(),
+                    ) {
                         let mask_tex_id = mask_tex.tex_id();
-                        let textures = self.jfa_textures.as_ref().unwrap();
-                        let rects_tex = self.rects_texture.as_ref().unwrap();
                         render_jfa_mask(
                             gl,
                             options,
@@ -1191,17 +1216,17 @@ impl Blur {
                             jfa_cache_hit,
                         );
                     } else {
-                        // Compile mask shader lazily, cache for reuse.
                         if self.mask_program.is_none() {
                             match compile_mask_program(gl) {
                                 Ok(p) => self.mask_program = Some(p),
                                 Err(err) => {
                                     warn!("error compiling mask shader: {err:?}");
-                                    return;
+                                    // Skip mask render; custom passes will use
+                                    // a cleared/default mask texture instead.
                                 }
                             }
                         }
-                        let mask_prog = self.mask_program.as_ref().unwrap();
+                        if let Some(mask_prog) = self.mask_program.as_ref() {
 
                         let mut mask_fbo = 0u32;
                         gl.GenFramebuffers(1, &mut mask_fbo);
@@ -1225,22 +1250,11 @@ impl Blur {
                         );
 
                         gl.Viewport(0, 0, mask_w, mask_h);
-                        gl.EnableVertexAttribArray(mask_prog.attrib_vert as u32);
-                        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-                        gl.VertexAttribPointer(
-                            mask_prog.attrib_vert as u32,
-                            2,
-                            ffi::FLOAT,
-                            ffi::FALSE,
-                            0,
-                            MASK_VERTICES.as_ptr().cast(),
-                        );
+                        draw_fullscreen_quad(gl, mask_prog.attrib_vert);
 
-                        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-                        gl.DisableVertexAttribArray(mask_prog.attrib_vert as u32);
-
-                        gl.DeleteFramebuffers(1, &mut mask_fbo);
+                        gl.DeleteFramebuffers(1, &mask_fbo);
                         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                        check_gl_error(gl);
 
                         // Set texture params on the rendered mask.
                         gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
@@ -1264,6 +1278,7 @@ impl Blur {
                             ffi::TEXTURE_WRAP_T,
                             ffi::CLAMP_TO_EDGE as i32,
                         );
+                        } // end if let Some(mask_prog)
                     }
                 }
 
@@ -1275,8 +1290,6 @@ impl Blur {
             let mut fbos = [0; 2];
             gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
-
-            let vertices = MASK_VERTICES;
 
             for (i, pass) in passes.iter().enumerate() {
                 let (output_w, output_h) = pass_output_sizes[i];
@@ -1323,17 +1336,6 @@ impl Blur {
 
                 gl.Viewport(0, 0, output_w, output_h);
 
-                gl.EnableVertexAttribArray(pass.attrib_vert as u32);
-                gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-                gl.VertexAttribPointer(
-                    pass.attrib_vert as u32,
-                    2,
-                    ffi::FLOAT,
-                    ffi::FALSE,
-                    0,
-                    vertices.as_ptr().cast(),
-                );
-
                 let dst = self.custom_textures[i].tex_id();
                 let src = if i == 0 {
                     source.tex_id()
@@ -1365,30 +1367,22 @@ impl Blur {
                     ffi::CLAMP_TO_EDGE as i32,
                 );
 
-                gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-                gl.DisableVertexAttribArray(pass.attrib_vert as u32);
+                draw_fullscreen_quad(gl, pass.attrib_vert);
             }
 
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
             gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
+            check_gl_error(gl);
         })?;
 
-        Ok(self.custom_textures.last().unwrap().clone())
+        let result = self
+            .custom_textures
+            .last()
+            .context("custom pipeline has no render passes")?
+            .clone();
+        Ok(result)
     }
 }
-
-// When true, replaces the normal encode pass with a gradient-magnitude
-// heatmap (jfa_encode_debug.frag).  Interior pixels are coloured by the
-// decoded direction magnitude `|∇u * max_dist * 0.5|`:
-//
-//   blue → 0.0         green → 0.25        yellow → 0.5         red → 1.0+
-//
-// The analytical `|to_center|` peaks at 0.5 at a straight boundary.
-// If the heatmap shows green at boundaries the Poisson gradient is too
-// weak; if it shows red it's too strong.  Once calibrated, adjust the
-// `* 0.5` factor in `jfa_encode.frag` line 52 so that boundary pixels
-// read yellow.
-const JFA_DEBUG_ENCODE: bool = false;
 
 fn render_jfa_mask(
     gl: &ffi::Gles2,
@@ -1429,7 +1423,7 @@ fn render_jfa_mask(
                 bbx,
                 bby,
             );
-            gl.DeleteFramebuffers(1, &mut fbo);
+            gl.DeleteFramebuffers(1, &fbo);
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
             gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
@@ -1447,11 +1441,14 @@ fn render_jfa_mask(
             return;
         }
 
-        if !ensure_jfa_pipeline(gl, jfa_pipeline) {
-            gl.DeleteFramebuffers(1, &mut fbo);
-            return;
-        }
-        let pipeline = jfa_pipeline.as_ref().unwrap();
+        let pipeline = match ensure_jfa_pipeline(gl, jfa_pipeline) {
+            Ok(()) => jfa_pipeline.as_ref().unwrap(),
+            Err(err) => {
+                warn!("error compiling JFA shaders: {err:?}");
+                gl.DeleteFramebuffers(1, &fbo);
+                return;
+            }
+        };
 
         render_binary_mask(
             gl,
@@ -1538,8 +1535,8 @@ fn render_jfa_mask(
         // reduces error by a constant factor), more sweeps improves
         // per-cycle damping.
         let mut final_u_idx = 0;
-        for _ in 0..2 {
-            final_u_idx = run_v_cycle(gl, pipeline, &textures.pyramid, 12, 12, 0.8, final_u_idx);
+        for _ in 0..V_CYCLES {
+            final_u_idx = run_v_cycle(gl, pipeline, &textures.pyramid, JACOBI_SWEEPS, JACOBI_SWEEPS, JACOBI_OMEGA, final_u_idx);
         }
         let poisson_u = if final_u_idx == 0 {
             &textures.pyramid[0].u_a
@@ -1547,29 +1544,16 @@ fn render_jfa_mask(
             &textures.pyramid[0].u_b
         };
 
-        if JFA_DEBUG_ENCODE {
-            encode_output_debug(
-                gl,
-                &pipeline.encode_debug_prog,
-                jfa_result,
-                poisson_u,
-                &textures.encoded,
-                bbw,
-                bbh,
-                max_dist,
-            );
-        } else {
-            encode_output(
-                gl,
-                &pipeline.encode_prog,
-                jfa_result,
-                poisson_u,
-                &textures.encoded,
-                bbw,
-                bbh,
-                max_dist,
-            );
-        }
+        encode_output(
+            gl,
+            &pipeline.encode_prog,
+            jfa_result,
+            poisson_u,
+            &textures.encoded,
+            bbw,
+            bbh,
+            max_dist,
+        );
 
         blit_to_mask_texture(
             gl,
@@ -1584,8 +1568,9 @@ fn render_jfa_mask(
             bby,
         );
 
-        gl.DeleteFramebuffers(1, &mut fbo);
+        gl.DeleteFramebuffers(1, &fbo);
         gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+        check_gl_error(gl);
 
         // Set final mask sampler params.
         gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
@@ -1617,14 +1602,14 @@ unsafe fn clear_mask_texture(gl: &ffi::Gles2, mask_tex_id: ffi::types::GLuint) {
     );
     gl.ClearColor(0.0, 0.0, 0.0, 0.0);
     gl.Clear(ffi::COLOR_BUFFER_BIT);
-    gl.DeleteFramebuffers(1, &mut clear_fbo);
+    gl.DeleteFramebuffers(1, &clear_fbo);
 }
 
-unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipeline>) -> bool {
+unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipeline>) -> anyhow::Result<()> {
     if jfa_pipeline.is_some() {
-        return true;
+        return Ok(());
     }
-    match (|| -> Result<JfaPipeline, GlesError> {
+    let pipeline = (|| -> Result<JfaPipeline, GlesError> {
         Ok(JfaPipeline {
             binary_prog: compile_jfa_binary(gl)?,
             init_prog: compile_jfa_init(gl)?,
@@ -1636,18 +1621,11 @@ unsafe fn ensure_jfa_pipeline(gl: &ffi::Gles2, jfa_pipeline: &mut Option<JfaPipe
             poisson_residual_restrict_prog: compile_jfa_poisson_residual_restrict(gl)?,
             poisson_prolongate_prog: compile_jfa_poisson_prolongate(gl)?,
             encode_prog: compile_jfa_encode(gl)?,
-            encode_debug_prog: compile_jfa_encode_debug(gl)?,
         })
-    })() {
-        Ok(p) => {
-            *jfa_pipeline = Some(p);
-            true
-        }
-        Err(err) => {
-            warn!("error compiling JFA shaders: {err:?}");
-            false
-        }
-    }
+    })()
+    .context("error compiling JFA shaders")?;
+    *jfa_pipeline = Some(pipeline);
+    Ok(())
 }
 
 unsafe fn render_binary_mask(
@@ -1669,10 +1647,10 @@ unsafe fn render_binary_mask(
         .iter()
         .map(|r| {
             [
-                (r[0] * source_w as f32).max((bbx + 1) as f32),
-                (r[1] * source_h as f32).max((bby + 1) as f32),
-                (r[2] * source_w as f32).min((bbx + bbw - 2) as f32),
-                (r[3] * source_h as f32).min((bby + bbh - 2) as f32),
+                (r[0] * source_w as f32).max((bbx + BBOX_BORDER) as f32),
+                (r[1] * source_h as f32).max((bby + BBOX_BORDER) as f32),
+                (r[2] * source_w as f32).min((bbx + bbw - 2 * BBOX_BORDER) as f32),
+                (r[3] * source_h as f32).min((bby + bbh - 2 * BBOX_BORDER) as f32),
             ]
         })
         .collect();
@@ -1728,23 +1706,12 @@ unsafe fn render_binary_mask(
         options.subregion_rects.len() as i32,
     );
     gl.Uniform1i(prog.uniform_subregion_rects, 1);
-    gl.Uniform2f(prog.uniform_mask_size, bbw as f32, bbh as f32);
+    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
     gl.Uniform2f(prog.uniform_bbox_origin, bbx as f32, bby as f32);
 
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.Viewport(0, 0, bbw, bbh);
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
 
     gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
     gl.TexParameteri(
@@ -1791,18 +1758,7 @@ unsafe fn jfa_init_pass(
 
     gl.Viewport(0, 0, bbw, bbh);
     gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
 
     gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
     gl.TexParameteri(
@@ -1871,18 +1827,7 @@ unsafe fn run_jfa_steps<'a>(
             ffi::NEAREST as i32,
         );
 
-        gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            prog.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            MASK_VERTICES.as_ptr().cast(),
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-        gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+        draw_fullscreen_quad(gl, prog.attrib_vert);
 
         std::mem::swap(&mut read_tex, &mut write_tex);
         step /= 2;
@@ -1929,18 +1874,7 @@ unsafe fn bake_sdf(
         ffi::NEAREST as i32,
     );
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
 }
 
 // Writes pyramid[0].rhs from the binary mask:
@@ -1981,18 +1915,7 @@ unsafe fn init_rhs_level0(
         ffi::NEAREST as i32,
     );
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
 }
 
 // For each pyramid level k = 1..pyramid.len(), box-downsamples the mask
@@ -2010,17 +1933,6 @@ unsafe fn restrict_mask_pyramid(
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_input, 0);
     gl.ActiveTexture(ffi::TEXTURE0);
-
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
 
     for k in 1..pyramid.len() {
         let src = &pyramid[k - 1];
@@ -2045,10 +1957,8 @@ unsafe fn restrict_mask_pyramid(
         gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
 
         gl.Viewport(0, 0, dst.size.w, dst.size.h);
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        draw_fullscreen_quad(gl, prog.attrib_vert);
     }
-
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
 }
 
 // Runs `sweeps` weighted-Jacobi sweeps on pyramid[level], ping-ponging
@@ -2091,17 +2001,6 @@ unsafe fn jacobi_smooth(
         ffi::NEAREST as i32,
     );
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-
     let mut current = current_u_idx;
     for _ in 0..sweeps {
         let (src, dst) = if current == 0 {
@@ -2132,12 +2031,10 @@ unsafe fn jacobi_smooth(
         );
 
         gl.Viewport(0, 0, lvl.size.w, lvl.size.h);
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        draw_fullscreen_quad(gl, prog.attrib_vert);
 
         current = 1 - current;
     }
-
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
     current
 }
 
@@ -2206,17 +2103,6 @@ unsafe fn residual_restrict(
         ffi::NEAREST as i32,
     );
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-
     gl.Viewport(0, 0, coarse.size.w, coarse.size.h);
 
     // Restrict only the R channel; G (mask) was populated once per frame
@@ -2224,10 +2110,8 @@ unsafe fn residual_restrict(
     // we'd be reading and writing the same texture (undefined per GL
     // spec; observed driver behaviour was unstable).
     gl.ColorMask(ffi::TRUE, ffi::FALSE, ffi::FALSE, ffi::FALSE);
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
     gl.ColorMask(ffi::TRUE, ffi::TRUE, ffi::TRUE, ffi::TRUE);
-
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
     gl.ActiveTexture(ffi::TEXTURE0);
 
     // Reset coarse u_a to zero so subsequent smoothing solves the
@@ -2328,20 +2212,8 @@ unsafe fn prolongate(
         ffi::NEAREST as i32,
     );
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-
     gl.Viewport(0, 0, fine.size.w, fine.size.h);
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
     gl.ActiveTexture(ffi::TEXTURE0);
 
     1 - fine_u_idx
@@ -2427,71 +2299,6 @@ unsafe fn run_v_cycle(
     u_idx[0]
 }
 
-unsafe fn encode_output_debug(
-    gl: &ffi::Gles2,
-    prog: &JfaEncodeDebugProgram,
-    jfa: &GlesTexture,
-    poisson_u: &GlesTexture,
-    dst: &GlesTexture,
-    bbw: i32,
-    bbh: i32,
-    max_dist: f32,
-) {
-    gl.FramebufferTexture2D(
-        ffi::DRAW_FRAMEBUFFER,
-        ffi::COLOR_ATTACHMENT0,
-        ffi::TEXTURE_2D,
-        dst.tex_id(),
-        0,
-    );
-
-    gl.UseProgram(prog.program);
-    gl.Uniform1i(prog.uniform_input, 0);
-    gl.Uniform1i(prog.uniform_poisson_u, 1);
-    gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
-    gl.Uniform1f(prog.uniform_max_dist, max_dist);
-
-    gl.Viewport(0, 0, bbw, bbh);
-
-    gl.ActiveTexture(ffi::TEXTURE1);
-    gl.BindTexture(ffi::TEXTURE_2D, poisson_u.tex_id());
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_MIN_FILTER,
-        ffi::NEAREST as i32,
-    );
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_MAG_FILTER,
-        ffi::NEAREST as i32,
-    );
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_WRAP_S,
-        ffi::CLAMP_TO_EDGE as i32,
-    );
-    gl.TexParameteri(
-        ffi::TEXTURE_2D,
-        ffi::TEXTURE_WRAP_T,
-        ffi::CLAMP_TO_EDGE as i32,
-    );
-    gl.ActiveTexture(ffi::TEXTURE0);
-    gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
-
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
-}
-
 unsafe fn encode_output(
     gl: &ffi::Gles2,
     prog: &JfaEncodeProgram,
@@ -2545,18 +2352,7 @@ unsafe fn encode_output(
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, jfa.tex_id());
 
-    gl.EnableVertexAttribArray(prog.attrib_vert as u32);
-    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-    gl.VertexAttribPointer(
-        prog.attrib_vert as u32,
-        2,
-        ffi::FLOAT,
-        ffi::FALSE,
-        0,
-        MASK_VERTICES.as_ptr().cast(),
-    );
-    gl.DrawArrays(ffi::TRIANGLES, 0, 6);
-    gl.DisableVertexAttribArray(prog.attrib_vert as u32);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
 }
 
 unsafe fn blit_to_mask_texture(
@@ -2589,25 +2385,25 @@ unsafe fn blit_to_mask_texture(
         .iter()
         .map(|r| r[0] as i32)
         .min()
-        .unwrap_or(bbx + 1)
+        .unwrap_or(bbx + BBOX_BORDER)
         .max(0);
     let blit_y1 = rects_raw_px
         .iter()
         .map(|r| r[1] as i32)
         .min()
-        .unwrap_or(bby + 1)
+        .unwrap_or(bby + BBOX_BORDER)
         .max(0);
     let blit_x2 = rects_raw_px
         .iter()
         .map(|r| r[2] as i32)
         .max()
-        .unwrap_or(bbx + bbw - 1)
+        .unwrap_or(bbx + bbw - BBOX_BORDER)
         .min(source_w);
     let blit_y2 = rects_raw_px
         .iter()
         .map(|r| r[3] as i32)
         .max()
-        .unwrap_or(bby + bbh - 1)
+        .unwrap_or(bby + bbh - BBOX_BORDER)
         .min(source_h);
 
     let mut read_fbo = 0u32;
@@ -2630,10 +2426,10 @@ unsafe fn blit_to_mask_texture(
     );
 
     gl.BlitFramebuffer(
-        1,
-        1,
-        bbw - 1,
-        bbh - 1,
+        BBOX_BORDER,
+        BBOX_BORDER,
+        bbw - BBOX_BORDER,
+        bbh - BBOX_BORDER,
         blit_x1,
         blit_y1,
         blit_x2,
@@ -2642,7 +2438,7 @@ unsafe fn blit_to_mask_texture(
         ffi::LINEAR,
     );
 
-    gl.DeleteFramebuffers(1, &mut read_fbo);
+    gl.DeleteFramebuffers(1, &read_fbo);
 }
 
 impl Blur {
@@ -2650,7 +2446,7 @@ impl Blur {
         &mut self,
         renderer: &mut GlesRenderer,
         source: &GlesTexture,
-        options: BlurOptions,
+        options: &BlurOptions,
     ) -> anyhow::Result<GlesTexture> {
         let _span = tracy_client::span!("Blur::render");
         trace!("rendering blur");
@@ -2663,7 +2459,7 @@ impl Blur {
             let custom =
                 crate::render_helpers::shaders::get_or_compile_custom_blur(renderer, pipeline);
             if let Some(custom) = custom {
-                return self.render_custom(renderer, source, &custom, &options);
+                return self.render_custom(renderer, source, &custom, options);
             }
         }
 
@@ -2672,14 +2468,14 @@ impl Blur {
             "wrong renderer"
         );
 
-        let passes = options.passes.clamp(1, 31) as usize;
+        let passes = options.clamped_passes();
         let size = source.size();
 
         // If shader_pipeline was set but compilation failed, prepare_textures()
         // skipped Kawase texture allocation. Allocate them here for the
         // fallback path.
         if self.textures.len() != passes + 1
-            || self.textures.first().map_or(true, |t| t.size() != size)
+            || self.textures.first().is_none_or(|t| t.size() != size)
         {
             self.ensure_kawase_textures(
                 |fourcc, sz| renderer.create_buffer(fourcc, sz),
@@ -2723,7 +2519,6 @@ impl Blur {
             gl.Uniform1i(program.uniform_tex, 0);
             gl.Uniform1f(program.uniform_offset, options.offset as f32);
 
-            let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
             gl.EnableVertexAttribArray(program.attrib_vert as u32);
             gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
             gl.VertexAttribPointer(
@@ -2732,7 +2527,7 @@ impl Blur {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                vertices.as_ptr().cast(),
+                FULLSCREEN_TRI_STRIP.as_ptr().cast(),
             );
 
             let src = once(source).chain(&self.textures[1..]);
@@ -2783,7 +2578,6 @@ impl Blur {
             gl.Uniform1i(program.uniform_tex, 0);
             gl.Uniform1f(program.uniform_offset, options.offset as f32);
 
-            let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
             gl.EnableVertexAttribArray(program.attrib_vert as u32);
             gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
             gl.VertexAttribPointer(
@@ -2792,7 +2586,7 @@ impl Blur {
                 ffi::FLOAT,
                 ffi::FALSE,
                 0,
-                vertices.as_ptr().cast(),
+                FULLSCREEN_TRI_STRIP.as_ptr().cast(),
             );
 
             let src = self.textures.iter().rev();
@@ -2842,6 +2636,7 @@ impl Blur {
 
             gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
             gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
+            check_gl_error(gl);
         })?;
 
         Ok(self.textures[0].clone())

@@ -34,10 +34,9 @@ void main() {
     // multi-grid solver was built for.  We normalise to a unit vector
     // to isolate direction from convergence-dependent magnitude.
     //
-    // Magnitude comes from the JFA distance field (R channel): the
-    // analytical `|to_center|` is 0.5 at boundaries and 0 at the
-    // centre, which is exactly `(1 - mask) * 0.5`.  This needs no
-    // bbox-size calibration or convergence tuning.
+    // Magnitude is derived from the JFA distance field (R channel):
+    // it is maximal at boundaries and falls to zero at the centre.
+    // This needs no bbox-size calibration or convergence tuning.
     vec2 st = 1.0 / niri_output_size;
     float r = texture(niri_poisson_u, uv + vec2(st.x, 0.0)).r;
     float l = texture(niri_poisson_u, uv - vec2(st.x, 0.0)).r;

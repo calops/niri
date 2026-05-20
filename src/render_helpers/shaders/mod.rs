@@ -411,6 +411,14 @@ pub fn get_or_compile_custom_blur(
         .custom_blur
         .borrow_mut()
         .insert(key, program.clone());
+
+    let cache_size = Shaders::get(renderer).custom_blur.borrow().len();
+    if cache_size > 100 {
+        warn!(
+            "custom blur shader cache has {cache_size} entries; consider clearing on config reload"
+        );
+    }
+
     program
 }
 

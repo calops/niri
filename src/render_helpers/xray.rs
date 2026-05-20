@@ -15,6 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::effect_buffer::EffectBuffer;
 use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
@@ -77,6 +78,7 @@ pub struct XrayElement {
     corner_radius: CornerRadius,
     scale: f32,
     blur: bool,
+    blur_options: Option<BlurOptions>,
     noise: f32,
     saturation: f32,
     bg_color: Color32F,
@@ -99,11 +101,12 @@ impl Xray {
         ctx: RenderCtx<GlesRenderer>,
         params: RenderParams,
         xray_pos: XrayPos,
-        blur: bool,
+        blur_options: Option<BlurOptions>,
         noise: f32,
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
+        let blur = blur_options.is_some();
         let program = Shaders::get(ctx.renderer).postprocess_and_clip.clone();
 
         let zoom = xray_pos.zoom;
@@ -119,12 +122,18 @@ impl Xray {
         let geo_in_backdrop = Rectangle::new(pos_in_backdrop, params.geometry.size.upscale(zoom));
 
         let mut backdrop = self.backdrop[ctx.target as usize].borrow_mut();
+        if let Some(ref opts) = blur_options {
+            backdrop.update_blur_options(opts.clone());
+        }
         let backdrop_geo = Rectangle::from_size(backdrop.logical_size());
         let intersection_with_backdrop = backdrop_geo.intersection(geo_in_backdrop);
 
         let mut skip_backdrop = intersection_with_backdrop.is_none();
 
         let mut background = self.background[ctx.target as usize].borrow_mut();
+        if let Some(ref opts) = blur_options {
+            background.update_blur_options(opts.clone());
+        }
         let prev = background.commit();
         if background.prepare(ctx.renderer, blur) {
             if background.commit() != prev {
@@ -198,6 +207,7 @@ impl Xray {
                     corner_radius,
                     scale: params.scale as f32,
                     blur,
+                    blur_options: blur_options.clone(),
                     noise,
                     saturation,
                     bg_color: *bg_color,
@@ -248,6 +258,7 @@ impl Xray {
                 corner_radius: corner_radius.scaled_by(zoom as f32),
                 scale: params.scale as f32,
                 blur,
+                blur_options: blur_options.clone(),
                 noise,
                 saturation,
                 bg_color: self.backdrop_color,
@@ -307,6 +318,9 @@ impl RenderElement<GlesRenderer> for XrayElement {
         _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         let mut buffer = self.buffer.borrow_mut();
+        if let Some(ref opts) = self.blur_options {
+            buffer.update_blur_options(opts.clone());
+        }
         let texture = match buffer.render(frame, self.blur) {
             Ok(x) => x,
             Err(err) => {

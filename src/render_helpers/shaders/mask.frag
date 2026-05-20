@@ -34,8 +34,8 @@ void main() {
         best_dist = d;
     }
 
-    float max_half = min(half_iso.x, half_iso.y);
-    float mask = max_half > 0.0 ? best_dist / max_half : 0.0;
+    float min_half = min(half_iso.x, half_iso.y);
+    float mask = min_half > 0.0 ? best_dist / min_half : 0.0;
 
     if (mask < 0.001) {
         frag_color = vec4(0.0, 0.5, 0.5, 1.0);

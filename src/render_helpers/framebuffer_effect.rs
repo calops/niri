@@ -238,7 +238,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 if let Err(err) = b.prepare_textures(
                     |fourcc, size| renderer.create_buffer(fourcc, size),
                     framebuffer,
-                    options.clone(),
+                    options,
                 ) {
                     warn!("error preparing blur textures: {err:?}");
                     blur = None;
@@ -344,7 +344,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     .with_geometry(geo_size, corner_radius)
                     .with_subregion_rects(subregion_rects)
                     .with_window_screen_rect(window_screen_rect);
-                match blur.render(renderer, framebuffer, options) {
+                match blur.render(renderer, framebuffer, &options) {
                     Ok(blurred) => inner.intermediate = Some(blurred),
                     Err(err) => {
                         warn!("error rendering blur: {err:?}");
