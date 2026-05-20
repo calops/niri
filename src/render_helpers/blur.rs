@@ -695,13 +695,29 @@ impl Blur {
 
     pub fn prepare_textures(
         &mut self,
-        mut create_texture: impl FnMut(Fourcc, Size<i32, Buffer>) -> Result<GlesTexture, GlesError>,
+        create_texture: impl FnMut(Fourcc, Size<i32, Buffer>) -> Result<GlesTexture, GlesError>,
         source: &GlesTexture,
         options: BlurOptions,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Blur::prepare_textures");
 
+        // Custom pipelines manage their own textures in render_custom().
+        // Don't allocate the Kawase cascade when a shader pipeline is set.
+        if options.shader_pipeline.is_some() {
+            self.textures.clear();
+            return Ok(());
+        }
+
         let passes = options.passes.clamp(1, 31) as usize;
+        self.ensure_kawase_textures(create_texture, source, passes)
+    }
+
+    fn ensure_kawase_textures(
+        &mut self,
+        mut create_texture: impl FnMut(Fourcc, Size<i32, Buffer>) -> Result<GlesTexture, GlesError>,
+        source: &GlesTexture,
+        passes: usize,
+    ) -> anyhow::Result<()> {
         let size = source.size();
 
         if let Some(output) = self.textures.first_mut() {
@@ -2659,6 +2675,19 @@ impl Blur {
         let passes = options.passes.clamp(1, 31) as usize;
         let size = source.size();
 
+        // If shader_pipeline was set but compilation failed, prepare_textures()
+        // skipped Kawase texture allocation. Allocate them here for the
+        // fallback path.
+        if self.textures.len() != passes + 1
+            || self.textures.first().map_or(true, |t| t.size() != size)
+        {
+            self.ensure_kawase_textures(
+                |fourcc, sz| renderer.create_buffer(fourcc, sz),
+                source,
+                passes,
+            )?;
+        }
+
         ensure!(
             self.textures.len() == passes + 1,
             "wrong textures len: expected {}, got {}",
@@ -2666,15 +2695,14 @@ impl Blur {
             self.textures.len()
         );
 
-        let output = &mut self.textures[0];
         ensure!(
-            output.size() == size,
+            self.textures[0].size() == size,
             "wrong output texture size: expected {size:?}, got {:?}",
-            output.size()
+            self.textures[0].size()
         );
 
         ensure!(
-            output.is_unique_reference(),
+            self.textures[0].is_unique_reference(),
             "output texture has a non-unique reference"
         );
 
