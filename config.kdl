@@ -116,9 +116,9 @@ environment {
 blur {
     noise 0
     shader-pipeline {
-        render-pass "down0" file="shaders/overshifted3/down.frag" scale=0.5
-        render-pass "up0" file="shaders/overshifted3/up.frag" scale=2.0
-        render-pass "glass" file="shaders/overshifted3/glass.frag" scale=1.0
+        mask-pass "window-vectors"
+        render-pass "dual-kawase-blur" passes=2 offset=1
+        render-pass "custom" file="shaders/overshifted3/glass.frag" scale=1.0
     }
 }
 
@@ -235,8 +235,11 @@ window-rule {
   geometry-corner-radius 1000 1000 1000 1000
   background-effect {
     shader-pipeline {
-        render-pass "magnify" file="shaders/magnify/magnify.frag" scale=1.0
-        render-pass "glass" file="shaders/magnify/glass.frag" scale=1.0
+        mask-pass "window-vectors"
+        render-pass "dual-kawase-blur" passes=1 offset=1
+        render-pass "custom" file="shaders/overshifted3/glass.frag" scale=1.0
+        // render-pass "custom" file="shaders/magnify/magnify.frag" scale=1.0
+        // render-pass "custom" file="shaders/magnify/glass.frag" scale=1.0
     }
   }
 }
@@ -278,6 +281,10 @@ layer-rule {
     xray false
     blur true
     noise 0.0
+    shader-pipeline {
+        mask-pass "region-vectors"
+        render-pass "dual-kawase-blur"
+    }
   }
 }
 
@@ -288,8 +295,9 @@ layer-rule {
     blur true
     noise 0.0
     shader-pipeline {
-        render-pass "magnify" file="shaders/magnify/magnify.frag" scale=1.0
-        render-pass "glass" file="shaders/magnify/glass.frag" scale=1.0
+        mask-pass "window-vectors"
+        render-pass "custom" file="shaders/magnify/magnify.frag" scale=1.0
+        render-pass "custom" file="shaders/magnify/glass.frag" scale=1.0
     }
   }
 }

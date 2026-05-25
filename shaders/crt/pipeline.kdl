@@ -1,1 +1,2 @@
-render-pass "crt" file="crt.frag" scale=1.0
+mask-pass "window-vectors"
+render-pass "custom" file="crt.frag" scale=1.0

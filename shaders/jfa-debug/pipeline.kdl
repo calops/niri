@@ -1,1 +1,2 @@
-render-pass "viz" file="viz.frag" scale=1.0
+mask-pass "region-vectors"
+render-pass "custom" file="viz.frag" scale=1.0

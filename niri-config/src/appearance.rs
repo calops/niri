@@ -1029,23 +1029,66 @@ impl Default for Blur {
     }
 }
 
+#[derive(knuffel::DecodeScalar, Debug, Clone, PartialEq)]
+pub enum MaskPassKind {
+    WindowVectors,
+    RegionVectors,
+    Custom,
+}
+
+impl std::fmt::Display for MaskPassKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowVectors => f.write_str("window-vectors"),
+            Self::RegionVectors => f.write_str("region-vectors"),
+            Self::Custom => f.write_str("custom"),
+        }
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct ShaderPassPart {
+pub struct MaskPassPart {
     #[knuffel(argument)]
-    pub name: String,
+    pub kind: MaskPassKind,
     #[knuffel(property)]
-    pub file: String,
+    pub file: Option<String>,
     #[knuffel(property, default = 1.0)]
     pub scale: f32,
 }
 
-pub type MaskPassPart = ShaderPassPart;
-pub type RenderPassPart = ShaderPassPart;
+#[derive(knuffel::DecodeScalar, Debug, Clone, PartialEq)]
+pub enum RenderPassKind {
+    DualKawaseBlur,
+    Custom,
+}
+
+impl std::fmt::Display for RenderPassKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DualKawaseBlur => f.write_str("dual-kawase-blur"),
+            Self::Custom => f.write_str("custom"),
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct RenderPassPart {
+    #[knuffel(argument)]
+    pub kind: RenderPassKind,
+    #[knuffel(property)]
+    pub file: Option<String>,
+    #[knuffel(property, default = 1.0)]
+    pub scale: f32,
+    #[knuffel(property)]
+    pub passes: Option<u8>,
+    #[knuffel(property)]
+    pub offset: Option<FloatOrInt<0, 100>>,
+}
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct ShaderPipeline {
-    #[knuffel(child)]
-    pub mask_pass: Option<MaskPassPart>,
+    #[knuffel(children(name = "mask-pass"))]
+    pub mask_passes: Vec<MaskPassPart>,
     #[knuffel(children(name = "render-pass"))]
     pub render_passes: Vec<RenderPassPart>,
 }
@@ -1387,9 +1430,10 @@ mod tests {
             r##"
             blur {
                 shader-pipeline {
-                    mask-pass "my_mask" file="/path/to/mask.frag" scale=0.5
-                    render-pass "pass1" file="/path/to/pass1.frag" scale=1.0
-                    render-pass "pass2" file="/path/to/pass2.frag"
+                    mask-pass "window-vectors"
+                    mask-pass "custom" file="/path/to/mask.frag" scale=0.5
+                    render-pass "dual-kawase-blur"
+                    render-pass "custom" file="/path/to/pass1.frag" scale=1.0
                 }
             }
             "##,
@@ -1401,23 +1445,36 @@ mod tests {
 
         assert_debug_snapshot!(pipeline, @r#"
         ShaderPipeline {
-            mask_pass: Some(
-                ShaderPassPart {
-                    name: "my_mask",
-                    file: "/path/to/mask.frag",
+            mask_passes: [
+                MaskPassPart {
+                    kind: WindowVectors,
+                    file: None,
+                    scale: 1.0,
+                },
+                MaskPassPart {
+                    kind: Custom,
+                    file: Some(
+                        "/path/to/mask.frag",
+                    ),
                     scale: 0.5,
                 },
-            ),
+            ],
             render_passes: [
-                ShaderPassPart {
-                    name: "pass1",
-                    file: "/path/to/pass1.frag",
+                RenderPassPart {
+                    kind: DualKawaseBlur,
+                    file: None,
                     scale: 1.0,
+                    passes: None,
+                    offset: None,
                 },
-                ShaderPassPart {
-                    name: "pass2",
-                    file: "/path/to/pass2.frag",
+                RenderPassPart {
+                    kind: Custom,
+                    file: Some(
+                        "/path/to/pass1.frag",
+                    ),
                     scale: 1.0,
+                    passes: None,
+                    offset: None,
                 },
             ],
         }

@@ -1,2 +1,3 @@
-render-pass "magnify" file="magnify.frag" scale=1.0
-render-pass "glass" file="glass.frag" scale=1.0
+mask-pass "window-vectors"
+render-pass "custom" file="magnify.frag" scale=1.0
+render-pass "custom" file="glass.frag" scale=1.0

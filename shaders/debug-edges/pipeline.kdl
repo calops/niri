@@ -1,1 +1,1 @@
-render-pass "edges" file="edges.frag" scale=1.0
+render-pass "custom" file="edges.frag" scale=1.0

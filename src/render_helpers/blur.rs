@@ -9,7 +9,7 @@ use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Textu
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Size};
 
-use crate::render_helpers::custom_blur::PipelineConfig;
+use crate::render_helpers::custom_blur::{MaskPassStep, PipelineConfig, RenderPassStep};
 use crate::render_helpers::shaders::Shaders;
 
 #[derive(Debug)]
@@ -24,7 +24,10 @@ pub struct Blur {
     /// Intermediate textures for custom blur passes.
     custom_textures: Vec<GlesTexture>,
     /// Mask texture at source resolution, rendered from GPU mask shader.
-    mask_texture: Option<GlesTexture>,
+    /// Primary buffer in the mask ping-pong pair.
+    mask_texture_a: Option<GlesTexture>,
+    /// Secondary buffer for mask ping-pong.
+    mask_texture_b: Option<GlesTexture>,
     /// Cached mask shader (compiled once per-blur-instance).
     mask_program: Option<MaskProgram>,
     /// Cache: last rects and size used for mask render.
@@ -33,6 +36,9 @@ pub struct Blur {
     cached_mask_h: i32,
     jfa_pipeline: Option<JfaPipeline>,
     jfa_textures: Option<JfaTextures>,
+    /// Compiled binary mask program (mask_binary.frag).  Used for the
+    /// always-on source-resolution binary mask step.
+    binary_program: Option<JfaBinaryProgram>,
     /// 1×N RGBA32F texture holding the subregion rects (one texel per
     /// rect, RGBA = x1,y1,x2,y2 in source pixels). Sampled by
     /// `mask_binary.frag` via texelFetch. Grown when the rect count
@@ -173,9 +179,10 @@ struct CustomBlurPassProgram {
 
 #[derive(Debug)]
 struct CustomBlurProgramInner {
-    mask_program: Option<CustomMaskProgram>,
-    passes: Vec<CustomBlurPassProgram>,
-    scales: Vec<f32>,
+    mask_passes: Vec<MaskPassStep>,
+    mask_programs: Vec<Option<CustomMaskProgram>>,
+    render_passes: Vec<RenderPassStep>,
+    render_programs: Vec<Option<CustomBlurPassProgram>>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,37 +255,44 @@ impl CustomBlurProgram {
         renderer: &mut GlesRenderer,
         config: &PipelineConfig,
     ) -> anyhow::Result<Self> {
-        let scales: Vec<f32> = config.render_passes.iter().map(|c| c.scale).collect();
         renderer
             .with_context(move |gl| unsafe {
-                let mask_program = if let Some(mask_cfg) = &config.mask_pass {
-                    Some(
-                        compile_custom_mask_pass(gl, &mask_cfg.source)
-                            .with_context(|| {
+                let mut mask_programs = Vec::with_capacity(config.mask_passes.len());
+                for (i, step) in config.mask_passes.iter().enumerate() {
+                    let prog = match step {
+                        MaskPassStep::WindowVectors | MaskPassStep::RegionVectors => None,
+                        MaskPassStep::Custom { source, name, .. } => Some(
+                            compile_custom_mask_pass(gl, source).with_context(|| {
                                 format!(
-                                    "error compiling custom mask pass ({:?})",
-                                    mask_cfg.name
+                                    "error compiling custom mask pass {} ({:?})",
+                                    i, name
                                 )
                             })?,
-                    )
-                } else {
-                    None
-                };
+                        ),
+                    };
+                    mask_programs.push(prog);
+                }
 
-                let mut passes = Vec::with_capacity(config.render_passes.len());
-                for (i, render_cfg) in config.render_passes.iter().enumerate() {
-                    let pass = compile_custom_pass(gl, &render_cfg.source).with_context(|| {
-                        format!(
-                            "error compiling custom render pass {} ({:?})",
-                            i, render_cfg.name
-                        )
-                    })?;
-                    passes.push(pass);
+                let mut render_programs = Vec::with_capacity(config.render_passes.len());
+                for (i, step) in config.render_passes.iter().enumerate() {
+                    let prog = match step {
+                        RenderPassStep::DualKawaseBlur { .. } => None,
+                        RenderPassStep::Custom { source, name, .. } => Some(
+                            compile_custom_pass(gl, source).with_context(|| {
+                                format!(
+                                    "error compiling custom render pass {} ({:?})",
+                                    i, name
+                                )
+                            })?,
+                        ),
+                    };
+                    render_programs.push(prog);
                 }
                 Ok(Self(Rc::new(CustomBlurProgramInner {
-                    mask_program,
-                    passes,
-                    scales,
+                    mask_passes: config.mask_passes.clone(),
+                    mask_programs,
+                    render_passes: config.render_passes.clone(),
+                    render_programs,
                 })))
             })
             .context("error making GL context current")?
@@ -286,11 +300,15 @@ impl CustomBlurProgram {
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         renderer.with_context(move |gl| unsafe {
-            if let Some(mask) = &self.0.mask_program {
-                gl.DeleteProgram(mask.program);
+            for prog in &self.0.mask_programs {
+                if let Some(p) = prog {
+                    gl.DeleteProgram(p.program);
+                }
             }
-            for pass in &self.0.passes {
-                gl.DeleteProgram(pass.program);
+            for prog in &self.0.render_programs {
+                if let Some(p) = prog {
+                    gl.DeleteProgram(p.program);
+                }
             }
         })
     }
@@ -458,9 +476,6 @@ const FULLSCREEN_TRI_STRIP: [f32; 12] =
 /// Maximum number of Kawase blur down+up passes.
 const MAX_KAWASE_PASSES: u8 = 31;
 
-/// Threshold for deciding a subregion covers the entire window (single-full heuristic).
-const SINGLE_FULL_EPSILON: f32 = 0.001;
-
 /// Per-component comparison epsilon for the JFA bbox-local rects cache.
 const JFA_CACHE_EPSILON: f32 = 0.01;
 
@@ -571,6 +586,12 @@ unsafe fn compile_jfa_binary(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesEr
         uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
+}
+
+/// Compile the binary mask program for standalone use (at source resolution,
+/// outside the JFA pipeline).
+unsafe fn compile_binary_program(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
+    compile_jfa_binary(gl)
 }
 
 unsafe fn compile_jfa_init(gl: &ffi::Gles2) -> Result<JfaInitProgram, GlesError> {
@@ -709,13 +730,15 @@ impl Blur {
             renderer_context_id: renderer.context_id(),
             textures: Vec::new(),
             custom_textures: Vec::new(),
-            mask_texture: None,
+            mask_texture_a: None,
+            mask_texture_b: None,
             mask_program: None,
             cached_mask_rects: Vec::new(),
             cached_mask_w: 0,
             cached_mask_h: 0,
             jfa_pipeline: None,
             jfa_textures: None,
+            binary_program: None,
             rects_texture: None,
             rects_capacity: 0,
             cached_jfa_rects_local: Vec::new(),
@@ -809,6 +832,7 @@ impl Blur {
         let _span = tracy_client::span!("Blur::render_custom");
         trace!("rendering custom blur");
 
+        let inner = &custom_program.0;
         let geo_size = options.geo_size;
         let corner_radius = options.corner_radius;
 
@@ -817,9 +841,9 @@ impl Blur {
             "wrong renderer"
         );
 
-        let passes = &custom_program.0.passes;
-        let scales = &custom_program.0.scales;
-        let pass_count = passes.len();
+        let render_passes = &inner.render_passes;
+        let render_programs = &inner.render_programs;
+        let pass_count = render_passes.len();
 
         let source_size = source.size();
         let source_w = source_size.w as f32;
@@ -828,7 +852,11 @@ impl Blur {
         let mut pass_output_sizes: Vec<(i32, i32)> = Vec::with_capacity(pass_count);
         let mut current_w = source_w;
         let mut current_h = source_h;
-        for &scale in scales {
+        for step in render_passes {
+            let scale = match step {
+                RenderPassStep::DualKawaseBlur { .. } => 1.0,
+                RenderPassStep::Custom { scale, .. } => *scale,
+            };
             current_w = (current_w * scale).max(1.0);
             current_h = (current_h * scale).max(1.0);
             pass_output_sizes.push((current_w as i32, current_h as i32));
@@ -855,7 +883,6 @@ impl Blur {
 
         let rects_changed = self.cached_mask_rects != options.subregion_rects;
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
-
         let render_mask = rects_changed || size_changed;
 
         if render_mask {
@@ -872,145 +899,94 @@ impl Blur {
 
         let mask_size = Size::new(mask_w, mask_h);
         let need_new_mask = self
-            .mask_texture
+            .mask_texture_a
             .as_ref()
             .is_none_or(|t| t.size() != mask_size);
         if need_new_mask {
-            let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
-            self.mask_texture = Some(texture);
+            let tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
+            self.mask_texture_a = Some(tex);
+        }
+        let need_mask_b = self
+            .mask_texture_b
+            .as_ref()
+            .is_none_or(|t| t.size() != mask_size);
+        if need_mask_b {
+            let tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
+            self.mask_texture_b = Some(tex);
         }
 
         let need_render = render_mask || need_new_mask;
 
-        let has_custom_mask = custom_program.0.mask_program.is_some();
+        let needed = options.subregion_rects.len() as i32;
+        if needed > self.rects_capacity {
+            let capacity = ((needed as u32).next_power_of_two() as i32).max(16);
+            let size = Size::new(capacity, 1);
+            self.rects_texture = Some(create_rgba32f_buffer(renderer, size)?);
+            self.rects_capacity = capacity;
+        }
 
-        // Tracks whether the JFA pipeline allocated new textures this frame;
-        // used below to invalidate the per-bbox cache.
+        let has_region_vectors = inner.mask_passes.iter().any(|s| matches!(s, MaskPassStep::RegionVectors));
         let mut jfa_need_alloc = false;
-
-        // Use JFA for explicit subregions; fall back to analytical SDF when
-        // there's a single region covering the whole window (or none at all).
-        // When a custom mask pass is declared in the pipeline, we bypass this
-        // heuristic entirely and let the user shader decide.
-        let jfa_bbox = if has_custom_mask {
-            None
-        } else if need_render && !options.subregion_rects.is_empty() {
-            let rects = &options.subregion_rects;
-            let single_full = rects.len() == 1
-                && rects[0][0] <= SINGLE_FULL_EPSILON
-                && rects[0][1] <= SINGLE_FULL_EPSILON
-                && rects[0][2] >= 1.0 - SINGLE_FULL_EPSILON
-                && rects[0][3] >= 1.0 - SINGLE_FULL_EPSILON;
-            if single_full {
-                info!("single full-window subregion, using analytical SDF");
-                None
-            } else {
-                let mut bbox = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
-                for rect in &options.subregion_rects {
-                    bbox[0] = bbox[0].min(rect[0]);
-                    bbox[1] = bbox[1].min(rect[1]);
-                    bbox[2] = bbox[2].max(rect[2]);
-                    bbox[3] = bbox[3].max(rect[3]);
-                }
-                // Expand bbox by 1px on each side for a guaranteed exterior border.
-                //
-                // Subregion rects arrive as UV coords (f32) that round-tripped
-                // through a divide-by-blur-width: an integer pixel coord like
-                // 200 becomes 200/1920 in f32, then multiplied back by 1920
-                // here gives 199.99999 or 200.00001 (±1 ULP). A naïve floor()
-                // then jitters between 199 and 200 across frames, which
-                // propagates to bbox-size oscillation and visible "wobble"
-                // even though the geometric input is integer-stable.
-                //
-                // The ULP at value ~200 in f32 is ~2.4e-5. A 1e-4 epsilon is
-                // an order of magnitude above ULP and well below 0.5, so it
-                // snaps integer-close values to the integer without altering
-                // genuinely fractional positions.
-                const EPS: f32 = 1e-4;
-                let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
-                let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
-                let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
-                    .max(1)
-                    .min(source_size.w - bbx);
-                let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
-                    .max(1)
-                    .min(source_size.h - bby);
-                if bbw > 0 && bbh > 0 {
-                    let bbox_size = Size::new(bbw, bbh);
-                    let need_alloc = match &self.jfa_textures {
-                        Some(t) => t.size != bbox_size,
-                        None => true,
-                    };
-                    jfa_need_alloc = need_alloc;
-                    if need_alloc {
-                        // Build the multigrid pyramid sized to the bbox.
-                        // Level 0 is bbox_size; each subsequent level halves
-                        // both dimensions (floor, min 1).
-                        let pyramid_max_levels = MAX_MULTIGRID_LEVELS;
-                        let mut pyramid: Vec<MultigridLevel> =
-                            Vec::with_capacity(pyramid_max_levels);
-                        for k in 0..pyramid_max_levels {
-                            let mw = std::cmp::max(1, bbw >> k);
-                            let mh = std::cmp::max(1, bbh >> k);
-                            let lvl_size = Size::new(mw, mh);
-                            pyramid.push(MultigridLevel {
-                                // u textures need 32-bit float precision; half-
-                                // float bands the gradient near interior maxima.
-                                u_a: create_rgba32f_buffer(renderer, lvl_size)?,
-                                u_b: create_rgba32f_buffer(renderer, lvl_size)?,
-                                rhs: renderer.create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
-                                size: lvl_size,
-                            });
-                            if mw == 1 || mh == 1 {
-                                break;
-                            }
-                        }
-
-                        self.jfa_textures = Some(JfaTextures {
-                            bin: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            jfa_a: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            jfa_b: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            sdf: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            pyramid,
-                            encoded: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
-                            size: bbox_size,
+        let jfa_bbox = if has_region_vectors && !options.subregion_rects.is_empty() {
+            let mut bbox = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
+            for rect in &options.subregion_rects {
+                bbox[0] = bbox[0].min(rect[0]);
+                bbox[1] = bbox[1].min(rect[1]);
+                bbox[2] = bbox[2].max(rect[2]);
+                bbox[3] = bbox[3].max(rect[3]);
+            }
+            const EPS: f32 = 1e-4;
+            let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
+                .max(1)
+                .min(source_size.w - bbx);
+            let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32 + 2 * BBOX_BORDER)
+                .max(1)
+                .min(source_size.h - bby);
+            if bbw > 0 && bbh > 0 {
+                let bbox_size = Size::new(bbw, bbh);
+                let need_alloc = match &self.jfa_textures {
+                    Some(t) => t.size != bbox_size,
+                    None => true,
+                };
+                jfa_need_alloc = need_alloc;
+                if need_alloc {
+                    let pyramid_max_levels = MAX_MULTIGRID_LEVELS;
+                    let mut pyramid: Vec<MultigridLevel> =
+                        Vec::with_capacity(pyramid_max_levels);
+                    for k in 0..pyramid_max_levels {
+                        let mw = std::cmp::max(1, bbw >> k);
+                        let mh = std::cmp::max(1, bbh >> k);
+                        let lvl_size = Size::new(mw, mh);
+                        pyramid.push(MultigridLevel {
+                            u_a: create_rgba32f_buffer(renderer, lvl_size)?,
+                            u_b: create_rgba32f_buffer(renderer, lvl_size)?,
+                            rhs: renderer.create_buffer(Fourcc::Abgr16161616f, lvl_size)?,
+                            size: lvl_size,
                         });
+                        if mw == 1 || mh == 1 {
+                            break;
+                        }
                     }
-                    Some((bbx, bby, bbw, bbh))
-                } else {
-                    None
+                    self.jfa_textures = Some(JfaTextures {
+                        bin: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                        jfa_a: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                        jfa_b: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                        sdf: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                        pyramid,
+                        encoded: renderer.create_buffer(Fourcc::Abgr16161616f, bbox_size)?,
+                        size: bbox_size,
+                    });
                 }
-            } // end single_full else
+                Some((bbx, bby, bbw, bbh))
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        // Grow the rect-data texture if needed. We size it to the next
-        // power-of-two ≥ rect_count to amortise reallocations across small
-        // count fluctuations. The texture isn't shrunk.
-        if jfa_bbox.is_some()
-            || (has_custom_mask && !options.subregion_rects.is_empty())
-        {
-            let needed = options.subregion_rects.len() as i32;
-            if needed > self.rects_capacity {
-                let capacity = ((needed as u32).next_power_of_two() as i32).max(16);
-                let size = Size::new(capacity, 1);
-                self.rects_texture = Some(create_rgba32f_buffer(renderer, size)?);
-                self.rects_capacity = capacity;
-            }
-        }
-
-        // Decide whether the previous frame's `textures.encoded` is still
-        // valid: the JFA pipeline runs entirely in bbox-local coordinates,
-        // so its output is invariant under cursor motion (only the bbox
-        // origin in screen pixels changes). We can skip the full pipeline
-        // and just re-blit when (a) the bbox has the same dimensions and
-        // (b) every rect occupies the same offset within the bbox.
-        //
-        // Cache miss on:
-        // - textures freshly allocated this frame (encoded is uninitialised)
-        // - bbox dimensions changed
-        // - any rect's bbox-local pixel position changed
         let jfa_cache_hit = match jfa_bbox {
             Some((bbx, bby, bbw, bbh)) if !jfa_need_alloc => {
                 let rects_local: Vec<[f32; 4]> = options
@@ -1049,6 +1025,33 @@ impl Blur {
             }
         };
 
+        let mask_passes = &inner.mask_passes;
+        let mask_programs = &inner.mask_programs;
+
+        // If any render step is DualKawaseBlur, prepare Kawase textures
+        // before entering the GL context. Use the maximum passes across
+        // all DualKawaseBlur steps so that intermediate textures are sized
+        // for the largest chain.
+        let max_kawase_passes = render_passes
+            .iter()
+            .filter_map(|s| match s {
+                RenderPassStep::DualKawaseBlur { passes, .. } => Some(
+                    passes
+                        .map(|p| p.clamp(1, MAX_KAWASE_PASSES) as usize)
+                        .unwrap_or_else(|| options.clamped_passes()),
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if max_kawase_passes > 0 {
+            self.ensure_kawase_textures(
+                |fourcc, sz| renderer.create_buffer(fourcc, sz),
+                source,
+                max_kawase_passes,
+            )?;
+        }
+
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
 
@@ -1056,14 +1059,23 @@ impl Blur {
             gl.Disable(ffi::SCISSOR_TEST);
             gl.ActiveTexture(ffi::TEXTURE0);
 
-            if let Some(mask_tex) = &self.mask_texture {
-                if need_render {
-                    if let Some(mask_prog) = custom_program.0.mask_program.as_ref() {
+            // Step 0: binary mask into mask_texture_a.
+            let mask_a = self.mask_texture_a.as_ref().unwrap();
+            if need_render {
+                let mask_a_id = mask_a.tex_id();
+                clear_mask_texture(gl, mask_a_id);
 
-                        if let (Some(rects_tex), true) = (
-                            self.rects_texture.as_ref(),
-                            !options.subregion_rects.is_empty(),
-                        ) {
+                if !options.subregion_rects.is_empty() {
+                    if let Some(rects_tex) = self.rects_texture.as_ref() {
+                        if self.binary_program.is_none() {
+                            match compile_binary_program(gl) {
+                                Ok(p) => self.binary_program = Some(p),
+                                Err(err) => {
+                                    warn!("error compiling binary mask shader: {err:?}");
+                                }
+                            }
+                        }
+                        if let Some(bin_prog) = self.binary_program.as_ref() {
                             let rects_px: Vec<[f32; 4]> = options
                                 .subregion_rects
                                 .iter()
@@ -1111,251 +1123,40 @@ impl Blur {
                                 ffi::CLAMP_TO_EDGE as i32,
                             );
                             gl.ActiveTexture(ffi::TEXTURE0);
-                        }
 
-                        let mut mask_fbo = 0u32;
-                        gl.GenFramebuffers(1, &mut mask_fbo);
-                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
-                        gl.FramebufferTexture2D(
-                            ffi::DRAW_FRAMEBUFFER,
-                            ffi::COLOR_ATTACHMENT0,
-                            ffi::TEXTURE_2D,
-                            mask_tex.tex_id(),
-                            0,
-                        );
+                            let mut mask_fbo = 0u32;
+                            gl.GenFramebuffers(1, &mut mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
+                            gl.FramebufferTexture2D(
+                                ffi::DRAW_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                mask_a_id,
+                                0,
+                            );
 
-                        gl.UseProgram(mask_prog.program);
-                        if mask_prog.uniform_subregion_count >= 0 {
+                            gl.UseProgram(bin_prog.program);
                             gl.Uniform1i(
-                                mask_prog.uniform_subregion_count,
+                                bin_prog.uniform_subregion_count,
                                 options.subregion_rects.len() as i32,
                             );
+                            gl.Uniform1i(bin_prog.uniform_subregion_rects, 1);
+                            gl.Uniform2f(bin_prog.uniform_output_size, mask_w as f32, mask_h as f32);
+                            gl.Uniform2f(bin_prog.uniform_bbox_origin, 0.0, 0.0);
+
+                            gl.Viewport(0, 0, mask_w, mask_h);
+                            draw_fullscreen_quad(gl, bin_prog.attrib_vert);
+
+                            gl.DeleteFramebuffers(1, &mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                            check_gl_error(gl);
                         }
-                        if mask_prog.uniform_subregion_rects >= 0 {
-                            gl.Uniform1i(mask_prog.uniform_subregion_rects, 1);
-                        }
-                        if mask_prog.uniform_output_size >= 0 {
-                            gl.Uniform2f(
-                                mask_prog.uniform_output_size,
-                                mask_w as f32,
-                                mask_h as f32,
-                            );
-                        }
-                        if mask_prog.uniform_bbox_origin >= 0 {
-                            gl.Uniform2f(
-                                mask_prog.uniform_bbox_origin,
-                                0.0,
-                                0.0,
-                            );
-                        }
-                        if mask_prog.uniform_geo_size >= 0 {
-                            gl.Uniform2f(
-                                mask_prog.uniform_geo_size,
-                                geo_size.0,
-                                geo_size.1,
-                            );
-                        }
-                        if mask_prog.uniform_corner_radius >= 0 {
-                            gl.Uniform4f(
-                                mask_prog.uniform_corner_radius,
-                                corner_radius[0],
-                                corner_radius[1],
-                                corner_radius[2],
-                                corner_radius[3],
-                            );
-                        }
-
-                        gl.Viewport(0, 0, mask_w, mask_h);
-                        draw_fullscreen_quad(gl, mask_prog.attrib_vert);
-
-                        gl.DeleteFramebuffers(1, &mask_fbo);
-                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
-                        check_gl_error(gl);
-
-                        // Set texture params on the rendered mask.
-                        gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_MIN_FILTER,
-                            ffi::LINEAR as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_MAG_FILTER,
-                            ffi::LINEAR as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_WRAP_S,
-                            ffi::CLAMP_TO_EDGE as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_WRAP_T,
-                            ffi::CLAMP_TO_EDGE as i32,
-                        );
-                    } else if let (Some((bbx, bby, bbw, bbh)), Some(textures), Some(rects_tex)) = (
-                        jfa_bbox,
-                        self.jfa_textures.as_ref(),
-                        self.rects_texture.as_ref(),
-                    ) {
-                        let mask_tex_id = mask_tex.tex_id();
-                        render_jfa_mask(
-                            gl,
-                            options,
-                            mask_tex_id,
-                            bbx,
-                            bby,
-                            bbw,
-                            bbh,
-                            source_size.w,
-                            source_size.h,
-                            &mut self.jfa_pipeline,
-                            textures,
-                            rects_tex,
-                            jfa_cache_hit,
-                        );
-                    } else {
-                        if self.mask_program.is_none() {
-                            match compile_mask_program(gl) {
-                                Ok(p) => self.mask_program = Some(p),
-                                Err(err) => {
-                                    warn!("error compiling mask shader: {err:?}");
-                                    // Skip mask render; custom passes will use
-                                    // a cleared/default mask texture instead.
-                                }
-                            }
-                        }
-                        if let Some(mask_prog) = self.mask_program.as_ref() {
-
-                        let mut mask_fbo = 0u32;
-                        gl.GenFramebuffers(1, &mut mask_fbo);
-                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
-                        gl.FramebufferTexture2D(
-                            ffi::DRAW_FRAMEBUFFER,
-                            ffi::COLOR_ATTACHMENT0,
-                            ffi::TEXTURE_2D,
-                            mask_tex.tex_id(),
-                            0,
-                        );
-
-                        gl.UseProgram(mask_prog.program);
-                        gl.Uniform2f(mask_prog.uniform_geo_size, geo_size.0, geo_size.1);
-                        gl.Uniform4f(
-                            mask_prog.uniform_corner_radius,
-                            corner_radius[0],
-                            corner_radius[1],
-                            corner_radius[2],
-                            corner_radius[3],
-                        );
-
-                        gl.Viewport(0, 0, mask_w, mask_h);
-                        draw_fullscreen_quad(gl, mask_prog.attrib_vert);
-
-                        gl.DeleteFramebuffers(1, &mask_fbo);
-                        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
-                        check_gl_error(gl);
-
-                        // Set texture params on the rendered mask.
-                        gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_MIN_FILTER,
-                            ffi::LINEAR as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_MAG_FILTER,
-                            ffi::LINEAR as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_WRAP_S,
-                            ffi::CLAMP_TO_EDGE as i32,
-                        );
-                        gl.TexParameteri(
-                            ffi::TEXTURE_2D,
-                            ffi::TEXTURE_WRAP_T,
-                            ffi::CLAMP_TO_EDGE as i32,
-                        );
-                        } // end if let Some(mask_prog)
                     }
                 }
 
-                gl.ActiveTexture(ffi::TEXTURE1);
-                gl.BindTexture(ffi::TEXTURE_2D, mask_tex.tex_id());
-                gl.ActiveTexture(ffi::TEXTURE0);
-            }
-
-            let mut fbos = [0; 2];
-            gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
-            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
-
-            for (i, pass) in passes.iter().enumerate() {
-                let (output_w, output_h) = pass_output_sizes[i];
-                let (input_w, input_h) = if i == 0 {
-                    (source_size.w, source_size.h)
-                } else {
-                    let prev = pass_output_sizes[i - 1];
-                    (prev.0, prev.1)
-                };
-
-                gl.UseProgram(pass.program);
-                gl.Uniform1i(pass.uniform_input, 0);
-                gl.Uniform2f(pass.uniform_output_size, output_w as f32, output_h as f32);
-                gl.Uniform2f(pass.uniform_input_size, input_w as f32, input_h as f32);
-                gl.Uniform2f(
-                    pass.uniform_half_pixel,
-                    0.5 / output_w as f32,
-                    0.5 / output_h as f32,
-                );
-                gl.Uniform1i(pass.uniform_pass, i as i32);
-                gl.Uniform1i(pass.uniform_pass_count, pass_count as i32);
-                gl.Uniform2f(pass.uniform_geo_size, geo_size.0, geo_size.1);
-                gl.Uniform4f(
-                    pass.uniform_corner_radius,
-                    corner_radius[0],
-                    corner_radius[1],
-                    corner_radius[2],
-                    corner_radius[3],
-                );
-
-                if pass.uniform_mask >= 0 {
-                    gl.Uniform1i(pass.uniform_mask, 1);
-                }
-
-                if pass.uniform_window_screen_rect >= 0 {
-                    gl.Uniform4f(
-                        pass.uniform_window_screen_rect,
-                        options.window_screen_rect[0],
-                        options.window_screen_rect[1],
-                        options.window_screen_rect[2],
-                        options.window_screen_rect[3],
-                    );
-                }
-
-                gl.Viewport(0, 0, output_w, output_h);
-
-                let dst = self.custom_textures[i].tex_id();
-                let src = if i == 0 {
-                    source.tex_id()
-                } else {
-                    self.custom_textures[i - 1].tex_id()
-                };
-
-                trace!("custom blur pass {i}: drawing {src} to {dst}");
-
-                gl.FramebufferTexture2D(
-                    ffi::DRAW_FRAMEBUFFER,
-                    ffi::COLOR_ATTACHMENT0,
-                    ffi::TEXTURE_2D,
-                    dst,
-                    0,
-                );
-
-                gl.BindTexture(ffi::TEXTURE_2D, src);
-                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                gl.BindTexture(ffi::TEXTURE_2D, mask_a_id);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
                 gl.TexParameteri(
                     ffi::TEXTURE_2D,
                     ffi::TEXTURE_WRAP_S,
@@ -1366,8 +1167,296 @@ impl Blur {
                     ffi::TEXTURE_WRAP_T,
                     ffi::CLAMP_TO_EDGE as i32,
                 );
+            }
 
-                draw_fullscreen_quad(gl, pass.attrib_vert);
+            // Step 1: mask pipeline passes (binary → mask_texture_a → passes).
+            let mask_b = self.mask_texture_b.as_ref().unwrap();
+            let mut src_mask = mask_a;
+            let mut swap = false;
+
+            for (i, step) in mask_passes.iter().enumerate() {
+                let dst_mask = if swap { mask_a } else { mask_b };
+
+                match step {
+                    MaskPassStep::WindowVectors => {
+                        if self.mask_program.is_none() {
+                            match compile_mask_program(gl) {
+                                Ok(p) => self.mask_program = Some(p),
+                                Err(err) => {
+                                    warn!("error compiling analytical mask shader: {err:?}");
+                                    src_mask = dst_mask;
+                                    swap = !swap;
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(mask_prog) = self.mask_program.as_ref() {
+                            let mut mask_fbo = 0u32;
+                            gl.GenFramebuffers(1, &mut mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
+                            gl.FramebufferTexture2D(
+                                ffi::DRAW_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                dst_mask.tex_id(),
+                                0,
+                            );
+
+                            gl.UseProgram(mask_prog.program);
+                            gl.Uniform2f(mask_prog.uniform_geo_size, geo_size.0, geo_size.1);
+                            gl.Uniform4f(
+                                mask_prog.uniform_corner_radius,
+                                corner_radius[0], corner_radius[1],
+                                corner_radius[2], corner_radius[3],
+                            );
+
+                            gl.Viewport(0, 0, mask_w, mask_h);
+                            draw_fullscreen_quad(gl, mask_prog.attrib_vert);
+
+                            gl.DeleteFramebuffers(1, &mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                            check_gl_error(gl);
+
+                            gl.BindTexture(ffi::TEXTURE_2D, dst_mask.tex_id());
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                        }
+                    }
+
+                    MaskPassStep::RegionVectors => {
+                        match (jfa_bbox, self.jfa_textures.as_ref(), self.rects_texture.as_ref()) {
+                            (Some((bbx, bby, bbw, bbh)), Some(textures), Some(rects_tex)) => {
+                                let mask_id = dst_mask.tex_id();
+                                render_jfa_mask(
+                                    gl,
+                                    options,
+                                    mask_id,
+                                    bbx, bby, bbw, bbh,
+                                    source_size.w, source_size.h,
+                                    &mut self.jfa_pipeline,
+                                    textures,
+                                    rects_tex,
+                                    jfa_cache_hit,
+                                );
+                            }
+                            _ => {
+                                warn!("RegionVectors mask pass: no valid bbox/subregion rects");
+                            }
+                        }
+                    }
+
+                    MaskPassStep::Custom { .. } => {
+                        if let Some(Some(prog)) = mask_programs.get(i) {
+                            if let (Some(rects_tex), true) = (
+                                self.rects_texture.as_ref(),
+                                !options.subregion_rects.is_empty(),
+                            ) {
+                                let rects_px: Vec<[f32; 4]> = options
+                                    .subregion_rects
+                                    .iter()
+                                    .map(|r| {
+                                        [
+                                            r[0] * source_size.w as f32,
+                                            r[1] * source_size.h as f32,
+                                            r[2] * source_size.w as f32,
+                                            r[3] * source_size.h as f32,
+                                        ]
+                                    })
+                                    .collect();
+
+                                gl.ActiveTexture(ffi::TEXTURE1);
+                                gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
+                                gl.TexSubImage2D(
+                                    ffi::TEXTURE_2D, 0, 0, 0,
+                                    rects_px.len() as i32, 1,
+                                    ffi::RGBA, ffi::FLOAT,
+                                    rects_px.as_ptr() as *const _,
+                                );
+                                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+                                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+                                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                                gl.ActiveTexture(ffi::TEXTURE0);
+                            }
+
+                            let mut mask_fbo = 0u32;
+                            gl.GenFramebuffers(1, &mut mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, mask_fbo);
+                            gl.FramebufferTexture2D(
+                                ffi::DRAW_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                dst_mask.tex_id(),
+                                0,
+                            );
+
+                            gl.ActiveTexture(ffi::TEXTURE0);
+                            gl.BindTexture(ffi::TEXTURE_2D, src_mask.tex_id());
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+
+                            gl.UseProgram(prog.program);
+                            if prog.uniform_subregion_count >= 0 {
+                                gl.Uniform1i(prog.uniform_subregion_count, options.subregion_rects.len() as i32);
+                            }
+                            if prog.uniform_subregion_rects >= 0 {
+                                gl.Uniform1i(prog.uniform_subregion_rects, 1);
+                            }
+                            if prog.uniform_output_size >= 0 {
+                                gl.Uniform2f(prog.uniform_output_size, mask_w as f32, mask_h as f32);
+                            }
+                            if prog.uniform_bbox_origin >= 0 {
+                                gl.Uniform2f(prog.uniform_bbox_origin, 0.0, 0.0);
+                            }
+                            if prog.uniform_geo_size >= 0 {
+                                gl.Uniform2f(prog.uniform_geo_size, geo_size.0, geo_size.1);
+                            }
+                            if prog.uniform_corner_radius >= 0 {
+                                gl.Uniform4f(
+                                    prog.uniform_corner_radius,
+                                    corner_radius[0], corner_radius[1],
+                                    corner_radius[2], corner_radius[3],
+                                );
+                            }
+
+                            gl.Viewport(0, 0, mask_w, mask_h);
+                            draw_fullscreen_quad(gl, prog.attrib_vert);
+
+                            gl.DeleteFramebuffers(1, &mask_fbo);
+                            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                            check_gl_error(gl);
+
+                            gl.ActiveTexture(ffi::TEXTURE0);
+                            gl.BindTexture(ffi::TEXTURE_2D, dst_mask.tex_id());
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                        }
+                    }
+                }
+
+                src_mask = dst_mask;
+                swap = !swap;
+            }
+
+            let active_mask = src_mask;
+
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, active_mask.tex_id());
+            gl.ActiveTexture(ffi::TEXTURE0);
+
+            // Step 2: render passes.
+            let mut fbos = [0; 2];
+            gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
+
+            for (i, step) in render_passes.iter().enumerate() {
+                let (output_w, output_h) = pass_output_sizes[i];
+                let (input_w, input_h) = if i == 0 {
+                    (source_size.w, source_size.h)
+                } else {
+                    let prev = pass_output_sizes[i - 1];
+                    (prev.0, prev.1)
+                };
+
+                match step {
+                    RenderPassStep::DualKawaseBlur { passes, offset } => {
+                        let dst = self.custom_textures[i].tex_id();
+                        let src = if i == 0 {
+                            source.tex_id()
+                        } else {
+                            self.custom_textures[i - 1].tex_id()
+                        };
+
+                        run_dual_kawase_blur(
+                            gl,
+                            &self.program,
+                            src,
+                            dst,
+                            &self.textures,
+                            options,
+                            active_mask.tex_id(),
+                            *passes,
+                            *offset,
+                        );
+                    }
+
+                    RenderPassStep::Custom { .. } => {
+                        if let Some(Some(pass)) = render_programs.get(i) {
+                            gl.UseProgram(pass.program);
+                            gl.Uniform1i(pass.uniform_input, 0);
+                            gl.Uniform2f(pass.uniform_output_size, output_w as f32, output_h as f32);
+                            gl.Uniform2f(pass.uniform_input_size, input_w as f32, input_h as f32);
+                            gl.Uniform2f(
+                                pass.uniform_half_pixel,
+                                0.5 / output_w as f32,
+                                0.5 / output_h as f32,
+                            );
+                            gl.Uniform1i(pass.uniform_pass, i as i32);
+                            gl.Uniform1i(pass.uniform_pass_count, pass_count as i32);
+                            gl.Uniform2f(pass.uniform_geo_size, geo_size.0, geo_size.1);
+                            gl.Uniform4f(
+                                pass.uniform_corner_radius,
+                                corner_radius[0], corner_radius[1],
+                                corner_radius[2], corner_radius[3],
+                            );
+
+                            if pass.uniform_mask >= 0 {
+                                gl.Uniform1i(pass.uniform_mask, 1);
+                            }
+
+                            if pass.uniform_window_screen_rect >= 0 {
+                                gl.Uniform4f(
+                                    pass.uniform_window_screen_rect,
+                                    options.window_screen_rect[0],
+                                    options.window_screen_rect[1],
+                                    options.window_screen_rect[2],
+                                    options.window_screen_rect[3],
+                                );
+                            }
+
+                            gl.Viewport(0, 0, output_w, output_h);
+
+                            let dst = self.custom_textures[i].tex_id();
+                            let src = if i == 0 {
+                                source.tex_id()
+                            } else {
+                                self.custom_textures[i - 1].tex_id()
+                            };
+
+                            trace!("custom blur pass {i}: drawing {src} to {dst}");
+
+                            gl.FramebufferTexture2D(
+                                ffi::DRAW_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                dst,
+                                0,
+                            );
+
+                            gl.BindTexture(ffi::TEXTURE_2D, src);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_S,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+                            gl.TexParameteri(
+                                ffi::TEXTURE_2D,
+                                ffi::TEXTURE_WRAP_T,
+                                ffi::CLAMP_TO_EDGE as i32,
+                            );
+
+                            draw_fullscreen_quad(gl, pass.attrib_vert);
+                        }
+                    }
+                }
             }
 
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
@@ -2439,6 +2528,179 @@ unsafe fn blit_to_mask_texture(
     );
 
     gl.DeleteFramebuffers(1, &read_fbo);
+}
+
+/// Run the full dual-Kawase down+up blur chain, writing the result
+/// to `dst_tex`.  Uses `blur.textures` for intermediate storage; callers
+/// must ensure `ensure_kawase_textures` has been called first.
+///
+/// The active mask texture ID is exposed on TEXTURE1 throughout, so
+/// mask-aware variants of the blur shaders can sample it.  The built-in
+/// `blur_down.frag`/`blur_up.frag` currently ignore it.
+unsafe fn run_dual_kawase_blur(
+    gl: &ffi::Gles2,
+    program: &BlurProgram,
+    src_tex: u32,
+    dst_tex: u32,
+    textures: &[GlesTexture],
+    options: &BlurOptions,
+    mask_tex_id: u32,
+    passes_override: Option<u8>,
+    offset_override: Option<f32>,
+) {
+    let mut prev_fbo = 0i32;
+    gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut prev_fbo);
+
+    let passes = passes_override
+        .map(|p| p.clamp(1, MAX_KAWASE_PASSES) as usize)
+        .unwrap_or_else(|| options.clamped_passes());
+    let offset = offset_override.unwrap_or(options.offset as f32);
+
+    debug_assert!(
+        textures.len() >= passes + 1,
+        "run_dual_kawase_blur: textures ({}) < passes+1 ({})",
+        textures.len(),
+        passes + 1
+    );
+
+    let mut fbos = [0; 2];
+    gl.GenFramebuffers(fbos.len() as _, fbos.as_mut_ptr());
+    gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbos[0]);
+
+    // Bind mask on TEXTURE1 for the entire chain (shader may ignore it).
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    let down_prog = &program.0.down;
+    gl.UseProgram(down_prog.program);
+    gl.Uniform1i(down_prog.uniform_tex, 0);
+    gl.Uniform1f(down_prog.uniform_offset, offset);
+
+    gl.EnableVertexAttribArray(down_prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        down_prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        FULLSCREEN_TRI_STRIP.as_ptr().cast(),
+    );
+
+    // Down passes: source → textures[1] → textures[2] → …
+    // textures[0] is full-size (reserved for final up output) but we
+    // write the final up result to dst_tex instead.
+    // Down chain: src_tex → textures[1] → textures[2] → … → textures[passes]
+    {
+        let mut last_id = src_tex;
+        for i in 0..passes {
+            let dst = &textures[i + 1];
+            let dst_size = dst.size();
+            let w = dst_size.w;
+            let h = dst_size.h;
+            gl.Viewport(0, 0, w, h);
+            gl.Uniform2f(down_prog.uniform_half_pixel, 0.5 / w as f32, 0.5 / h as f32);
+
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                dst.tex_id(),
+                0,
+            );
+
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, last_id);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+
+            gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+
+            last_id = dst.tex_id();
+        }
+    }
+
+    gl.DisableVertexAttribArray(down_prog.attrib_vert as u32);
+
+    // Up passes: textures[passes] → … → textures[1] → dst_tex
+    let up_prog = &program.0.up;
+    gl.UseProgram(up_prog.program);
+    gl.Uniform1i(up_prog.uniform_tex, 0);
+    gl.Uniform1f(up_prog.uniform_offset, offset);
+
+    gl.EnableVertexAttribArray(up_prog.attrib_vert as u32);
+    gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+    gl.VertexAttribPointer(
+        up_prog.attrib_vert as u32,
+        2,
+        ffi::FLOAT,
+        ffi::FALSE,
+        0,
+        FULLSCREEN_TRI_STRIP.as_ptr().cast(),
+    );
+
+    {
+        // Each up pass doubles the resolution.
+        // src_chain: [tex3(eighth), tex2(quarter), tex1(half)]
+        // dst_ids:   [tex2_id,       tex1_id,       dst_tex]
+        // dst_sizes: [quarter,       half,          full]
+        let src_chain: Vec<&GlesTexture> = textures.iter().skip(1).rev().collect();
+        let first_dst_size = textures[0].size();
+        let dst_ids: Vec<u32> = textures[1..]
+            .iter()
+            .rev()
+            .skip(1)
+            .map(|t| t.tex_id())
+            .chain(std::iter::once(dst_tex))
+            .collect();
+        let dst_sizes: Vec<Size<i32, Buffer>> = textures[1..]
+            .iter()
+            .rev()
+            .skip(1)
+            .map(|t| t.size())
+            .chain(std::iter::once(first_dst_size))
+            .collect();
+
+        for ((src, &dst_id), dst_size) in src_chain.iter().zip(dst_ids.iter()).zip(dst_sizes.iter()) {
+            gl.Viewport(0, 0, dst_size.w, dst_size.h);
+
+            let src_size = src.size();
+            gl.Uniform2f(
+                up_prog.uniform_half_pixel,
+                0.5 / src_size.w as f32,
+                0.5 / src_size.h as f32,
+            );
+
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                dst_id,
+                0,
+            );
+
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, src.tex_id());
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+
+            gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+        }
+    }
+
+    gl.DisableVertexAttribArray(up_prog.attrib_vert as u32);
+
+    gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, prev_fbo as u32);
+    gl.DeleteFramebuffers(fbos.len() as _, fbos.as_ptr());
 }
 
 impl Blur {
