@@ -2,3 +2,8 @@
 /result
 
 .idea
+
+*.mkv
+*.mov
+*.mp4
+*.webm

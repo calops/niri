@@ -6,39 +6,41 @@ Branch: `feat/custom-blur-shader` — custom shader pipelines for background eff
 
 The blur pipeline runs in three stages:
 
-1. **Binary mask** — always runs first at source resolution. Renders the anti-aliased coverage of subregion rects (from `ext-background-effect` Wayland protocol) via `mask_binary.frag`. No directional field is produced — only R=coverage.
-2. **Mask passes** — zero or more user-declared passes that refine the mask. Each pass reads the previous pass's output mask texture and writes to the next. Three built-in types exist, plus custom user shaders.
+1. **Initial binary mask** — renders anti-aliased subregion coverage through `mask_binary.frag` when there are no mask passes or the first pass is custom. It is skipped when the first pass is a self-contained built-in vector pass.
+2. **Mask passes** — zero or more user-declared passes that refine or replace the mask. Each custom pass reads the previous pass's output. Built-in vector passes are self-contained.
 3. **Render passes** — one or more passes that produce the final blurred output. Each pass receives `niri_input` (source texture or previous pass output) and `niri_mask` (final mask texture).
 
 ## Mask pass types
 
 | Config value | Description |
 |-------------|-------------|
-| `"window-vectors"` | Analytical SDF for a full-window rounded rectangle. Produces R=mask + GB=direction (from center). Uses `geo_size` and `corner_radius`. |
+| `"window-vectors"` | Analytical SDF for a full-window rounded rectangle. Produces R=normalized interior distance + GB=vector from the fragment to the center. Uses `geo_size` and `corner_radius`. |
 | `"region-vectors"` | JFA distance + Poisson direction field for arbitrary subregion layouts. Works for any composite region. Uses `subregion_rects`. Cached by bbox-local coordinates. |
-| `"custom"` | User-provided `.frag` file. Requires `file=` property. Receives the binary mask as input and must output mask convention. |
+| `"custom"` | User-provided `.frag` file. Requires `file=` property. Receives the previous mask, or the binary mask when it is the first pass. |
 
 ## Render pass types
 
 | Config value | Description |
 |-------------|-------------|
-| `"dual-kawase-blur"` | Built-in Kawase down+up blur (mask-aware). Inherits `passes` and `offset` from the parent `blur` block. Outputs at source resolution. |
+| `"dual-kawase-blur"` | Built-in Kawase down+up blur. Inherits `passes` and `offset` from the parent `blur` block. The final mask remains bound, but the current built-in shaders do not sample it. Outputs at source resolution. |
 | `"custom"` | User-provided `.frag` file. Requires `file=` property. Receives `niri_input`, `niri_mask`, and geometry uniforms. |
 
 ## Mask texture convention
 
-All mask passes (built-in and custom) must output `frag_color` with:
-- **R** = mask value (1 = fully inside, 0 = fully outside, fractional = anti-aliased edge)
+The binary mask is an intermediate coverage texture: R is anti-aliased coverage and GBA are zero.
+
+The built-in vector masks use:
+- **R** = normalized interior distance
 - **G** = direction_x * 0.5 + 0.5
 - **B** = direction_y * 0.5 + 0.5
 
-The binary mask (`mask_binary.frag`) outputs only R=coverage (GB=0 → direction=(-1,-1) by convention).
+`window-vectors` encodes the vector to the window center. `region-vectors` encodes the scaled inward Poisson-gradient direction. Custom passes receive the previous texture and must output the convention expected by their render passes.
 
 ## Key source files
 
 | File | Role |
 |------|------|
-| `src/render_helpers/blur.rs` (~2960 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, `MaskProgram` (analytical SDF), `JfaPipeline`/`JfaTextures`/`MultigridLevel` (region-vectors), `render_custom()`, `render_jfa_mask()`, `run_dual_kawase_blur()`, multigrid V-cycle functions. Constants: `MAX_KAWASE_PASSES`, `JFA_CACHE_EPSILON`, `MAX_MULTIGRID_LEVELS`, `JACOBI_OMEGA`, `JACOBI_SWEEPS`, `V_CYCLES`, `BBOX_BORDER`. |
+| `src/render_helpers/blur.rs` (~2970 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, `MaskProgram` (analytical SDF), `JfaPipeline`/`JfaTextures`/`MultigridLevel` (region-vectors), final-mask and bbox-local JFA caches, `render_custom()`, `render_jfa_mask()`, `run_dual_kawase_blur()`, and multigrid V-cycle functions. Constants: `MAX_KAWASE_PASSES`, `JFA_CACHE_EPSILON`, `MAX_MULTIGRID_LEVELS`, `MULTIGRID_COARSE_SIZE`, `JACOBI_OMEGA`, `JACOBI_SWEEPS`, `V_CYCLES`, `BBOX_BORDER`. |
 | `src/render_helpers/custom_blur.rs` (140 lines) | `MaskPassStep`/`RenderPassStep` enums, `PipelineConfig`, `resolve_pipeline()`, `cache_key()` |
 | `src/render_helpers/shaders/mod.rs` (450 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`/`RenderPassPart` (with `kind` discriminant: `MaskPassKind`/`RenderPassKind`), `BackgroundEffect`, `BackgroundEffectRule` |
@@ -57,10 +59,10 @@ All in `src/render_helpers/shaders/`:
 - `blur.vert` / `blur_down.frag` / `blur_up.frag` — default Kawase blur (also used by `dual-kawase-blur`)
 - `blur_custom.vert` — shared vertex shader for all custom/JFA/binary passes
 - `mask.frag` — analytical SDF mask (used by `window-vectors`)
-- `mask_binary.frag` — binary subregion mask (always runs, step 0)
-- `jfa_init.frag`, `jfa_step.frag`, `jfa_sdf_bake.frag` — JFA stages (used by `region-vectors`)
+- `mask_binary.frag` — binary subregion coverage mask
+- `jfa_init.frag`, `jfa_step.frag` — JFA stages used by `region-vectors`
 - `jfa_poisson_init_rhs.frag`, `jfa_poisson_restrict_mask.frag`, `jfa_poisson_jacobi.frag`, `jfa_poisson_residual_restrict.frag`, `jfa_poisson_prolongate.frag` — multigrid Poisson stages
-- `jfa_encode.frag` — final encode for JFA+Poisson
+- `jfa_encode.frag`, `jfa_smooth.frag` — direction encode and cached 3×3 tent smoothing for JFA+Poisson
 - `border.frag`, `shadow.frag`, `clipped_surface.frag`, `rounding_alpha.frag`, `postprocess.frag` — border/shadow/clipping/post-process
 
 ## Config format
@@ -117,7 +119,7 @@ layer-rule {
 | `niri_geo_size` | vec2 | — | Window geometry size |
 | `niri_corner_radius` | vec4 | — | Corner radii |
 
-The mask passes receive `niri_mask` (the previous mask) implicitly via TEXTURE0 before their invocation. The first mask pass reads the binary mask.
+Custom mask passes receive `niri_mask` (the previous mask) implicitly via TEXTURE0. A first custom pass receives the binary coverage mask; a custom pass after another pass receives that pass's output.
 
 ### Custom render pass (`CustomBlurPassProgram`)
 
@@ -145,25 +147,28 @@ Renderer/Layer render loop
 
 Blur::render()
   → if shader_pipeline set: get_or_compile_custom_blur() → Blur::render_custom()
-    → Step 0: always render binary mask (mask_binary.frag) → mask_texture_a
-    → Step 1: for each mask-pass:
-        - "window-vectors": analytical SDF → dst
-        - "region-vectors": JFA+Poisson pipeline → dst
-        - "custom": user shader (reads src, writes dst ping-pong)
-    → Step 2: for each render-pass:
+    → if final-mask cache matches: reuse the active mask texture
+    → otherwise:
+        - render binary mask only when there are no mask passes or the first pass is custom
+        - run each mask pass:
+            - "window-vectors": analytical SDF → dst
+            - "region-vectors": JFA+Poisson pipeline → dst
+            - "custom": user shader (reads src, writes dst ping-pong)
+    → run each render pass:
         - "dual-kawase-blur": run_dual_kawase_blur() (down+up chain)
         - "custom": user shader with niri_mask bound
   → else: default Kawase down/up passes
 ```
 
-Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destination across custom mask passes. Built-in passes overwrite their destination in-place (they are self-contained).
+Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destination across mask passes. Built-in passes overwrite their destination and do not read their source.
 
 ## Caching
 
-- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use. Failures cached as `None`. Cleared on config reload.
-- **JFA output:** The JFA pipeline runs in bbox-local coords; cached by bbox size + rect offsets. Cache hit re-blits encoded texture without recomputing JFA/Poisson.
-- **Mask programs:** `Blur.mask_program` (analytical SDF), `Blur.binary_program` (binary mask), and `Blur.jfa_pipeline` (JFA) are compiled once per `Blur` instance and reused.
-- **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks).
+- **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use. Failures are cached as `None`. Cleared on config reload.
+- **Final mask:** cached by compiled pipeline identity, source size, subregion rectangles, geometry size, and corner radii. Exact hits skip the entire binary and mask pipeline.
+- **JFA output:** computed in bbox-local coordinates and cached by bbox size + local rect offsets. A translation cache hit re-blits the encoded texture without recomputing JFA/Poisson. When `region-vectors` is the first pass and reuses the same destination texture, only the previous bbox is cleared.
+- **Mask programs:** `Blur.mask_program`, `Blur.binary_program`, and `Blur.jfa_pipeline` are compiled once per `Blur` instance and reused.
+- **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks). Pixel-space rectangle conversion and upload are reused across mask paths.
 
 ## Error handling
 
@@ -178,12 +183,17 @@ Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destin
 - **Shader pipeline examples:** `shaders/crt/`, `shaders/magnify/`, `shaders/overshifted3/`, `shaders/debug-mask/`, `shaders/debug-edges/`, `shaders/jfa-debug/`
 - **Config tests:** `insta` snapshot tests in `niri-config/`. Run with `cargo test -p niri-config`
 - **Compile check:** `cargo check --all-targets`
+- **Nested refresh:** the Winit backend reads the host monitor refresh when available. Set `NIRI_WINIT_REFRESH_RATE=<hz>` to override unreliable Wayland monitor metadata, for example `NIRI_WINIT_REFRESH_RATE=170 target/debug/niri --config config.kdl`.
+- **Cava refresh:** `cava-test/shell.qml` follows the nested output refresh by default. Set `NIRI_CAVA_FRAMERATE=<fps>` to hold Cava at a separate rate when isolating compositor timing from region-update frequency.
 
 ## Precision notes
 
-- Multigrid `u` textures use raw GL RGBA32F (via `create_rgba32f_buffer`). Half-float is insufficient near gradient minima.
-- RHS is scaled by `1/max_dist²` to keep `u` in precision-friendly range.
-- Bbox calculation has 1e-4 epsilon snap to prevent pixel-coordinate wobble.
+- Multigrid `u` textures use raw GL R32F. Half-float is insufficient near gradient minima.
+- Multigrid RHS uses RG16F and bbox-local binary coverage uses R16F.
+- RHS is scaled by `1/max_dist²` to keep `u` in a precision-friendly range.
+- The multigrid pyramid grows dynamically until both coarse dimensions are at most 8 pixels, capped at 12 levels. The solver runs one V-cycle with three pre- and three post-Jacobi sweeps.
+- The region-vector encoder takes a central-difference Poisson gradient and fades it with `smoothstep(0.02, 0.10, gmag * max_dist)`. A following cached pass applies a 3×3 tent filter to normalized GB direction only, using the unused JFA ping-pong texture as encode scratch; the JFA-derived R distance channel remains exact.
+- Bbox calculation has a 1e-4 epsilon snap to prevent pixel-coordinate wobble.
 - `glColorMask(TRUE, FALSE, FALSE, FALSE)` is used during residual restrict to write only R.
 
 ## Update policy

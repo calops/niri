@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::{env, mem};
 
 use anyhow::Context as _;
 use niri_config::{Config, OutputName};
@@ -26,6 +26,31 @@ use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
+
+const DEFAULT_REFRESH_RATE_MHZ: i32 = 60_000;
+const REFRESH_RATE_ENV: &str = "NIRI_WINIT_REFRESH_RATE";
+
+fn window_refresh_rate(window: &Window) -> i32 {
+    if let Some(value) = env::var_os(REFRESH_RATE_ENV) {
+        let refresh_hz = value.to_str().and_then(|value| value.parse::<f64>().ok());
+        if let Some(refresh_hz) = refresh_hz
+            .filter(|refresh| refresh.is_finite())
+            .filter(|refresh| *refresh > 0.0)
+            .filter(|refresh| *refresh <= i32::MAX as f64 / 1000.0)
+        {
+            return (refresh_hz * 1000.0).round() as i32;
+        }
+
+        warn!("ignoring invalid {REFRESH_RATE_ENV}={value:?}");
+    }
+
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .and_then(|refresh| i32::try_from(refresh).ok())
+        .filter(|refresh| *refresh > 0)
+        .unwrap_or(DEFAULT_REFRESH_RATE_MHZ)
+}
 
 pub struct Winit {
     config: Rc<RefCell<Config>>,
@@ -51,6 +76,8 @@ impl Winit {
                 WindowAttributesWayland::default().with_name("niri", ""),
             ));
         let (backend, winit) = winit::init_from_attributes(builder)?;
+        let refresh_rate = window_refresh_rate(backend.window());
+        debug!("using winit refresh rate: {refresh_rate} mHz");
 
         let output = Output::new(
             "winit".to_string(),
@@ -65,7 +92,7 @@ impl Winit {
 
         let mode = Mode {
             size: backend.window_size(),
-            refresh: 60_000,
+            refresh: refresh_rate,
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
@@ -89,7 +116,7 @@ impl Winit {
                 modes: vec![niri_ipc::Mode {
                     width: backend.window_size().w.clamp(0, u16::MAX as i32) as u16,
                     height: backend.window_size().h.clamp(0, u16::MAX as i32) as u16,
-                    refresh_rate: 60_000,
+                    refresh_rate: refresh_rate as u32,
                     is_preferred: true,
                 }],
                 current_mode: Some(0),
@@ -107,15 +134,15 @@ impl Winit {
             .insert_source(winit, move |event, _, state| match event {
                 WinitEvent::Resized { size, .. } => {
                     let winit = state.backend.winit();
-                    winit.output.change_current_state(
-                        Some(Mode {
-                            size,
-                            refresh: 60_000,
-                        }),
-                        None,
-                        None,
-                        None,
-                    );
+                    let refresh_rate = window_refresh_rate(winit.backend.window());
+                    let mode = Mode {
+                        size,
+                        refresh: refresh_rate,
+                    };
+                    winit
+                        .output
+                        .change_current_state(Some(mode), None, None, None);
+                    winit.output.set_preferred(mode);
 
                     {
                         let mut ipc_outputs = winit.ipc_outputs.lock().unwrap();
@@ -123,6 +150,7 @@ impl Winit {
                         let mode = &mut output.modes[0];
                         mode.width = size.w.clamp(0, u16::MAX as i32) as u16;
                         mode.height = size.h.clamp(0, u16::MAX as i32) as u16;
+                        mode.refresh_rate = refresh_rate as u32;
                         if let Some(logical) = output.logical.as_mut() {
                             logical.width = size.w as u32;
                             logical.height = size.h as u32;

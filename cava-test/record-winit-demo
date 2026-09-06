@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${NIRI_CAVA_RECORDER_DEPS:-}" != 1 ]]; then
+    exec nix shell nixpkgs#wf-recorder nixpkgs#slurp nixpkgs#jq nixpkgs#ffmpeg \
+        --command env NIRI_CAVA_RECORDER_DEPS=1 bash "$0" "$@"
+fi
+
+if (($# > 1)); then
+    printf 'Usage: %s [output.mkv]\n' "$0" >&2
+    exit 2
+fi
+
+output="${1:-niri-cava-demo.mkv}"
+audio_source="${AUDIO_SOURCE:-alsa_output.usb-Generic_USB_Audio-00.HiFi__SPDIF__sink.monitor}"
+
+windows="$(
+    niri msg --json windows |
+        jq -r '
+            .[]
+            | select(.app_id == "niri" and .is_floating)
+            | .layout as $layout
+            | select($layout.tile_pos_in_workspace_view != null)
+            | "\(
+                ($layout.tile_pos_in_workspace_view[0] + $layout.window_offset_in_tile[0])
+                | floor
+              ),\(
+                ($layout.tile_pos_in_workspace_view[1] + $layout.window_offset_in_tile[1])
+                | floor
+              ) \($layout.window_size[0])x\($layout.window_size[1]) \(.title)"
+        '
+)"
+
+if [[ -z "$windows" ]]; then
+    printf 'No floating nested Niri windows found.\n' >&2
+    exit 1
+fi
+
+region="$(printf '%s\n' "$windows" | slurp -r)" || exit 0
+if [[ -z "$region" ]]; then
+    exit 0
+fi
+
+printf 'Recording %s. Press Ctrl+C to stop.\n' "$region"
+wf-recorder \
+    --audio-backend pipewire \
+    --audio="$audio_source" \
+    --geometry="$region" \
+    --framerate=60 \
+    --codec=libx264 \
+    --pixel-format=yuv420p \
+    --codec-param=preset=veryfast \
+    --codec-param=crf=18 \
+    --file="$output"
+
+corrected_output="${output%.*}.corrected.${output##*.}"
+ffmpeg -y -i "$output" -map 0 -c copy \
+    -bsf:v 'h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1' \
+    "$corrected_output"
+mv "$corrected_output" "$output"

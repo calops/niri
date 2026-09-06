@@ -289,6 +289,20 @@ layer-rule {
 }
 
 layer-rule {
+  match namespace="cava-glass"
+  background-effect {
+    xray false
+    blur true
+    noise 0.0
+    shader-pipeline {
+        mask-pass "region-vectors"
+        render-pass "dual-kawase-blur" passes=2 offset=1
+        render-pass "custom" file="shaders/overshifted3/glass.frag" scale=1.0
+    }
+  }
+}
+
+layer-rule {
   match namespace="magnify-glass"
   background-effect {
     xray false

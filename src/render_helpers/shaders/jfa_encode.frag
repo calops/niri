@@ -27,16 +27,20 @@ void main() {
 
     // Direction: central-difference gradient of the Poisson field.
     // ∇u points INTO the interior (toward larger u); that's exactly
-    // the "inward" direction the renderers consume.
+    // the "inward" direction the renderers consume. The following pass
+    // smooths the normalized encoded vector, where prolongation blocks and
+    // half-float direction steps are visible.
     //
-    // The Poisson gradient direction is smooth and continuous even
-    // through the medial axis of non-convex shapes — this is what the
-    // multi-grid solver was built for.  We normalise to a unit vector
-    // to isolate direction from convergence-dependent magnitude.
+    // The Poisson gradient is smooth and continuous away from the medial
+    // axis. Its magnitude is a confidence signal: after the RHS is scaled
+    // by 1 / max_dist², gmag * max_dist is normally near zero at a medial
+    // centre and reaches roughly 0.5 at a boundary. Keep the transition
+    // conservative so real gradients are not hidden while tiny coarse-grid
+    // residuals cannot become unit vectors.
     //
-    // Magnitude is derived from the JFA distance field (R channel):
-    // it is maximal at boundaries and falls to zero at the centre.
-    // This needs no bbox-size calibration or convergence tuning.
+    // Magnitude is still derived from the JFA distance field (R channel):
+    // it is maximal at boundaries and falls to zero at the centre. The
+    // confidence only fades direction; it does not alter the R channel.
     vec2 st = 1.0 / niri_output_size;
     float r = texture(niri_poisson_u, uv + vec2(st.x, 0.0)).r;
     float l = texture(niri_poisson_u, uv - vec2(st.x, 0.0)).r;
@@ -45,9 +49,16 @@ void main() {
 
     vec2 grad_raw = vec2(r - l, t - b);
     float gmag = length(grad_raw);
-    vec2 unit_dir = gmag > 1e-6 ? grad_raw / gmag : vec2(0.0);
+
+    // A normalized gradient below 0.02 is numerical/coarse-grid noise; the
+    // fade reaches full confidence at 0.10, well below the expected ~0.5
+    // boundary gradient. This smoothstep is deliberately continuous.
+    float normalized_gradient = gmag * niri_max_dist;
+    float gradient_confidence = smoothstep(0.02, 0.10, normalized_gradient);
+    vec2 unit_dir =
+        gradient_confidence > 0.0 ? grad_raw / max(gmag, 1e-6) : vec2(0.0);
     float magnitude = cos(mask * 1.57079632679) * 0.2;
-    vec2 dir = unit_dir * magnitude;
+    vec2 dir = unit_dir * (magnitude * gradient_confidence);
 
     frag_color = vec4(mask, dir.x * 0.5 + 0.5, dir.y * 0.5 + 0.5, 1.0);
 }

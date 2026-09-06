@@ -25,13 +25,18 @@ void main() {
     }
 
     vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-    float angle = atan(to_center.y, to_center.x);
-
-    vec3 mask_color = vec3(
-        (sin(angle) * 0.5 + 0.5),
-        mask,
-        (cos(angle) * 0.5 + 0.5)
-    );
+    float direction_magnitude = length(to_center);
+    vec3 mask_color = vec3(0.5, mask, 0.5);
+    if (direction_magnitude > 1e-6) {
+        float angle = atan(to_center.y, to_center.x);
+        vec3 direction_color = vec3(
+            sin(angle) * 0.5 + 0.5,
+            mask,
+            cos(angle) * 0.5 + 0.5
+        );
+        float direction_visibility = smoothstep(0.0, 0.02, direction_magnitude);
+        mask_color = mix(mask_color, direction_color, direction_visibility);
+    }
 
     frag_color = vec4(mask_color, 1.0);
 }

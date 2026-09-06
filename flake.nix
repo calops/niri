@@ -183,6 +183,7 @@
                 cargo
                 clippy
                 cargo-insta
+                cava
                 ;
               inherit rustfmt';
             };

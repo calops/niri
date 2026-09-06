@@ -1,6 +1,7 @@
 #version 300 es
 
 precision highp float;
+precision highp int;
 
 in vec2 v_coords;
 
@@ -49,8 +50,18 @@ const float u_vignetteStrength = 0.5;
 // Subtle 0.005 | Balanced 0.012 | Heavy 0.025
 const float u_noiseStrength = 0.025;
 
-float rand(vec2 co) {
-    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+uint hash(uvec2 pixel) {
+    uint h = pixel.x * 0x8da6b343u ^ pixel.y * 0xd8163841u;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    return h;
+}
+
+float rand(uvec2 pixel) {
+    return float(hash(pixel)) / 4294967295.0;
 }
 
 void main() {
@@ -78,29 +89,26 @@ void main() {
     // --- Chromatic aberration ---
     float ca = u_chromatic * dist;
 
+    vec4 center_sample = texture(niri_input, warped);
     float cr = texture(niri_input, warped + vec2(ca, 0.0)).r;
-    float cg = texture(niri_input, warped).g;
+    float cg = center_sample.g;
     float cb = texture(niri_input, warped - vec2(ca, 0.0)).b;
-    float ca_val = texture(niri_input, warped).a;
+    float ca_val = center_sample.a;
 
     vec4 color = vec4(cr, cg, cb, ca_val);
 
     // --- Phosphor bloom (cheap in-pass blur) ---
     vec4 bloom = vec4(0.0);
     float bloom_kernel = 4.0 / niri_output_size.y;
-    bloom += texture(niri_input, warped) * 0.5;
+    bloom += center_sample * 0.5;
     bloom += texture(niri_input, warped + vec2(bloom_kernel, 0.0)) * 0.125;
     bloom += texture(niri_input, warped - vec2(bloom_kernel, 0.0)) * 0.125;
     bloom += texture(niri_input, warped + vec2(0.0, bloom_kernel)) * 0.125;
     bloom += texture(niri_input, warped - vec2(0.0, bloom_kernel)) * 0.125;
     color.rgb += bloom.rgb * u_bloomStrength;
 
-    // --- Scanlines ---
-    float scanline = abs(sin(gl_FragCoord.y * 3.14159)) * (1.0 - u_scanlineWidth) + u_scanlineWidth;
-    float row = floor(gl_FragCoord.y);
-    if (mod(row, 2.0) < 1.0) {
-        scanline = mix(scanline, 1.0, 0.3);
-    }
+    float row_period = mod(floor(gl_FragCoord.y), 2.0);
+    float scanline = mix(u_scanlineWidth, 1.0, row_period);
     color.rgb *= mix(1.0, scanline, u_scanlineStrength);
 
     // --- Phosphor mask pattern (RGB triad dots) ---
@@ -120,7 +128,7 @@ void main() {
     color.rgb *= max(vignette, 0.0);
 
     // --- Noise ---
-    color.rgb += (rand(gl_FragCoord.xy) - 0.5) * u_noiseStrength;
+    color.rgb += (rand(uvec2(gl_FragCoord.xy)) - 0.5) * u_noiseStrength;
 
     frag_color = color;
 }

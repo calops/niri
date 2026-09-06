@@ -36,9 +36,10 @@ void main() {
     vec2 uv_b = clamp(uv + displacement * (1.0 + chromatic), 0.0, 1.0);
 
     float cr = texture(niri_input, uv_r).r;
-    float cg = texture(niri_input, uv_g).g;
+    vec4 green_alpha_sample = texture(niri_input, uv_g);
+    float cg = green_alpha_sample.g;
     float cb = texture(niri_input, uv_b).b;
-    float ca = texture(niri_input, uv_g).a;
+    float ca = green_alpha_sample.a;
 
     frag_color = vec4(cr, cg, cb, ca);
 }
