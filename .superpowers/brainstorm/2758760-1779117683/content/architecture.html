@@ -1,0 +1,60 @@
+<h2>Pipeline Architecture</h2>
+<p class="subtitle">How should the CRT passes be structured?</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Approach A: 2-pass (Recommended)</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:14px;line-height:1.8;padding:16px;">
+      <b>Pass 1: down0</b> &mdash; scale=0.5<br>
+      &nbsp;&nbsp;Kawase blur downscale<br>
+      &nbsp;&nbsp;(bloom source)<br>
+      <br>
+      <b>Pass 2: crt</b> &mdash; scale=1.0<br>
+      &nbsp;&nbsp;Reads niri_input (original)<br>
+      &nbsp;&nbsp;Reads niri_mask (window bounds)<br>
+      &nbsp;&nbsp;All CRT effects in one pass:<br>
+      &nbsp;&nbsp;&bull; Scanlines<br>
+      &nbsp;&nbsp;&bull; Barrel curvature<br>
+      &nbsp;&nbsp;&bull; Chromatic aberration<br>
+      &nbsp;&nbsp;&bull; Phosphor bloom (from blur)<br>
+      &nbsp;&nbsp;&bull; Phosphor mask pattern<br>
+      &nbsp;&nbsp;&bull; Vignette<br>
+      &nbsp;&nbsp;&bull; Noise<br>
+      <br>
+      <span style="color:#aaa;">Simpler, faster. 1 blur pass.</span>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Approach B: 3-pass</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:14px;line-height:1.8;padding:16px;">
+      <b>Pass 1: down0</b> &mdash; scale=0.5<br>
+      &nbsp;&nbsp;Kawase blur downscale<br>
+      <br>
+      <b>Pass 2: up0</b> &mdash; scale=2.0<br>
+      &nbsp;&nbsp;Kawase blur upscale<br>
+      &nbsp;&nbsp;(smoother bloom)<br>
+      <br>
+      <b>Pass 3: crt</b> &mdash; scale=1.0<br>
+      &nbsp;&nbsp;Same CRT effects as A<br>
+      &nbsp;&nbsp;+ mask distance awareness<br>
+      &nbsp;&nbsp;(edge effects like overshifted3)
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>2-pass (Recommended)</h3>
+      <p>Simpler, faster, 40% fewer GPU passes. The CRT pass handles everything. Bloom uses a single kawase downscale — good enough for phosphor glow.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>3-pass</h3>
+      <p>Smoother bloom (down+up cascade), and CRT effects can vary by distance from window edge (stronger chromatic aberration at corners, etc). Costs an extra GPU pass.</p>
+    </div>
+  </div>
+</div>

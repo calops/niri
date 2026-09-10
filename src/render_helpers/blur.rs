@@ -1,6 +1,7 @@
 use std::cmp::{max, min};
 use std::iter::{once, zip};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context as _};
 use smithay::backend::allocator::Fourcc;
@@ -23,6 +24,8 @@ pub struct Blur {
     textures: Vec<GlesTexture>,
     /// Intermediate textures for custom blur passes.
     custom_textures: Vec<GlesTexture>,
+    /// Final custom-pipeline output multiplied by the exact region mask.
+    masked_output_texture: Option<GlesTexture>,
     /// Mask texture at source resolution, rendered from GPU mask shader.
     /// Primary buffer in the mask ping-pong pair.
     mask_texture_a: Option<GlesTexture>,
@@ -30,10 +33,12 @@ pub struct Blur {
     mask_texture_b: Option<GlesTexture>,
     /// Compiled analytical full-window mask program.
     mask_program: Option<MaskProgram>,
+    /// Program applying the exact mask to a custom-pipeline output.
+    mask_output_program: Option<MaskOutputProgram>,
     /// Cached mask inputs and final texture. A matching custom pipeline and
     /// geometry can reuse the fully rendered mask without touching either
     /// ping-pong texture.
-    cached_mask_rects: Vec<[f32; 4]>,
+    cached_mask_rects: Arc<Vec<[f32; 4]>>,
     cached_mask_w: i32,
     cached_mask_h: i32,
     cached_mask_geo_size: (f32, f32),
@@ -44,8 +49,8 @@ pub struct Blur {
     cached_rects_px: Vec<[f32; 4]>,
     jfa_pipeline: Option<JfaPipeline>,
     jfa_textures: Option<JfaTextures>,
-    /// Compiled binary mask program (mask_binary.frag). Used when the first
-    /// mask pass is not a built-in vector pass.
+    /// Compiled instanced binary-mask program. Used by the source-sized
+    /// binary mask and the bbox-local JFA input.
     binary_program: Option<JfaBinaryProgram>,
     /// 1×N RGBA32F texture holding the subregion rects (one texel per
     /// rect, RGBA = x1,y1,x2,y2 in source pixels). Grown when the rect count
@@ -71,7 +76,7 @@ pub struct BlurOptions {
     pub offset: f64,
     pub geo_size: (f32, f32),
     pub corner_radius: [f32; 4],
-    pub subregion_rects: Vec<[f32; 4]>,
+    pub subregion_rects: Arc<Vec<[f32; 4]>>,
     pub window_screen_rect: [f32; 4],
     /// Inline custom shader pipeline definition, or `None` to use the
     /// default Kawase blur. Cached in `Shaders` keyed by a hash of the
@@ -90,7 +95,7 @@ impl BlurOptions {
         self
     }
 
-    pub fn with_subregion_rects(mut self, rects: Vec<[f32; 4]>) -> Self {
+    pub fn with_subregion_rects(mut self, rects: Arc<Vec<[f32; 4]>>) -> Self {
         self.subregion_rects = rects;
         self
     }
@@ -108,11 +113,18 @@ impl From<niri_config::Blur> for BlurOptions {
             offset: config.offset,
             geo_size: (0.0, 0.0),
             corner_radius: [0.0; 4],
-            subregion_rects: Vec::new(),
+            subregion_rects: Arc::new(Vec::new()),
             window_screen_rect: [0.0; 4],
             shader_pipeline: config.shader_pipeline,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct BlurOutput {
+    pub texture: GlesTexture,
+    /// The texture is transparent outside the requested protocol subregion.
+    pub subregion_clipped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +245,22 @@ unsafe fn compile_custom_pass(
     })
 }
 
+unsafe fn compile_mask_output_program(gl: &ffi::Gles2) -> Result<MaskOutputProgram, GlesError> {
+    let program = unsafe {
+        link_program(
+            gl,
+            include_str!("shaders/blur_custom.vert"),
+            include_str!("shaders/mask_output.frag"),
+        )?
+    };
+    Ok(MaskOutputProgram {
+        program,
+        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
+        uniform_mask: gl.GetUniformLocation(program, c"niri_mask".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
 unsafe fn compile_custom_mask_pass(
     gl: &ffi::Gles2,
     frag_src: &str,
@@ -324,6 +352,14 @@ struct MaskProgram {
 }
 
 #[derive(Debug)]
+struct MaskOutputProgram {
+    program: ffi::types::GLuint,
+    uniform_input: ffi::types::GLint,
+    uniform_mask: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
 struct CustomMaskProgram {
     program: ffi::types::GLuint,
     uniform_subregion_count: ffi::types::GLint,
@@ -338,11 +374,9 @@ struct CustomMaskProgram {
 #[derive(Debug)]
 struct JfaBinaryProgram {
     program: ffi::types::GLuint,
-    uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_bbox_origin: ffi::types::GLint,
-    attrib_vert: ffi::types::GLint,
 }
 
 #[derive(Debug)]
@@ -591,24 +625,16 @@ unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError
     })
 }
 
-unsafe fn compile_jfa_binary(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur_custom.vert");
+unsafe fn compile_binary_program(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
+    let vert_src = include_str!("shaders/mask_binary.vert");
     let frag_src = include_str!("shaders/mask_binary.frag");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
     Ok(JfaBinaryProgram {
         program,
-        uniform_subregion_count: gl.GetUniformLocation(program, c"niri_subregion_count".as_ptr()),
         uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
-}
-
-/// Compile the binary mask program for standalone use (at source resolution,
-/// outside the JFA pipeline).
-unsafe fn compile_binary_program(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
-    compile_jfa_binary(gl)
 }
 
 unsafe fn compile_jfa_init(gl: &ffi::Gles2) -> Result<JfaInitProgram, GlesError> {
@@ -749,9 +775,11 @@ impl Blur {
             mask_texture_a: None,
             mask_texture_b: None,
             mask_program: None,
-            cached_mask_rects: Vec::new(),
+            masked_output_texture: None,
+            cached_mask_rects: Arc::new(Vec::new()),
             cached_mask_w: 0,
             cached_mask_h: 0,
+            mask_output_program: None,
             cached_mask_geo_size: (0.0, 0.0),
             cached_mask_corner_radius: [0.0; 4],
             cached_mask_pipeline: None,
@@ -845,13 +873,17 @@ impl Blur {
         Ok(())
     }
 
+    fn can_gpu_clip_custom_output(mask_passes: &[MaskPassStep], has_subregions: bool) -> bool {
+        has_subregions && matches!(mask_passes.last(), None | Some(MaskPassStep::RegionVectors))
+    }
+
     fn render_custom(
         &mut self,
         renderer: &mut GlesRenderer,
         source: &GlesTexture,
         custom_program: &CustomBlurProgram,
         options: &BlurOptions,
-    ) -> anyhow::Result<GlesTexture> {
+    ) -> anyhow::Result<BlurOutput> {
         let _span = tracy_client::span!("Blur::render_custom");
         trace!("rendering custom blur");
 
@@ -884,6 +916,15 @@ impl Blur {
             current_h = (current_h * scale).max(1.0);
             pass_output_sizes.push((current_w as i32, current_h as i32));
         }
+        let (final_output_w, final_output_h) = pass_output_sizes
+            .last()
+            .copied()
+            .context("custom pipeline has no render passes")?;
+        let final_output_size = Size::new(final_output_w, final_output_h);
+        let mut apply_output_mask = Self::can_gpu_clip_custom_output(
+            &inner.mask_passes,
+            !options.subregion_rects.is_empty(),
+        );
 
         let needs_recreate = self.custom_textures.len() != pass_count
             || self
@@ -901,10 +942,20 @@ impl Blur {
             }
         }
 
+        if apply_output_mask
+            && self
+                .masked_output_texture
+                .as_ref()
+                .is_none_or(|texture| texture.size() != final_output_size)
+        {
+            self.masked_output_texture =
+                Some(renderer.create_buffer(Fourcc::Abgr8888, final_output_size)?);
+        }
+
         let mask_w = source_size.w;
         let mask_h = source_size.h;
 
-        let rects_changed = self.cached_mask_rects != options.subregion_rects;
+        let rects_changed = !Arc::ptr_eq(&self.cached_mask_rects, &options.subregion_rects);
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
         let mask_geometry_changed = self.cached_mask_geo_size != geo_size
             || self.cached_mask_corner_radius != corner_radius;
@@ -977,7 +1028,7 @@ impl Blur {
         let mut jfa_need_alloc = false;
         let jfa_bbox = if has_region_vectors && !options.subregion_rects.is_empty() {
             let mut bbox = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
-            for rect in &options.subregion_rects {
+            for rect in options.subregion_rects.iter() {
                 bbox[0] = bbox[0].min(rect[0]);
                 bbox[1] = bbox[1].min(rect[1]);
                 bbox[2] = bbox[2].max(rect[2]);
@@ -1171,33 +1222,9 @@ impl Blur {
                                 }
                             }
                             if let Some(bin_prog) = self.binary_program.as_ref() {
-                                gl.ActiveTexture(ffi::TEXTURE1);
-                                gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
-                                gl.ActiveTexture(ffi::TEXTURE0);
-
-                                gl.FramebufferTexture2D(
-                                    ffi::DRAW_FRAMEBUFFER,
-                                    ffi::COLOR_ATTACHMENT0,
-                                    ffi::TEXTURE_2D,
-                                    mask_a_id,
-                                    0,
+                                render_binary_mask(
+                                    gl, bin_prog, options, mask_a, rects_tex, 0, 0, mask_w, mask_h,
                                 );
-
-                                gl.UseProgram(bin_prog.program);
-                                gl.Uniform1i(
-                                    bin_prog.uniform_subregion_count,
-                                    options.subregion_rects.len() as i32,
-                                );
-                                gl.Uniform1i(bin_prog.uniform_subregion_rects, 1);
-                                gl.Uniform2f(
-                                    bin_prog.uniform_output_size,
-                                    mask_w as f32,
-                                    mask_h as f32,
-                                );
-                                gl.Uniform2f(bin_prog.uniform_bbox_origin, 0.0, 0.0);
-
-                                gl.Viewport(0, 0, mask_w, mask_h);
-                                draw_fullscreen_quad(gl, bin_prog.attrib_vert);
                                 check_gl_error(gl);
                             }
                         }
@@ -1455,6 +1482,17 @@ impl Blur {
                 self.cached_mask_texture_is_b = Some(active_mask_is_b);
             }
 
+            // Only advertise an exact GPU clip when the built-in program
+            // that produced the final mask is available. A compile failure
+            // keeps the existing CPU region-clipping fallback.
+            if apply_output_mask {
+                apply_output_mask = match mask_passes.last() {
+                    None => self.binary_program.is_some(),
+                    Some(MaskPassStep::RegionVectors) => self.jfa_pipeline.is_some(),
+                    Some(_) => false,
+                };
+            }
+
             let active_mask = if active_mask_is_b { mask_b } else { mask_a };
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_2D, active_mask.tex_id());
@@ -1581,17 +1619,88 @@ impl Blur {
                 }
             }
 
+            if apply_output_mask && self.mask_output_program.is_none() {
+                match compile_mask_output_program(gl) {
+                    Ok(program) => self.mask_output_program = Some(program),
+                    Err(err) => {
+                        warn!("error compiling exact output mask shader: {err:?}");
+                        apply_output_mask = false;
+                    }
+                }
+            }
+
+            if apply_output_mask {
+                let program = self.mask_output_program.as_ref().unwrap();
+                let input = self.custom_textures.last().unwrap();
+                let output = self.masked_output_texture.as_ref().unwrap();
+
+                gl.UseProgram(program.program);
+                gl.Uniform1i(program.uniform_input, 0);
+                gl.Uniform1i(program.uniform_mask, 1);
+                gl.Viewport(0, 0, final_output_w, final_output_h);
+                gl.FramebufferTexture2D(
+                    ffi::DRAW_FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::TEXTURE_2D,
+                    output.tex_id(),
+                    0,
+                );
+
+                gl.ActiveTexture(ffi::TEXTURE0);
+                gl.BindTexture(ffi::TEXTURE_2D, input.tex_id());
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_S,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_T,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+
+                gl.ActiveTexture(ffi::TEXTURE1);
+                gl.BindTexture(ffi::TEXTURE_2D, active_mask.tex_id());
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MIN_FILTER,
+                    ffi::NEAREST as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MAG_FILTER,
+                    ffi::NEAREST as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_S,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_T,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+
+                draw_fullscreen_quad(gl, program.attrib_vert);
+                gl.ActiveTexture(ffi::TEXTURE0);
+            }
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
             gl.DeleteFramebuffers(1, &mask_fbo);
             check_gl_error(gl);
         })?;
 
-        let result = self
-            .custom_textures
-            .last()
-            .context("custom pipeline has no render passes")?
-            .clone();
-        Ok(result)
+        let texture = if apply_output_mask {
+            self.masked_output_texture.as_ref().unwrap().clone()
+        } else {
+            self.custom_textures.last().unwrap().clone()
+        };
+        Ok(BlurOutput {
+            texture,
+            subregion_clipped: apply_output_mask,
+        })
     }
 }
 
@@ -1856,7 +1965,7 @@ unsafe fn ensure_jfa_pipeline(
     }
     let pipeline = (|| -> Result<JfaPipeline, GlesError> {
         Ok(JfaPipeline {
-            binary_prog: compile_jfa_binary(gl)?,
+            binary_prog: compile_binary_program(gl)?,
             init_prog: compile_jfa_init(gl)?,
             step_prog: compile_jfa_step(gl)?,
             poisson_init_rhs_prog: compile_jfa_poisson_init_rhs(gl)?,
@@ -1885,7 +1994,9 @@ unsafe fn render_binary_mask(
     bbh: i32,
 ) {
     // The source-pixel rects are uploaded once by render_custom() and are
-    // shared by the source binary, custom, and bbox-local JFA passes.
+    // shared by the source binary, custom, and bbox-local JFA passes. Render
+    // one quad instance per rectangle instead of making every destination
+    // fragment scan the complete rectangle list.
     gl.ActiveTexture(ffi::TEXTURE1);
     gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
 
@@ -1896,19 +2007,22 @@ unsafe fn render_binary_mask(
         dst.tex_id(),
         0,
     );
+    gl.Disable(ffi::BLEND);
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(ffi::COLOR_BUFFER_BIT);
 
     gl.UseProgram(prog.program);
-    gl.Uniform1i(
-        prog.uniform_subregion_count,
-        options.subregion_rects.len() as i32,
-    );
     gl.Uniform1i(prog.uniform_subregion_rects, 1);
     gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
     gl.Uniform2f(prog.uniform_bbox_origin, bbx as f32, bby as f32);
 
-    gl.ActiveTexture(ffi::TEXTURE0);
     gl.Viewport(0, 0, bbw, bbh);
-    draw_fullscreen_quad(gl, prog.attrib_vert);
+    gl.Enable(ffi::BLEND);
+    gl.BlendEquation(ffi::MAX);
+    gl.DrawArraysInstanced(ffi::TRIANGLES, 0, 6, options.subregion_rects.len() as i32);
+    gl.Disable(ffi::BLEND);
+    gl.BlendEquation(ffi::FUNC_ADD);
+    gl.ActiveTexture(ffi::TEXTURE0);
     // Keep the padded one-pixel border exterior even when a region touches
     // the source edge; JFA needs these exterior seeds.
     let border_x = BBOX_BORDER.min(bbw).max(0);
@@ -2841,7 +2955,7 @@ impl Blur {
         renderer: &mut GlesRenderer,
         source: &GlesTexture,
         options: &BlurOptions,
-    ) -> anyhow::Result<GlesTexture> {
+    ) -> anyhow::Result<BlurOutput> {
         let _span = tracy_client::span!("Blur::render");
         trace!("rendering blur");
 
@@ -3033,6 +3147,43 @@ impl Blur {
             check_gl_error(gl);
         })?;
 
-        Ok(self.textures[0].clone())
+        Ok(BlurOutput {
+            texture: self.textures[0].clone(),
+            subregion_clipped: false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_output_clip_requires_an_exact_builtin_region_mask() {
+        assert!(Blur::can_gpu_clip_custom_output(&[], true));
+        assert!(Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::RegionVectors],
+            true
+        ));
+        assert!(!Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::WindowVectors],
+            true
+        ));
+        assert!(!Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::RegionVectors, MaskPassStep::WindowVectors],
+            true
+        ));
+        assert!(!Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::Custom {
+                name: "mask".to_owned(),
+                source: String::new(),
+                scale: 1.0,
+            }],
+            true
+        ));
+        assert!(!Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::RegionVectors],
+            false
+        ));
     }
 }

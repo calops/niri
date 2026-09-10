@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
@@ -11,7 +12,7 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Frame as _, FrameContext, Offscreen, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
@@ -45,8 +46,36 @@ struct Inner {
     framebuffer: Option<GlesTexture>,
     blur: Option<Blur>,
     intermediate: Option<GlesTexture>,
+    /// Whether `intermediate` is transparent outside the protocol subregion.
+    intermediate_is_subregion_clipped: bool,
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
+    cached_subregion: Option<CachedSubregion>,
+    empty_subregion_rects: Arc<Vec<[f32; 4]>>,
+}
+
+#[derive(Debug)]
+struct CachedSubregion {
+    source: Arc<Vec<Rectangle<i32, Logical>>>,
+    scale: Scale<f64>,
+    relative_offset: Point<f64, Logical>,
+    geometry_size: Size<f64, Logical>,
+    normalized: Arc<Vec<[f32; 4]>>,
+}
+
+fn visible_geometry_crop(
+    geometry: Rectangle<f64, Logical>,
+    src: Rectangle<f64, Buffer>,
+    dst: Rectangle<i32, Physical>,
+    clamped_dst: Rectangle<i32, Physical>,
+) -> Rectangle<f64, Logical> {
+    let src_loc = src.loc.to_logical(1., Transform::Normal, &src.size);
+    let dst_to_src = src.size / dst.size.to_f64();
+    let clamp_offset = clamped_dst.loc - dst.loc;
+    Rectangle::new(
+        geometry.loc + src_loc + clamp_offset.to_f64().upscale(dst_to_src).to_logical(1.),
+        clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
+    )
 }
 
 impl FramebufferEffect {
@@ -174,6 +203,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             let inner = &mut *inner;
 
             inner.intermediate = None;
+            inner.intermediate_is_subregion_clipped = false;
+            let subregion = self.subregion.as_ref();
 
             // We want clamp-to-edge behavior for out-of-bounds pixels. However, glBlitFramebuffer
             // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
@@ -183,6 +214,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 Some(clamped) => clamped,
                 None => return Ok(()),
             };
+            let mask_geometry = visible_geometry_crop(self.geometry, src, dst, clamped_dst);
+            let subregion_rects = inner.normalized_subregion_rects(subregion, mask_geometry);
             let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
 
             let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
@@ -309,33 +342,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
                 let corner_radius: [f32; 4] = self.corner_radius.into();
 
-                let subregion_rects = if let Some(sr) = self.subregion.as_ref() {
-                    let mut raw: Vec<[f32; 4]> = Vec::new();
-                    for (tl, br) in sr.iter() {
-                        let x1 = ((tl.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let y_raw_top =
-                            ((tl.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
-                        let x2 = ((br.x - self.geometry.loc.x) / self.geometry.size.w) as f32;
-                        let y_raw_bot =
-                            ((br.y - self.geometry.loc.y) / self.geometry.size.h) as f32;
-                        let y1 = 1.0 - y_raw_bot;
-                        let y2 = 1.0 - y_raw_top;
-                        if x2 <= x1 || y2 <= y1 {
-                            continue;
-                        }
-                        raw.push([x1, y1, x2, y2]);
-                    }
-
-                    raw
-                } else {
-                    Vec::new()
-                };
+                let subregion_rects = Arc::clone(&subregion_rects);
 
                 let window_screen_rect = [
                     (self.geometry.loc.x / output_rect.size.w as f64) as f32,
-                    (1.0
-                        - (self.geometry.loc.y + self.geometry.size.h)
-                            / output_rect.size.h as f64) as f32,
+                    (1.0 - (self.geometry.loc.y + self.geometry.size.h) / output_rect.size.h as f64)
+                        as f32,
                     (self.geometry.size.w / output_rect.size.w as f64) as f32,
                     (self.geometry.size.h / output_rect.size.h as f64) as f32,
                 ];
@@ -345,7 +357,10 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                     .with_subregion_rects(subregion_rects)
                     .with_window_screen_rect(window_screen_rect);
                 match blur.render(renderer, framebuffer, &options) {
-                    Ok(blurred) => inner.intermediate = Some(blurred),
+                    Ok(output) => {
+                        inner.intermediate_is_subregion_clipped = output.subregion_clipped;
+                        inner.intermediate = Some(output.texture);
+                    }
                     Err(err) => {
                         warn!("error rendering blur: {err:?}");
                     }
@@ -390,8 +405,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         let filtered = &mut inner.subregion_damage;
         filtered.clear();
 
-        if let Some(subregion) = &self.subregion {
-            // Convert to subregion coordinates.
+        if inner.intermediate_is_subregion_clipped && self.noise == 0.0 {
+            // The GPU-applied mask makes pixels outside the exact protocol
+            // region transparent, so rendering one damaged quad is sufficient.
+            filtered.extend(damage.iter());
+        } else if let Some(subregion) = &self.subregion {
+            // Generic and fallback effects still need CPU-side exact clipping.
             let mut crop = src.to_logical(1., Transform::Normal, &src.size);
             crop.loc += self.geometry.loc;
             subregion.filter_damage(crop, dst, damage, filtered);
@@ -489,7 +508,71 @@ impl Inner {
             framebuffer: None,
             blur: Blur::new(renderer),
             intermediate: None,
+            intermediate_is_subregion_clipped: false,
             subregion_damage: Vec::new(),
+            cached_subregion: None,
+            empty_subregion_rects: Arc::new(Vec::new()),
         }
+    }
+
+    fn normalized_subregion_rects(
+        &mut self,
+        subregion: Option<&TransformedRegion>,
+        geometry: Rectangle<f64, Logical>,
+    ) -> Arc<Vec<[f32; 4]>> {
+        let Some(subregion) = subregion else {
+            return Arc::clone(&self.empty_subregion_rects);
+        };
+
+        let relative_offset = subregion.offset - geometry.loc;
+        if self.cached_subregion.as_ref().is_some_and(|cached| {
+            Arc::ptr_eq(&cached.source, &subregion.rects)
+                && cached.scale == subregion.scale
+                && cached.relative_offset == relative_offset
+                && cached.geometry_size == geometry.size
+        }) {
+            return Arc::clone(&self.cached_subregion.as_ref().unwrap().normalized);
+        }
+
+        let mut normalized = Vec::with_capacity(subregion.rects.len());
+        for (top_left, bottom_right) in subregion.iter() {
+            let x1 = ((top_left.x - geometry.loc.x) / geometry.size.w) as f32;
+            let y_raw_top = ((top_left.y - geometry.loc.y) / geometry.size.h) as f32;
+            let x2 = ((bottom_right.x - geometry.loc.x) / geometry.size.w) as f32;
+            let y_raw_bottom = ((bottom_right.y - geometry.loc.y) / geometry.size.h) as f32;
+            let y1 = 1.0 - y_raw_bottom;
+            let y2 = 1.0 - y_raw_top;
+            if x2 > x1 && y2 > y1 {
+                normalized.push([x1, y1, x2, y2]);
+            }
+        }
+
+        let normalized = Arc::new(normalized);
+        self.cached_subregion = Some(CachedSubregion {
+            source: Arc::clone(&subregion.rects),
+            scale: subregion.scale,
+            relative_offset,
+            geometry_size: geometry.size,
+            normalized: Arc::clone(&normalized),
+        });
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_crop_tracks_a_partially_offscreen_effect() {
+        let geometry = Rectangle::new((-50.0, 0.0).into(), (100.0, 100.0).into());
+        let src = Rectangle::from_size((100.0, 100.0).into());
+        let dst = Rectangle::new((-50, 0).into(), (100, 100).into());
+        let clamped_dst = Rectangle::new((0, 0).into(), (50, 100).into());
+
+        assert_eq!(
+            visible_geometry_crop(geometry, src, dst, clamped_dst),
+            Rectangle::new((0.0, 0.0).into(), (50.0, 100.0).into())
+        );
     }
 }

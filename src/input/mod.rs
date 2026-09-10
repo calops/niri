@@ -4634,12 +4634,9 @@ fn find_bind<'a>(
         });
     }
 
-    if let Some(bind) = find_configured_bind(
-        bindings.clone(),
-        mod_key,
-        Trigger::Keycode(key_code),
-        mods,
-    ) {
+    if let Some(bind) =
+        find_configured_bind(bindings.clone(), mod_key, Trigger::Keycode(key_code), mods)
+    {
         return Some(bind);
     }
 

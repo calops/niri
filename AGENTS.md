@@ -6,7 +6,7 @@ Branch: `feat/custom-blur-shader` — custom shader pipelines for background eff
 
 The blur pipeline runs in three stages:
 
-1. **Initial binary mask** — renders anti-aliased subregion coverage through `mask_binary.frag` when there are no mask passes or the first pass is custom. It is skipped when the first pass is a self-contained built-in vector pass.
+1. **Initial binary mask** — renders anti-aliased subregion coverage through the instanced `mask_binary.vert` / `mask_binary.frag` pair when there are no mask passes or the first pass is custom. It is skipped when the first pass is a self-contained built-in vector pass.
 2. **Mask passes** — zero or more user-declared passes that refine or replace the mask. Each custom pass reads the previous pass's output. Built-in vector passes are self-contained.
 3. **Render passes** — one or more passes that produce the final blurred output. Each pass receives `niri_input` (source texture or previous pass output) and `niri_mask` (final mask texture).
 
@@ -40,12 +40,12 @@ The built-in vector masks use:
 
 | File | Role |
 |------|------|
-| `src/render_helpers/blur.rs` (~2970 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, `MaskProgram` (analytical SDF), `JfaPipeline`/`JfaTextures`/`MultigridLevel` (region-vectors), final-mask and bbox-local JFA caches, `render_custom()`, `render_jfa_mask()`, `run_dual_kawase_blur()`, and multigrid V-cycle functions. Constants: `MAX_KAWASE_PASSES`, `JFA_CACHE_EPSILON`, `MAX_MULTIGRID_LEVELS`, `MULTIGRID_COARSE_SIZE`, `JACOBI_OMEGA`, `JACOBI_SWEEPS`, `V_CYCLES`, `BBOX_BORDER`. |
+| `src/render_helpers/blur.rs` (~3220 lines) | Central hub: `Blur`, `BlurProgram`, `CustomBlurProgram`, `MaskProgram` (analytical SDF), `JfaPipeline`/`JfaTextures`/`MultigridLevel` (region-vectors), final-mask and bbox-local JFA caches, exact output-mask compositing, `render_custom()`, `render_jfa_mask()`, `run_dual_kawase_blur()`, and multigrid V-cycle functions. Constants: `MAX_KAWASE_PASSES`, `JFA_CACHE_EPSILON`, `MAX_MULTIGRID_LEVELS`, `MULTIGRID_COARSE_SIZE`, `JACOBI_OMEGA`, `JACOBI_SWEEPS`, `V_CYCLES`, `BBOX_BORDER`. |
 | `src/render_helpers/custom_blur.rs` (140 lines) | `MaskPassStep`/`RenderPassStep` enums, `PipelineConfig`, `resolve_pipeline()`, `cache_key()` |
 | `src/render_helpers/shaders/mod.rs` (450 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`/`RenderPassPart` (with `kind` discriminant: `MaskPassKind`/`RenderPassKind`), `BackgroundEffect`, `BackgroundEffectRule` |
 | `src/render_helpers/background_effect.rs` | `BackgroundEffect`, `Options`, `RenderParams` — ties blur config to window/layer rendering |
-| `src/render_helpers/framebuffer_effect.rs` | `FramebufferEffect` — captures framebuffer, runs blur, draws result |
+| `src/render_helpers/framebuffer_effect.rs` | `FramebufferEffect` — captures the visible framebuffer crop, normalizes subregion rectangles against that crop, runs blur, and draws exact GPU-masked outputs without expanding damage into one scissor per region rectangle |
 | `src/render_helpers/effect_buffer.rs` | `EffectBuffer` — cached offscreen texture + on-demand blur (xray path) |
 | `src/render_helpers/xray.rs` | `Xray`, `XrayElement` — transparency rendering |
 | `src/handlers/background_effect.rs` | Wayland protocol handler for `ext-background-effect` blur regions |
@@ -57,12 +57,13 @@ The built-in vector masks use:
 All in `src/render_helpers/shaders/`:
 
 - `blur.vert` / `blur_down.frag` / `blur_up.frag` — default Kawase blur (also used by `dual-kawase-blur`)
-- `blur_custom.vert` — shared vertex shader for all custom/JFA/binary passes
+- `blur_custom.vert` — shared vertex shader for custom, JFA, analytical-mask, and output-mask fullscreen passes
 - `mask.frag` — analytical SDF mask (used by `window-vectors`)
-- `mask_binary.frag` — binary subregion coverage mask
+- `mask_binary.vert` / `mask_binary.frag` — binary subregion coverage mask; one instanced quad per rectangle with `GL_MAX` coverage blending, used both source-sized and bbox-local for JFA
 - `jfa_init.frag`, `jfa_step.frag` — JFA stages used by `region-vectors`
 - `jfa_poisson_init_rhs.frag`, `jfa_poisson_restrict_mask.frag`, `jfa_poisson_jacobi.frag`, `jfa_poisson_residual_restrict.frag`, `jfa_poisson_prolongate.frag` — multigrid Poisson stages
 - `jfa_encode.frag`, `jfa_smooth.frag` — direction encode and cached 3×3 tent smoothing for JFA+Poisson
+- `mask_output.frag` — multiplies eligible custom-pipeline output by the exact built-in region mask, making pixels outside the protocol region transparent
 - `border.frag`, `shadow.frag`, `clipped_surface.frag`, `rounding_alpha.frag`, `postprocess.frag` — border/shadow/clipping/post-process
 
 ## Config format
@@ -149,14 +150,17 @@ Blur::render()
   → if shader_pipeline set: get_or_compile_custom_blur() → Blur::render_custom()
     → if final-mask cache matches: reuse the active mask texture
     → otherwise:
-        - render binary mask only when there are no mask passes or the first pass is custom
+        - render binary mask only when there are no mask passes or the first pass is custom;
+          one instanced quad per rectangle replaces the old per-fragment scan of every rectangle
         - run each mask pass:
             - "window-vectors": analytical SDF → dst
-            - "region-vectors": JFA+Poisson pipeline → dst
+            - "region-vectors": instanced bbox-local binary mask → JFA+Poisson pipeline → dst
             - "custom": user shader (reads src, writes dst ping-pong)
     → run each render pass:
         - "dual-kawase-blur": run_dual_kawase_blur() (down+up chain)
         - "custom": user shader with niri_mask bound
+    → when the final mask is exact for the protocol region (binary or final `region-vectors`), apply `mask_output.frag`
+      so the final texture is transparent outside the region
   → else: default Kawase down/up passes
 ```
 
@@ -165,10 +169,12 @@ Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destin
 ## Caching
 
 - **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use. Failures are cached as `None`. Cleared on config reload.
-- **Final mask:** cached by compiled pipeline identity, source size, subregion rectangles, geometry size, and corner radii. Exact hits skip the entire binary and mask pipeline.
+- **Final mask:** cached by compiled pipeline identity, source size, `Arc` identity of normalized subregion rectangles, geometry size, and corner radii. Exact hits skip the entire binary and mask pipeline.
 - **JFA output:** computed in bbox-local coordinates and cached by bbox size + local rect offsets. A translation cache hit re-blits the encoded texture without recomputing JFA/Poisson. When `region-vectors` is the first pass and reuses the same destination texture, only the previous bbox is cleared.
-- **Mask programs:** `Blur.mask_program`, `Blur.binary_program`, and `Blur.jfa_pipeline` are compiled once per `Blur` instance and reused.
-- **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks). Pixel-space rectangle conversion and upload are reused across mask paths.
+- **Exact output clip:** custom pipelines whose final mask is binary or `region-vectors` run one final `mask_output.frag` pass. With zero post-process noise, `FramebufferEffect` draws compositor damage directly instead of expanding it to thousands of subregion scissors. Other masks, fallback pipelines, and noisy output retain CPU-side region clipping.
+- **Normalized subregions:** `FramebufferEffect` caches its normalized float rectangle vector by source `Arc`, relative offset, scale, and visible capture size. Partially offscreen effects normalize against the captured crop rather than compressing full-surface mask coordinates into the visible texture. Unchanged visible crops reuse the same `Arc`, making `Blur` mask-change detection O(1).
+- **Mask programs:** `Blur.mask_program`, `Blur.binary_program`, `Blur.mask_output_program`, and `Blur.jfa_pipeline` are compiled once per `Blur` instance and reused.
+- **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks). Pixel-space rectangle conversion and upload are reused across mask paths. Binary mask generation fetches one rect per instanced quad, so changing a large region costs roughly its covered fragments rather than mask pixels × rectangle count.
 
 ## Error handling
 
@@ -185,6 +191,7 @@ Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destin
 - **Compile check:** `cargo check --all-targets`
 - **Nested refresh:** the Winit backend reads the host monitor refresh when available. Set `NIRI_WINIT_REFRESH_RATE=<hz>` to override unreliable Wayland monitor metadata, for example `NIRI_WINIT_REFRESH_RATE=170 target/debug/niri --config config.kdl`.
 - **Cava refresh:** `cava-test/shell.qml` follows the nested output refresh by default. Set `NIRI_CAVA_FRAMERATE=<fps>` to hold Cava at a separate rate when isolating compositor timing from region-update frequency.
+- **Stained-glass lock UI:** `./lock.sh` launches the standalone native Rust client at `${NIRI_GLASS_LOCK_PROJECT:-$HOME/projects/niri-glass-lock}` through its Nix flake. Two top-level half-screen overlay layer surfaces move by layer-shell margins, each with one static SHM-rendered stained-glass buffer and a surface-local background-effect region; frame callbacks pace the motion without rebuilding the Voronoi cells or mask strips. The `stained-glass-lock` layer rule uses the `overshifted3` shader pipeline. It accepts any password and does not acquire a Wayland session lock. A real lock will require a niri config option to keep rendering normal surfaces beneath the transparent session-lock surface.
 
 ## Precision notes
 

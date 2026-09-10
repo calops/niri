@@ -75,9 +75,7 @@ fn read_shader_file(path: &Path) -> anyhow::Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-pub fn resolve_pipeline(
-    pipeline: &niri_config::ShaderPipeline,
-) -> anyhow::Result<PipelineConfig> {
+pub fn resolve_pipeline(pipeline: &niri_config::ShaderPipeline) -> anyhow::Result<PipelineConfig> {
     let mut mask_passes = Vec::with_capacity(pipeline.mask_passes.len());
     for (i, mask) in pipeline.mask_passes.iter().enumerate() {
         let step = match mask.kind {
@@ -87,10 +85,7 @@ pub fn resolve_pipeline(
                 let file = mask.file.as_deref().with_context(|| {
                     format!("mask-pass {i}: `custom` requires a `file` property")
                 })?;
-                ensure!(
-                    mask.scale > 0.0,
-                    "mask-pass {i}: scale must be positive"
-                );
+                ensure!(mask.scale > 0.0, "mask-pass {i}: scale must be positive");
                 let source = read_shader_file(Path::new(file))?;
                 MaskPassStep::Custom {
                     name: file.to_string(),
@@ -118,10 +113,7 @@ pub fn resolve_pipeline(
                 let file = pass.file.as_deref().with_context(|| {
                     format!("render-pass {i}: `custom` requires a `file` property")
                 })?;
-                ensure!(
-                    pass.scale > 0.0,
-                    "render-pass {i}: scale must be positive"
-                );
+                ensure!(pass.scale > 0.0, "render-pass {i}: scale must be positive");
                 let source = read_shader_file(Path::new(file))?;
                 RenderPassStep::Custom {
                     name: file.to_string(),

@@ -317,7 +317,7 @@ impl EffectBuffer {
             let blurred = blur
                 .render(renderer, &offscreen.texture, &self.blur_options)
                 .context("error rendering blur")?;
-            offscreen.blurred.insert(blurred).clone()
+            offscreen.blurred.insert(blurred.texture).clone()
         };
 
         Ok(texture)

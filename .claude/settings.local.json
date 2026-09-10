@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(find ~/.cargo/registry/src/ -path \"*smithay-*\" -name \"*.rs\" -exec grep -l \"fourcc_to_gl\\\\|Fourcc::R8\\\\|Fourcc::Abgr16161616f\" {} \\\\;)",
+      "Bash(git mv *)"
+    ]
+  }
+}

@@ -1,0 +1,61 @@
+<h2>What CRT characteristics do you want?</h2>
+<p class="subtitle">Pick the effects that define your "classic CRT look" &mdash; multi-select is on</p>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="scanlines" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Scanlines</h3>
+      <p>Horizontal dark lines simulating the electron beam scan pattern. The most iconic CRT feature.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="curvature" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Screen Curvature</h3>
+      <p>Barrel or pincushion distortion; the dome-like bulge of a CRT tube, strongest at edges.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="chromatic" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Chromatic Aberration</h3>
+      <p>RGB color fringing at edges from the curved lens. Already present in overshifted3 but could be toned down.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="phosphor" onclick="toggleSelect(this)">
+    <div class="letter">D</div>
+    <div class="content">
+      <h3>Phosphor Bloom / Glow</h3>
+      <p>Soft fuzzy glow around bright areas. Light bleeding through the phosphor layer. Similar to overshifted3's dome lighting but warmer.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="megamask" onclick="toggleSelect(this)">
+    <div class="letter">E</div>
+    <div class="content">
+      <h3>Phosphor Mask Pattern</h3>
+      <p>Tiny RGB triad dots or vertical aperture grille lines visible up close. The sub-pixel structure of a CRT.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="vignette" onclick="toggleSelect(this)">
+    <div class="letter">F</div>
+    <div class="content">
+      <h3>Vignette</h3>
+      <p>Darkening toward the corners, simulating the uneven brightness of a CRT tube.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="noise" onclick="toggleSelect(this)">
+    <div class="letter">G</div>
+    <div class="content">
+      <h3>Noise / Signal Interference</h3>
+      <p>Subtle analog noise, occasional horizontal flicker, or rolling interference lines.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="refraction" onclick="toggleSelect(this)">
+    <div class="letter">H</div>
+    <div class="content">
+      <h3>Mask-Driven Refraction (reuse from overshifted3)</h3>
+      <p>Keep the Poisson direction field + chromatic refraction but toned down. Gives glass-like depth to windows.</p>
+    </div>
+  </div>
+</div>

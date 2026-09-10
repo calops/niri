@@ -1,0 +1,77 @@
+<h2>Pipeline: crt</h2>
+<p class="subtitle">2-pass CRT compositing pipeline</p>
+
+<div class="section">
+  <h3>Structure</h3>
+  <div class="mockup">
+    <div class="mockup-header">shaders/crt/ &mdash; 3 files</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:13px;line-height:1.7;padding:16px;">
+pipeline.kdl    &mdash; 2 passes<br>
+down.frag       &mdash; copied from overshifted3<br>
+crt.frag        &mdash; all CRT effects in one pass<br>
+<br>
+pass "down0" file="down.frag" scale=0.5<br>
+pass "crt" file="crt.frag" scale=1.0
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>crt.frag: Effect Stack (top-to-bottom order)</h3>
+  
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <tr style="background:var(--bg-secondary);">
+      <td style="padding:8px;font-weight:bold;">#</td>
+      <td style="padding:8px;font-weight:bold;">Effect</td>
+      <td style="padding:8px;font-weight:bold;">Knobs</td>
+      <td style="padding:8px;font-weight:bold;">Notes</td>
+    </tr>
+    <tr>
+      <td style="padding:8px;">1</td>
+      <td style="padding:8px;"><b>Curvature</b></td>
+      <td style="padding:8px;font-family:monospace;">u_curvature (0&ndash;1)</td>
+      <td style="padding:8px;">Barrel distortion. Warps UVs, creates dark bezel beyond the curve radius.</td>
+    </tr>
+    <tr style="background:var(--bg-secondary);">
+      <td style="padding:8px;">2</td>
+      <td style="padding:8px;"><b>Chromatic Aberration</b></td>
+      <td style="padding:8px;font-family:monospace;">u_chromatic (0&ndash;0.1)</td>
+      <td style="padding:8px;">RGB separation proportional to distance from center. Stronger at curved edges.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px;">3</td>
+      <td style="padding:8px;"><b>Scanlines</b></td>
+      <td style="padding:8px;font-family:monospace;">u_scanlineStrength (0&ndash;1)<br>u_scanlineWidth (0.25&ndash;0.5)</td>
+      <td style="padding:8px;">Horizontal dark bands. Alternating brightness for odd/even rows.</td>
+    </tr>
+    <tr style="background:var(--bg-secondary);">
+      <td style="padding:8px;">4</td>
+      <td style="padding:8px;"><b>Phosphor Mask</b></td>
+      <td style="padding:8px;font-family:monospace;">u_phosphorStrength (0&ndash;1)<br>u_phosphorScale (px)</td>
+      <td style="padding:8px;">RGB triad dots at sub-pixel level, tiled across screen.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px;">5</td>
+      <td style="padding:8px;"><b>Phosphor Bloom</b></td>
+      <td style="padding:8px;font-family:monospace;">u_bloomStrength (0&ndash;1)</td>
+      <td style="padding:8px;">Overlays the blurred downscale texture with a soft-light blend. Inspired by overshifted3's glow.</td>
+    </tr>
+    <tr style="background:var(--bg-secondary);">
+      <td style="padding:8px;">6</td>
+      <td style="padding:8px;"><b>Vignette</b></td>
+      <td style="padding:8px;font-family:monospace;">u_vignetteStrength (0&ndash;1)</td>
+      <td style="padding:8px;">Radial darkening from center to corners.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px;">7</td>
+      <td style="padding:8px;"><b>Noise</b></td>
+      <td style="padding:8px;font-family:monospace;">u_noiseStrength (0&ndash;1)</td>
+      <td style="padding:8px;">Per-pixel random flicker. Seed-based, time-independent (static noise).</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <h3>Knob Philosophy</h3>
+  <p>All effect parameters are <code>const float</code> values at the top of <code>crt.frag</code>. Each has a comment showing the range and what "subtle/balanced/heavy" means. To switch between looks, edit the constants and reload niri. No Rust-side changes needed for the initial version.</p>
+</div>

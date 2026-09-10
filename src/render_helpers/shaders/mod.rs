@@ -202,7 +202,6 @@ impl Shaders {
         self.custom_open.replace(program)
     }
 
-
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
         match program {
             ProgramType::Border => self.border.clone(),
