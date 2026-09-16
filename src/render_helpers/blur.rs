@@ -52,9 +52,9 @@ pub struct Blur {
     /// Compiled instanced binary-mask program. Used by the source-sized
     /// binary mask and the bbox-local JFA input.
     binary_program: Option<JfaBinaryProgram>,
-    /// 1×N RGBA32F texture holding the subregion rects (one texel per
-    /// rect, RGBA = x1,y1,x2,y2 in source pixels). Grown when the rect count
-    /// exceeds capacity; never shrunk.
+    /// Row-major RGBA32F texture holding the subregion rects (one texel per
+    /// rect, RGBA = x1,y1,x2,y2 in source pixels). Wraps to additional rows
+    /// at GL_MAX_TEXTURE_SIZE and grows when needed; never shrunk.
     rects_texture: Option<GlesTexture>,
     rects_capacity: i32,
     /// Cache for the JFA mask pipeline. The whole pipeline is computed in
@@ -70,7 +70,7 @@ pub struct Blur {
     cached_jfa_mask_texture_id: Option<u32>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlurOptions {
     pub passes: u8,
     pub offset: f64,
@@ -78,10 +78,30 @@ pub struct BlurOptions {
     pub corner_radius: [f32; 4],
     pub subregion_rects: Arc<Vec<[f32; 4]>>,
     pub window_screen_rect: [f32; 4],
+    /// Full mask texture size, independent of the currently visible source crop.
+    pub mask_size: Option<Size<i32, Buffer>>,
+    /// Visible source crop in full-mask UV coordinates: x1, y1, x2, y2.
+    pub mask_uv_rect: [f32; 4],
     /// Inline custom shader pipeline definition, or `None` to use the
     /// default Kawase blur. Cached in `Shaders` keyed by a hash of the
     /// shader source strings.
     pub shader_pipeline: Option<niri_config::ShaderPipeline>,
+}
+
+impl Default for BlurOptions {
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            offset: 0.0,
+            geo_size: (0.0, 0.0),
+            corner_radius: [0.0; 4],
+            subregion_rects: Arc::new(Vec::new()),
+            window_screen_rect: [0.0; 4],
+            mask_size: None,
+            mask_uv_rect: [0.0, 0.0, 1.0, 1.0],
+            shader_pipeline: None,
+        }
+    }
 }
 
 impl BlurOptions {
@@ -100,6 +120,12 @@ impl BlurOptions {
         self
     }
 
+    pub fn with_mask_geometry(mut self, size: Size<i32, Buffer>, uv_rect: [f32; 4]) -> Self {
+        self.mask_size = Some(size);
+        self.mask_uv_rect = uv_rect;
+        self
+    }
+
     pub fn with_window_screen_rect(mut self, rect: [f32; 4]) -> Self {
         self.window_screen_rect = rect;
         self
@@ -115,6 +141,8 @@ impl From<niri_config::Blur> for BlurOptions {
             corner_radius: [0.0; 4],
             subregion_rects: Arc::new(Vec::new()),
             window_screen_rect: [0.0; 4],
+            mask_size: None,
+            mask_uv_rect: [0.0, 0.0, 1.0, 1.0],
             shader_pipeline: config.shader_pipeline,
         }
     }
@@ -196,6 +224,7 @@ struct CustomBlurPassProgram {
     uniform_corner_radius: ffi::types::GLint,
     uniform_mask: ffi::types::GLint,
     uniform_window_screen_rect: ffi::types::GLint,
+    uniform_mask_uv_rect: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -227,6 +256,7 @@ unsafe fn compile_custom_pass(
     let corner_radius = c"niri_corner_radius";
     let mask = c"niri_mask";
     let window_screen_rect = c"niri_window_screen_rect";
+    let mask_uv_rect = c"niri_mask_uv_rect";
     let vert = c"vert";
 
     Ok(CustomBlurPassProgram {
@@ -241,6 +271,7 @@ unsafe fn compile_custom_pass(
         uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
         uniform_mask: gl.GetUniformLocation(program, mask.as_ptr()),
         uniform_window_screen_rect: gl.GetUniformLocation(program, window_screen_rect.as_ptr()),
+        uniform_mask_uv_rect: gl.GetUniformLocation(program, mask_uv_rect.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -257,6 +288,7 @@ unsafe fn compile_mask_output_program(gl: &ffi::Gles2) -> Result<MaskOutputProgr
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
         uniform_mask: gl.GetUniformLocation(program, c"niri_mask".as_ptr()),
+        uniform_mask_uv_rect: gl.GetUniformLocation(program, c"niri_mask_uv_rect".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -356,6 +388,7 @@ struct MaskOutputProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
     uniform_mask: ffi::types::GLint,
+    uniform_mask_uv_rect: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -557,6 +590,54 @@ unsafe fn draw_fullscreen_quad(gl: &ffi::Gles2, attrib_vert: ffi::types::GLint) 
     );
     gl.DrawArrays(ffi::TRIANGLES, 0, 6);
     gl.DisableVertexAttribArray(attrib_vert as u32);
+}
+
+fn rects_texture_size(needed: i32, max_texture_size: i32) -> Option<Size<i32, Buffer>> {
+    if needed <= 0 || max_texture_size <= 0 {
+        return None;
+    }
+
+    let preferred_width = (needed as u32).next_power_of_two().min(i32::MAX as u32) as i32;
+    let width = preferred_width.min(max_texture_size);
+    let height = needed / width + i32::from(needed % width != 0);
+    (height <= max_texture_size).then(|| Size::new(width, height))
+}
+
+unsafe fn upload_rects_texture(gl: &ffi::Gles2, texture: &GlesTexture, rects: &[[f32; 4]]) {
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, texture.tex_id());
+
+    let row_width = texture.size().w as usize;
+    let full_rows = rects.len() / row_width;
+    if full_rows > 0 {
+        gl.TexSubImage2D(
+            ffi::TEXTURE_2D,
+            0,
+            0,
+            0,
+            row_width as i32,
+            full_rows as i32,
+            ffi::RGBA,
+            ffi::FLOAT,
+            rects.as_ptr().cast(),
+        );
+    }
+
+    let remaining = rects.len() % row_width;
+    if remaining > 0 {
+        gl.TexSubImage2D(
+            ffi::TEXTURE_2D,
+            0,
+            0,
+            full_rows as i32,
+            remaining as i32,
+            1,
+            ffi::RGBA,
+            ffi::FLOAT,
+            rects.as_ptr().add(full_rows * row_width).cast(),
+        );
+    }
+    gl.ActiveTexture(ffi::TEXTURE0);
 }
 
 // Allocates a renderable floating-point GlesTexture directly via raw GL,
@@ -952,8 +1033,9 @@ impl Blur {
                 Some(renderer.create_buffer(Fourcc::Abgr8888, final_output_size)?);
         }
 
-        let mask_w = source_size.w;
-        let mask_h = source_size.h;
+        let mask_size = options.mask_size.unwrap_or(source_size);
+        let mask_w = mask_size.w;
+        let mask_h = mask_size.h;
 
         let rects_changed = !Arc::ptr_eq(&self.cached_mask_rects, &options.subregion_rects);
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
@@ -1009,15 +1091,24 @@ impl Blur {
         let needed = options.subregion_rects.len() as i32;
         let mut rects_texture_changed = false;
         if needed > self.rects_capacity {
-            let capacity = ((needed as u32).next_power_of_two() as i32).max(16);
-            let size = Size::new(capacity, 1);
+            let max_texture_size = renderer.with_context(|gl| unsafe {
+                let mut value = 0;
+                gl.GetIntegerv(ffi::MAX_TEXTURE_SIZE, &mut value);
+                value
+            })?;
+            let size = rects_texture_size(needed, max_texture_size).with_context(|| {
+                format!(
+                    "{needed} subregion rectangles exceed the GL texture capacity \
+                     {max_texture_size}×{max_texture_size}"
+                )
+            })?;
             self.rects_texture = Some(create_float_buffer(
                 renderer,
                 size,
                 ffi::RGBA32F,
                 ffi::RGBA,
             )?);
-            self.rects_capacity = capacity;
+            self.rects_capacity = size.w * size.h;
             rects_texture_changed = true;
         }
 
@@ -1181,20 +1272,7 @@ impl Blur {
             if !mask_cache_hit && rects_upload {
                 if let Some(rects_tex) = self.rects_texture.as_ref() {
                     if !self.cached_rects_px.is_empty() {
-                        gl.ActiveTexture(ffi::TEXTURE1);
-                        gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
-                        gl.TexSubImage2D(
-                            ffi::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            self.cached_rects_px.len() as i32,
-                            1,
-                            ffi::RGBA,
-                            ffi::FLOAT,
-                            self.cached_rects_px.as_ptr() as *const _,
-                        );
-                        gl.ActiveTexture(ffi::TEXTURE0);
+                        upload_rects_texture(gl, rects_tex, &self.cached_rects_px);
                     }
                 }
             }
@@ -1561,6 +1639,15 @@ impl Blur {
                             if pass.uniform_mask >= 0 {
                                 gl.Uniform1i(pass.uniform_mask, 1);
                             }
+                            if pass.uniform_mask_uv_rect >= 0 {
+                                gl.Uniform4f(
+                                    pass.uniform_mask_uv_rect,
+                                    options.mask_uv_rect[0],
+                                    options.mask_uv_rect[1],
+                                    options.mask_uv_rect[2],
+                                    options.mask_uv_rect[3],
+                                );
+                            }
 
                             if pass.uniform_window_screen_rect >= 0 {
                                 gl.Uniform4f(
@@ -1637,6 +1724,13 @@ impl Blur {
                 gl.UseProgram(program.program);
                 gl.Uniform1i(program.uniform_input, 0);
                 gl.Uniform1i(program.uniform_mask, 1);
+                gl.Uniform4f(
+                    program.uniform_mask_uv_rect,
+                    options.mask_uv_rect[0],
+                    options.mask_uv_rect[1],
+                    options.mask_uv_rect[2],
+                    options.mask_uv_rect[3],
+                );
                 gl.Viewport(0, 0, final_output_w, final_output_h);
                 gl.FramebufferTexture2D(
                     ffi::DRAW_FRAMEBUFFER,
@@ -3169,6 +3263,7 @@ mod tests {
             &[MaskPassStep::WindowVectors],
             true
         ));
+
         assert!(!Blur::can_gpu_clip_custom_output(
             &[MaskPassStep::RegionVectors, MaskPassStep::WindowVectors],
             true
@@ -3185,5 +3280,19 @@ mod tests {
             &[MaskPassStep::RegionVectors],
             false
         ));
+    }
+    #[test]
+    fn default_mask_uv_covers_the_full_texture() {
+        assert_eq!(BlurOptions::default().mask_uv_rect, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn rectangle_texture_wraps_at_the_gl_width_limit() {
+        assert_eq!(rects_texture_size(5_542, 16_384), Some(Size::new(8_192, 1)));
+        assert_eq!(
+            rects_texture_size(20_000, 16_384),
+            Some(Size::new(16_384, 2))
+        );
+        assert_eq!(rects_texture_size(17, 4), None);
     }
 }

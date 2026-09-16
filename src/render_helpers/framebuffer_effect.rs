@@ -78,6 +78,14 @@ fn visible_geometry_crop(
     )
 }
 
+fn mask_uv_rect(geometry: Rectangle<f64, Logical>, crop: Rectangle<f64, Logical>) -> [f32; 4] {
+    let x1 = ((crop.loc.x - geometry.loc.x) / geometry.size.w) as f32;
+    let x2 = ((crop.loc.x + crop.size.w - geometry.loc.x) / geometry.size.w) as f32;
+    let y_top = ((crop.loc.y - geometry.loc.y) / geometry.size.h) as f32;
+    let y_bottom = ((crop.loc.y + crop.size.h - geometry.loc.y) / geometry.size.h) as f32;
+    [x1, 1.0 - y_bottom, x2, 1.0 - y_top]
+}
+
 impl FramebufferEffect {
     pub fn new() -> Self {
         Self {
@@ -214,8 +222,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 Some(clamped) => clamped,
                 None => return Ok(()),
             };
-            let mask_geometry = visible_geometry_crop(self.geometry, src, dst, clamped_dst);
-            let subregion_rects = inner.normalized_subregion_rects(subregion, mask_geometry);
+            let visible_geometry = visible_geometry_crop(self.geometry, src, dst, clamped_dst);
+            let subregion_rects = inner.normalized_subregion_rects(subregion, self.geometry);
             let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
 
             let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
@@ -246,6 +254,12 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             let size = transform.transform_size(size);
 
             let size = size.to_logical(1).to_buffer(1, Transform::Normal);
+            let mask_size = self.geometry.size.to_physical_precise_round(self.scale);
+            let mask_size = transform
+                .transform_size(mask_size)
+                .to_logical(1)
+                .to_buffer(1, Transform::Normal);
+            let mask_uv_rect = mask_uv_rect(self.geometry, visible_geometry);
 
             // Recreate framebuffer if needed.
             if inner
@@ -355,6 +369,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
                 let options = options
                     .with_geometry(geo_size, corner_radius)
                     .with_subregion_rects(subregion_rects)
+                    .with_mask_geometry(mask_size, mask_uv_rect)
                     .with_window_screen_rect(window_screen_rect);
                 match blur.render(renderer, framebuffer, &options) {
                     Ok(output) => {
@@ -573,6 +588,23 @@ mod tests {
         assert_eq!(
             visible_geometry_crop(geometry, src, dst, clamped_dst),
             Rectangle::new((0.0, 0.0).into(), (50.0, 100.0).into())
+        );
+    }
+
+    #[test]
+    fn mask_uv_selects_the_visible_part_of_the_full_surface() {
+        let horizontal_geometry = Rectangle::new((-50.0, 0.0).into(), (100.0, 100.0).into());
+        let horizontal_crop = Rectangle::new((0.0, 0.0).into(), (50.0, 100.0).into());
+        assert_eq!(
+            mask_uv_rect(horizontal_geometry, horizontal_crop),
+            [0.5, 0.0, 1.0, 1.0]
+        );
+
+        let vertical_geometry = Rectangle::new((0.0, -50.0).into(), (100.0, 100.0).into());
+        let vertical_crop = Rectangle::new((0.0, 0.0).into(), (100.0, 50.0).into());
+        assert_eq!(
+            mask_uv_rect(vertical_geometry, vertical_crop),
+            [0.0, 0.0, 1.0, 0.5]
         );
     }
 }

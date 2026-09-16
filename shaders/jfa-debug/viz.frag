@@ -6,11 +6,13 @@ in vec2 v_coords;
 
 uniform sampler2D niri_input;
 uniform sampler2D niri_mask;
+uniform vec4 niri_mask_uv_rect;
 
 out vec4 frag_color;
 
 void main() {
-    vec4 m = texture(niri_mask, v_coords);
+    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, v_coords);
+    vec4 m = texture(niri_mask, mask_uv);
     if (m.r < 0.001) {
         frag_color = vec4(0.0, 0.0, 0.0, 1.0);
         return;

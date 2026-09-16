@@ -17,7 +17,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::winit::dpi::LogicalSize;
 use smithay::reexports::winit::platform::wayland::WindowAttributesWayland;
-use smithay::reexports::winit::window::WindowAttributes;
+use smithay::reexports::winit::window::{Window, WindowAttributes};
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 
@@ -30,7 +30,7 @@ use crate::utils::{get_monotonic_time, logical_output};
 const DEFAULT_REFRESH_RATE_MHZ: i32 = 60_000;
 const REFRESH_RATE_ENV: &str = "NIRI_WINIT_REFRESH_RATE";
 
-fn window_refresh_rate(window: &Window) -> i32 {
+fn window_refresh_rate(window: &dyn Window) -> i32 {
     if let Some(value) = env::var_os(REFRESH_RATE_ENV) {
         let refresh_hz = value.to_str().and_then(|value| value.parse::<f64>().ok());
         if let Some(refresh_hz) = refresh_hz
@@ -46,8 +46,9 @@ fn window_refresh_rate(window: &Window) -> i32 {
 
     window
         .current_monitor()
-        .and_then(|monitor| monitor.refresh_rate_millihertz())
-        .and_then(|refresh| i32::try_from(refresh).ok())
+        .and_then(|monitor| monitor.current_video_mode())
+        .and_then(|mode| mode.refresh_rate_millihertz())
+        .and_then(|refresh| i32::try_from(refresh.get()).ok())
         .filter(|refresh| *refresh > 0)
         .unwrap_or(DEFAULT_REFRESH_RATE_MHZ)
 }

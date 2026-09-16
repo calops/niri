@@ -7,6 +7,7 @@ in vec2 v_coords;
 
 uniform sampler2D niri_input;
 uniform sampler2D niri_mask;
+uniform vec4 niri_mask_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -38,7 +39,8 @@ float rand(uvec2 pixel) {
 void main() {
     vec2 uv = v_coords;
 
-    vec4 mask_sample = texture(niri_mask, uv);
+    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
+    vec4 mask_sample = texture(niri_mask, mask_uv);
     float mask = mask_sample.r;
 
     if (mask < 0.001) {
@@ -57,7 +59,7 @@ void main() {
     float slope = (1.0 - mask) * 5.0;
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
-    vec2 screen_uv = niri_window_screen_rect.xy + uv * niri_window_screen_rect.zw;
+    vec2 screen_uv = niri_window_screen_rect.xy + mask_uv * niri_window_screen_rect.zw;
     vec2 to_light = light_pos - screen_uv;
     vec2 light_dir_2d = to_light * inversesqrt(max(dot(to_light, to_light), 1e-12));
     vec3 light_dir = normalize(vec3(to_light, 0.04));

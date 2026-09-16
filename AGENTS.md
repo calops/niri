@@ -45,7 +45,7 @@ The built-in vector masks use:
 | `src/render_helpers/shaders/mod.rs` (450 lines) | `Shaders` struct, compiles built-in shaders, caches custom blur pipelines |
 | `niri-config/src/appearance.rs` | `Blur`, `BlurPart`, `ShaderPipeline`, `MaskPassPart`/`RenderPassPart` (with `kind` discriminant: `MaskPassKind`/`RenderPassKind`), `BackgroundEffect`, `BackgroundEffectRule` |
 | `src/render_helpers/background_effect.rs` | `BackgroundEffect`, `Options`, `RenderParams` — ties blur config to window/layer rendering |
-| `src/render_helpers/framebuffer_effect.rs` | `FramebufferEffect` — captures the visible framebuffer crop, normalizes subregion rectangles against that crop, runs blur, and draws exact GPU-masked outputs without expanding damage into one scissor per region rectangle |
+| `src/render_helpers/framebuffer_effect.rs` | `FramebufferEffect` — captures the visible framebuffer crop, keeps subregion masks in stable full-surface coordinates, supplies the visible mask UV crop to render passes, runs blur, and draws exact GPU-masked outputs without expanding damage into one scissor per region rectangle |
 | `src/render_helpers/effect_buffer.rs` | `EffectBuffer` — cached offscreen texture + on-demand blur (xray path) |
 | `src/render_helpers/xray.rs` | `Xray`, `XrayElement` — transparency rendering |
 | `src/handlers/background_effect.rs` | Wayland protocol handler for `ext-background-effect` blur regions |
@@ -114,7 +114,7 @@ layer-rule {
 | Uniform | Type | Slot | Description |
 |---------|------|------|-------------|
 | `niri_subregion_count` | int | — | Number of subregion rects |
-| `niri_subregion_rects` | sampler2D | TEXTURE1 | 1×N RGBA32F texture of rects in source pixels |
+| `niri_subregion_rects` | sampler2D | TEXTURE1 | Row-major RGBA32F texture of rects in source pixels. Texel `i` is at `(i % textureSize(...).x, i / textureSize(...).x)`; textures wider than `GL_MAX_TEXTURE_SIZE` wrap to additional rows. |
 | `niri_output_size` | vec2 | — | Render target size |
 | `niri_bbox_origin` | vec2 | — | Always (0,0) |
 | `niri_geo_size` | vec2 | — | Window geometry size |
@@ -135,6 +135,7 @@ Custom mask passes receive `niri_mask` (the previous mask) implicitly via TEXTUR
 | `niri_geo_size` | vec2 | — | Window geometry size |
 | `niri_corner_radius` | vec4 | — | Corner radii |
 | `niri_mask` | sampler2D | TEXTURE1 | Final mask texture |
+| `niri_mask_uv_rect` | vec4 | — | Visible input crop in full-mask UV: `(x1, y1, x2, y2)`. Sample the mask with `mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, v_coords)`. |
 | `niri_window_screen_rect` | vec4 | — | Window origin (xy) and size (zw) in screen UV |
 
 ## Rendering flow
@@ -169,12 +170,12 @@ Mask ping-pong: `mask_texture_a` and `mask_texture_b` alternate as source/destin
 ## Caching
 
 - **Custom blur programs:** `Shaders::custom_blur` is a `RefCell<HashMap<u64, Option<CustomBlurProgram>>>` — compiled lazily on first use. Failures are cached as `None`. Cleared on config reload.
-- **Final mask:** cached by compiled pipeline identity, source size, `Arc` identity of normalized subregion rectangles, geometry size, and corner radii. Exact hits skip the entire binary and mask pipeline.
-- **JFA output:** computed in bbox-local coordinates and cached by bbox size + local rect offsets. A translation cache hit re-blits the encoded texture without recomputing JFA/Poisson. When `region-vectors` is the first pass and reuses the same destination texture, only the previous bbox is cleared.
-- **Exact output clip:** custom pipelines whose final mask is binary or `region-vectors` run one final `mask_output.frag` pass. With zero post-process noise, `FramebufferEffect` draws compositor damage directly instead of expanding it to thousands of subregion scissors. Other masks, fallback pipelines, and noisy output retain CPU-side region clipping.
-- **Normalized subregions:** `FramebufferEffect` caches its normalized float rectangle vector by source `Arc`, relative offset, scale, and visible capture size. Partially offscreen effects normalize against the captured crop rather than compressing full-surface mask coordinates into the visible texture. Unchanged visible crops reuse the same `Arc`, making `Blur` mask-change detection O(1).
+- **Final mask:** cached by compiled pipeline identity, full surface mask size, `Arc` identity of normalized subregion rectangles, geometry size, and corner radii. Exact hits skip the entire binary and mask pipeline.
+- **JFA output:** computed in bbox-local full-surface coordinates and cached by bbox size + local rect offsets. A translation cache hit re-blits the encoded texture without recomputing JFA/Poisson. When `region-vectors` is the first pass and reuses the same destination texture, only the previous bbox is cleared.
+- **Exact output clip:** custom pipelines whose final mask is binary or `region-vectors` run one final `mask_output.frag` pass. The pass transforms visible input UV through `niri_mask_uv_rect` before sampling the stable full-surface mask. With zero post-process noise, `FramebufferEffect` draws compositor damage directly instead of expanding it to thousands of subregion scissors. Other masks, fallback pipelines, and noisy output retain CPU-side region clipping.
+- **Normalized subregions:** `FramebufferEffect` caches its normalized float rectangle vector by source `Arc`, relative offset, scale, and full surface size. Sliding partially offscreen effects reuse the full mask and change only `niri_mask_uv_rect`, avoiding per-frame JFA/Poisson recomputation.
 - **Mask programs:** `Blur.mask_program`, `Blur.binary_program`, `Blur.mask_output_program`, and `Blur.jfa_pipeline` are compiled once per `Blur` instance and reused.
-- **Rects texture:** 1×N RGBA32F texture (grows when rect count exceeds capacity, never shrinks). Pixel-space rectangle conversion and upload are reused across mask paths. Binary mask generation fetches one rect per instanced quad, so changing a large region costs roughly its covered fragments rather than mask pixels × rectangle count.
+- **Rects texture:** row-major RGBA32F texture (grows when rect count exceeds capacity, never shrinks) whose width is capped at `GL_MAX_TEXTURE_SIZE` and whose excess texels wrap to additional rows. Pixel-space rectangle conversion and upload are reused across mask paths. Binary mask generation fetches one rect per instanced quad, so changing a large region costs roughly its covered fragments rather than mask pixels × rectangle count.
 
 ## Error handling
 

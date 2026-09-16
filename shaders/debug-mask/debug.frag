@@ -6,6 +6,7 @@ in vec2 v_coords;
 
 uniform sampler2D niri_input;
 uniform sampler2D niri_mask;
+uniform vec4 niri_mask_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -14,7 +15,8 @@ out vec4 frag_color;
 
 void main() {
     vec2 uv = v_coords;
-    vec4 mask_sample = texture(niri_mask, uv);
+    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
+    vec4 mask_sample = texture(niri_mask, mask_uv);
     float mask = mask_sample.r;
 
     vec4 bg = texture(niri_input, uv);

@@ -18,7 +18,9 @@ const vec2 QUAD[6] = vec2[6](
 );
 
 void main() {
-    v_rect = texelFetch(niri_subregion_rects, ivec2(gl_InstanceID, 0), 0);
+    ivec2 rects_size = textureSize(niri_subregion_rects, 0);
+    ivec2 rect_coords = ivec2(gl_InstanceID % rects_size.x, gl_InstanceID / rects_size.x);
+    v_rect = texelFetch(niri_subregion_rects, rect_coords, 0);
 
     // Cover every destination pixel whose 1x1 footprint can overlap this
     // rectangle. The fragment shader computes the exact overlap fraction.
