@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project="${NIRI_BAD_APPLE_PROJECT:-$HOME/projects/wl-bad-apple}"
+binary="$project/target/release/wl-bad-apple"
+repo="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+if [[ ! -x "$binary" ]]; then
+    if [[ ! -f "$project/Cargo.toml" ]]; then
+        printf 'Bad Apple project not found at %s\n' "$project" >&2
+        exit 1
+    fi
+    command -v nix >/dev/null
+    (
+        cd "$project"
+        nix develop "$repo" --command cargo build --release
+    )
+fi
+
+nohup "$binary" </dev/null >/tmp/niri-showcase-bad-apple.log 2>&1 &

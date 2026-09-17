@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+kitty_bin="$(command -v kitty)"
+
+exec "$kitty_bin" \
+    --config NONE \
+    --class kitty \
+    --directory "$repo" \
+    --override background_opacity=0.18 \
+    --override background_blur=1 \
+    --override scrollbar=never \
+    --override hide_window_decorations=yes \
+    --override window_padding_width=12 \
+    --override confirm_os_window_close=0

@@ -6,6 +6,7 @@ in vec2 v_coords;
 
 uniform sampler2D niri_input;         // JFA result (RG = nearest exterior pixel)
 uniform sampler2D niri_poisson_u;     // R = Poisson solution u at level 0
+uniform sampler2D niri_binary;        // R = authoritative binary coverage
 uniform vec2 niri_output_size;
 uniform float niri_max_dist;          // normalization scale for the R channel
 
@@ -15,9 +16,13 @@ void main() {
     vec2 uv = v_coords;
     vec2 pixel = uv * niri_output_size;
     vec2 nearest = texture(niri_input, uv).rg;
+    float coverage = texture(niri_binary, uv).r;
 
-    if (nearest.x < 0.0) {
-        // Exterior sentinel — matches the analytical SDF path.
+    // Match the classification used by jfa_init.frag. Exterior seeds store
+    // their own coordinates in a half-float texture, so recomputing their
+    // distance can produce a small positive value rather than exact zero.
+    // That numerical residue must not turn the whole JFA bbox into coverage.
+    if (coverage < 0.5 || nearest.x < 0.0) {
         frag_color = vec4(0.0, 0.5, 0.5, 1.0);
         return;
     }

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source="${NIRI_RICKROLL_SOURCE:-https://www.youtube.com/watch?v=dQw4w9WgXcQ}"
+mpv_bin="$(command -v mpv)"
+mpv_args=(
+    --wayland-app-id=niri-rickroll
+    --title=Niri-Rickroll
+    --no-border
+    --force-window=yes
+    --keep-open=no
+)
+
+if [[ "$source" == http://* || "$source" == https://* ]] && ! command -v yt-dlp >/dev/null; then
+    command -v nix >/dev/null
+    runner=(nix shell nixpkgs#yt-dlp --command "$mpv_bin")
+else
+    runner=("$mpv_bin")
+fi
+
+nohup "${runner[@]}" "${mpv_args[@]}" "$source" \
+    </dev/null >/tmp/niri-showcase-rickroll.log 2>&1 &

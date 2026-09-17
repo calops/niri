@@ -122,9 +122,9 @@ blur {
     }
 }
 
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-circle -o scrollbar=never"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-square -o scrollbar=never"
-spawn-sh-at-startup "kitty --config NONE -o background_opacity=0.2 -o background_blur=1 --class kitty-rounded -o scrollbar=never"
+// The shader background is a quickshell layer surface covering the output.
+// -n keeps niri's config reloads from stacking extra instances.
+spawn-sh-at-startup "qs -n -p $HOME/projects/niri/shader-bg-test"
 
 binds {
   Mod+Ctrl+S          { screenshot-screen; }
@@ -171,7 +171,7 @@ binds {
   Mod+Tab             { toggle-overview; }
   Mod+L               { spawn-sh "/nix/store/763dwwp0pybvwrwn790qddk2dx7ygb5d-swaylock-effects-1.7.0.0/bin/swaylock"; }
   Mod+Plus            { set-column-width "+10%"; }
-  Mod+Return          { spawn-sh "kitty"; }
+  Mod+Return          { spawn-sh "$HOME/projects/niri/showcase/terminal"; }
   Mod+Shift+Comma     { show-hotkey-overlay; }
   Mod+Shift+E         { quit; }
   Mod+Space           { spawn-sh "shell toggleRunner \"\""; }
@@ -204,9 +204,6 @@ workspace "chat"
 workspace "games"
 workspace "misc"
 
-spawn-sh-at-startup "awww-daemon"
-spawn-sh-at-startup "awww img /nix/store/czn63ppw9mxf3wizqh6lc577ywxz86c9-wallhaven-d6j79o.png"
-
 window-rule {
   geometry-corner-radius 15.000000 15.000000 15.000000 15.000000
   clip-to-geometry true
@@ -221,9 +218,40 @@ window-rule {
   open-floating true
 }
 window-rule {
-  match app-id="^kitty"
+  match app-id="^kitty$"
+  open-floating false
+  default-column-width { proportion 0.333333; }
+  geometry-corner-radius 48 48 48 48
+  clip-to-geometry true
+  border { off; }
+  shadow {
+    on
+    softness 32
+    spread 2
+    offset x=0 y=4
+    color "#00000040"
+    inactive-color "#00000028"
+  }
+  background-effect {
+    xray false
+    blur true
+    noise 0.0
+  }
+}
+window-rule {
+  match app-id="^kitty-(circle|square|rounded)$"
   open-floating true
-  geometry-corner-radius 100 100 100 100
+  default-column-width { proportion 0.25; }
+  default-window-height { proportion 0.25; }
+  border { off; }
+  shadow {
+    on
+    softness 32
+    spread 2
+    offset x=0 y=4
+    color "#00000040"
+    inactive-color "#00000028"
+  }
   background-effect {
     xray false
     blur true
@@ -232,6 +260,7 @@ window-rule {
 }
 window-rule {
   match app-id="^kitty-circle$"
+  default-floating-position x=64 y=0 relative-to="left"
   geometry-corner-radius 1000 1000 1000 1000
   background-effect {
     shader-pipeline {
@@ -248,12 +277,31 @@ window-rule {
   geometry-corner-radius 0 0 0 0
 }
 window-rule {
+  match app-id="^kitty-rounded$"
+  geometry-corner-radius 100 100 100 100
+  default-floating-position x=64 y=0 relative-to="right"
+}
+window-rule {
+  match app-id="^niri-rickroll$"
+  open-floating true
+  default-column-width { proportion 0.32; }
+  default-window-height { proportion 0.32; }
+  default-floating-position x=64 y=64 relative-to="top-right"
+  geometry-corner-radius 28 28 28 28
+  clip-to-geometry true
+}
+window-rule {
   match title="^real$"
   open-floating true
   background-effect {
     xray false
     blur true
     noise 0.0
+    shader-pipeline {
+        mask-pass "region-vectors"
+        render-pass "dual-kawase-blur" passes=2 offset=1
+        render-pass "custom" file="shaders/overshifted3/glass.frag" scale=1.0
+    }
   }
 }
 window-rule {

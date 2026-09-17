@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+kitty_bin="$(command -v kitty)"
+blank_command='printf "\033[2J\033[H\033[?25l"; exec sleep infinity'
+
+kitty_args=(
+    --detach
+    --config NONE
+    --override background_opacity=0.18
+    --override background_blur=1
+    --override scrollbar=never
+    --override hide_window_decorations=yes
+    --override window_padding_width=0
+    --override confirm_os_window_close=0
+)
+
+"$kitty_bin" "${kitty_args[@]}" --class kitty-circle --title Circle sh -c "$blank_command"
+"$kitty_bin" "${kitty_args[@]}" --class kitty-square --title Square sh -c "$blank_command"
+"$kitty_bin" "${kitty_args[@]}" --class kitty-rounded --title Rounded sh -c "$blank_command"

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+qs_bin="$(command -v qs)"
+export NIRI_CAVA_FRAMERATE="${NIRI_CAVA_FRAMERATE:-60}"
+
+nohup "$qs_bin" -n -p "$repo/cava-test" \
+    </dev/null >/tmp/niri-showcase-cava.log 2>&1 &

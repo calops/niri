@@ -480,6 +480,7 @@ struct JfaEncodeProgram {
     program: ffi::types::GLuint,
     uniform_input: ffi::types::GLint,
     uniform_poisson_u: ffi::types::GLint,
+    uniform_binary: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_max_dist: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
@@ -827,6 +828,7 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
         program,
         uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
         uniform_poisson_u: gl.GetUniformLocation(program, c"niri_poisson_u".as_ptr()),
+        uniform_binary: gl.GetUniformLocation(program, c"niri_binary".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
@@ -1057,10 +1059,10 @@ impl Blur {
                 .iter()
                 .map(|r| {
                     [
-                        r[0] * source_size.w as f32,
-                        r[1] * source_size.h as f32,
-                        r[2] * source_size.w as f32,
-                        r[3] * source_size.h as f32,
+                        r[0] * mask_w as f32,
+                        r[1] * mask_h as f32,
+                        r[2] * mask_w as f32,
+                        r[3] * mask_h as f32,
                     ]
                 })
                 .collect();
@@ -1117,25 +1119,23 @@ impl Blur {
             .iter()
             .any(|s| matches!(s, MaskPassStep::RegionVectors));
         let mut jfa_need_alloc = false;
-        let jfa_bbox = if has_region_vectors && !options.subregion_rects.is_empty() {
-            let mut bbox = [1.0f32, 1.0f32, 0.0f32, 0.0f32];
-            for rect in options.subregion_rects.iter() {
+        let jfa_bbox = if has_region_vectors && !self.cached_rects_px.is_empty() {
+            let mut bbox = [mask_w as f32, mask_h as f32, 0.0f32, 0.0f32];
+            for rect in &self.cached_rects_px {
                 bbox[0] = bbox[0].min(rect[0]);
                 bbox[1] = bbox[1].min(rect[1]);
                 bbox[2] = bbox[2].max(rect[2]);
                 bbox[3] = bbox[3].max(rect[3]);
             }
             const EPS: f32 = 1e-4;
-            let bbx = ((bbox[0] * source_size.w as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bby = ((bbox[1] * source_size.h as f32 + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bbw = (((bbox[2] - bbox[0]) * source_size.w as f32 - EPS).ceil() as i32
-                + 2 * BBOX_BORDER)
+            let bbx = ((bbox[0] + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bby = ((bbox[1] + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bbw = ((bbox[2] - bbox[0] - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                 .max(1)
-                .min(source_size.w - bbx);
-            let bbh = (((bbox[3] - bbox[1]) * source_size.h as f32 - EPS).ceil() as i32
-                + 2 * BBOX_BORDER)
+                .min(mask_w - bbx);
+            let bbh = ((bbox[3] - bbox[1] - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                 .max(1)
-                .min(source_size.h - bby);
+                .min(mask_h - bby);
             if bbw > 0 && bbh > 0 {
                 let bbox_size = Size::new(bbw, bbh);
                 let need_alloc = match &self.jfa_textures {
@@ -1417,8 +1417,8 @@ impl Blur {
                                         bby,
                                         bbw,
                                         bbh,
-                                        source_size.w,
-                                        source_size.h,
+                                        mask_w,
+                                        mask_h,
                                         &mut self.jfa_pipeline,
                                         textures,
                                         rects_tex,
@@ -1807,8 +1807,8 @@ fn render_jfa_mask(
     bby: i32,
     bbw: i32,
     bbh: i32,
-    source_w: i32,
-    source_h: i32,
+    mask_w: i32,
+    mask_h: i32,
     jfa_pipeline: &mut Option<JfaPipeline>,
     textures: &JfaTextures,
     rects_tex: &GlesTexture,
@@ -1831,8 +1831,8 @@ fn render_jfa_mask(
                 mask_tex_id,
                 bbw,
                 bbh,
-                source_w,
-                source_h,
+                mask_w,
+                mask_h,
                 rects_px,
                 bbx,
                 bby,
@@ -1959,6 +1959,7 @@ fn render_jfa_mask(
             gl,
             &pipeline.encode_prog,
             jfa_result,
+            &textures.bin,
             poisson_u,
             encode_scratch,
             bbw,
@@ -1980,8 +1981,8 @@ fn render_jfa_mask(
             mask_tex_id,
             bbw,
             bbh,
-            source_w,
-            source_h,
+            mask_w,
+            mask_h,
             rects_px,
             bbx,
             bby,
@@ -2688,6 +2689,7 @@ unsafe fn encode_output(
     gl: &ffi::Gles2,
     prog: &JfaEncodeProgram,
     jfa: &GlesTexture,
+    binary: &GlesTexture,
     poisson_u: &GlesTexture,
     dst: &GlesTexture,
     bbw: i32,
@@ -2705,10 +2707,37 @@ unsafe fn encode_output(
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_input, 0);
     gl.Uniform1i(prog.uniform_poisson_u, 1);
+    gl.Uniform1i(prog.uniform_binary, 2);
     gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
     gl.Uniform1f(prog.uniform_max_dist, max_dist);
 
     gl.Viewport(0, 0, bbw, bbh);
+
+    // The binary mask is the authoritative interior/exterior classification.
+    // JFA coordinates are half-float and cannot reliably encode an exact
+    // zero self-distance for exterior pixels.
+    gl.ActiveTexture(ffi::TEXTURE2);
+    gl.BindTexture(ffi::TEXTURE_2D, binary.tex_id());
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
 
     // Poisson u on TEXTURE1 with NEAREST sampling for exact central
     // differences. Direction smoothing happens after normalization.
