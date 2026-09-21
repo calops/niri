@@ -8,7 +8,7 @@ use std::rc::Rc;
 use anyhow::{anyhow, Context};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{ffi, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, ImportMem, Renderer};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -236,6 +236,7 @@ pub enum RenderCursor {
 
 type TextureCache = HashMap<(CursorIcon, i32), Vec<MemoryRenderBuffer>>;
 type CoverageCache = HashMap<(CursorIcon, i32, usize), (ContextId<GlesTexture>, GlesTexture)>;
+type SdfCache = HashMap<(CursorIcon, i32, usize), (ContextId<GlesTexture>, GlesTexture)>;
 
 #[derive(Default)]
 pub struct CursorTextureCache {
@@ -243,12 +244,15 @@ pub struct CursorTextureCache {
     /// Cursor alpha coverage textures for the shader pipeline mask, keyed by
     /// icon, scale, and animation frame.
     coverage: RefCell<CoverageCache>,
+    /// Signed-distance textures (negative inside) used to morph named cursor shapes.
+    sdf: RefCell<SdfCache>,
 }
 
 impl CursorTextureCache {
     pub fn clear(&mut self) {
         self.cache.get_mut().clear();
         self.coverage.get_mut().clear();
+        self.sdf.get_mut().clear();
     }
 
     pub fn get(
@@ -309,6 +313,111 @@ impl CursorTextureCache {
             })
             .1
             .clone()
+    }
+
+    /// Get a cacheable signed-distance raster for a named cursor frame. Distances
+    /// are negative inside the alpha silhouette and positive outside, in pixels.
+    pub fn get_sdf(
+        &self,
+        renderer: &mut GlesRenderer,
+        icon: CursorIcon,
+        scale: i32,
+        cursor: &XCursor,
+        idx: usize,
+    ) -> GlesTexture {
+        let context_id = renderer.context_id();
+        self.sdf
+            .borrow_mut()
+            .entry((icon, scale, idx))
+            .and_modify(|(cached_context, texture)| {
+                if *cached_context != context_id {
+                    *texture = import_sdf(renderer, &cursor.frames()[idx]);
+                    *cached_context = context_id.clone();
+                }
+            })
+            .or_insert_with(|| (context_id, import_sdf(renderer, &cursor.frames()[idx])))
+            .1
+            .clone()
+    }
+}
+
+fn import_sdf(renderer: &mut GlesRenderer, frame: &Image) -> GlesTexture {
+    let size = (frame.width as i32, frame.height as i32).into();
+    let pixels = signed_distance_raster(
+        &frame.pixels_rgba,
+        frame.width as usize,
+        frame.height as usize,
+    );
+    let texture = renderer
+        .with_context(|gl| unsafe {
+            let mut tex = 0;
+            gl.GenTextures(1, &mut tex);
+            gl.BindTexture(ffi::TEXTURE_2D, tex);
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::R32F as i32,
+                frame.width as i32,
+                frame.height as i32,
+                0,
+                ffi::RED,
+                ffi::FLOAT,
+                pixels.as_ptr().cast(),
+            );
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            tex
+        })
+        .expect("error importing cursor SDF texture");
+    unsafe { GlesTexture::from_raw(renderer, Some(ffi::R32F), false, texture, size) }
+}
+
+/// Build a signed Euclidean-distance field from premultiplied ARGB pixels.
+/// The input is top-left origin; negative values are inside the alpha silhouette.
+fn signed_distance_raster(pixels: &[u8], width: usize, height: usize) -> Vec<f32> {
+    let inside: Vec<_> = pixels.chunks_exact(4).map(|p| p[3] >= 128).collect();
+    let mut result = vec![0.0; inside.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * width + x;
+            let want_inside = inside[i];
+            let mut nearest = f32::INFINITY;
+            for yy in 0..height {
+                for xx in 0..width {
+                    if inside[yy * width + xx] != want_inside {
+                        let dx = x as f32 - xx as f32;
+                        let dy = y as f32 - yy as f32;
+                        nearest = nearest.min((dx * dx + dy * dy).sqrt());
+                    }
+                }
+            }
+            result[i] = if want_inside { -nearest } else { nearest };
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signed_distance_raster;
+
+    #[test]
+    fn signed_distance_is_negative_inside_and_positive_outside() {
+        let pixels = [0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 0];
+        let sdf = signed_distance_raster(&pixels, 3, 1);
+        assert!(sdf[0] > 0.0);
+        assert!(sdf[1] < 0.0);
+        assert!(sdf[2] > 0.0);
     }
 }
 

@@ -1509,6 +1509,7 @@ impl State {
                 .cursor_manager
                 .reload(&config.cursor.xcursor_theme, config.cursor.xcursor_size);
             self.niri.cursor_texture_cache.clear();
+            self.niri.cursor_effect.borrow_mut().reload();
         }
 
         // We need &mut self to reload the xkb config, so just store it here.
@@ -3814,6 +3815,7 @@ impl Niri {
                     let config = self.config.borrow();
                     let pipeline = config.cursor.shader_pipeline.clone();
                     let padding = config.cursor.effect_padding as f64;
+                    let shape_transition_duration_ms = config.cursor.shape_transition_duration_ms;
                     let passes = config.blur.passes;
                     let offset = config.blur.offset;
                     drop(config);
@@ -3825,12 +3827,22 @@ impl Niri {
                         shaders::get_or_compile_custom_blur(renderer.as_gles_renderer(), pipeline)
                             .is_some()
                     });
-                    pipeline.map(|pipeline| (pipeline, padding, passes, offset))
+                    pipeline.map(|pipeline| {
+                        (
+                            pipeline,
+                            padding,
+                            shape_transition_duration_ms,
+                            passes,
+                            offset,
+                        )
+                    })
                 } else {
                     None
                 };
 
-                if let Some((pipeline, padding, passes, offset)) = effect {
+                if let Some((pipeline, padding, shape_transition_duration_ms, passes, offset)) =
+                    effect
+                {
                     let frame_size = Size::from((
                         frame.width as f64 / scale as f64,
                         frame.height as f64 / scale as f64,
@@ -3849,12 +3861,25 @@ impl Niri {
                         &cursor,
                         idx,
                     );
+                    let sdf = self.cursor_texture_cache.get_sdf(
+                        renderer.as_gles_renderer(),
+                        icon,
+                        scale,
+                        &cursor,
+                        idx,
+                    );
                     let identity =
                         cursor_frame_identity(icon, scale, idx, frame.width, frame.height);
+                    let mut named_hasher = DefaultHasher::new();
+                    icon.name().hash(&mut named_hasher);
+                    scale.hash(&mut named_hasher);
                     let coverage = CoverageMask {
                         texture,
                         bbox: geometry.coverage_bbox,
                         identity,
+                        sdf: Some(sdf),
+                        named_identity: Some(named_hasher.finish()),
+                        sdf_transition: None,
                     };
 
                     // Namespace the effect Id per output so that overlapping
@@ -3863,11 +3888,14 @@ impl Niri {
                     output.name().hash(&mut hasher);
                     let ns = Some(hasher.finish() as usize);
 
+                    let now = self.clock.now();
                     let element = self.cursor_effect.borrow_mut().render(
                         ns,
+                        now,
                         geometry,
                         output.current_scale().fractional_scale(),
                         coverage,
+                        shape_transition_duration_ms,
                         passes,
                         offset,
                         pipeline,
@@ -4751,6 +4779,10 @@ impl Niri {
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
+            state.unfinished_animations_remain |= self
+                .cursor_effect
+                .borrow()
+                .transition_active(self.clock.now());
             state.unfinished_animations_remain |= self
                 .cursor_manager
                 .is_current_cursor_animated(output.current_scale().integer_scale());

@@ -111,6 +111,23 @@ pub struct CoverageMask {
     /// mask/JFA cache key. Motion does not change it, so the expensive
     /// pipeline is only recomputed when the cursor image itself changes.
     pub identity: u64,
+    /// SDF for named cursor morphs (negative inside), when available.
+    pub sdf: Option<GlesTexture>,
+    /// Named cursor identity excluding its animation frame index.
+    pub named_identity: Option<u64>,
+    /// Optional SDF endpoints, aligned placement rects, and interpolation progress
+    /// for a named-shape morph.
+    pub sdf_transition: Option<SdfTransition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SdfTransition {
+    pub source: GlesTexture,
+    pub destination: GlesTexture,
+    /// Endpoint rectangles within the padded union canvas, in GL pixels.
+    pub source_rect: Rectangle<i32, Buffer>,
+    pub destination_rect: Rectangle<i32, Buffer>,
+    pub progress: f32,
 }
 
 impl PartialEq for CoverageMask {
@@ -452,6 +469,12 @@ struct CoverageProgram {
     uniform_coverage: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_coverage_rect: ffi::types::GLint,
+    uniform_sdf_source: ffi::types::GLint,
+    uniform_sdf_destination: ffi::types::GLint,
+    uniform_sdf_progress: ffi::types::GLint,
+    uniform_sdf_source_rect: ffi::types::GLint,
+    uniform_sdf_destination_rect: ffi::types::GLint,
+    uniform_sdf_transition: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -767,6 +790,13 @@ unsafe fn compile_coverage_program(gl: &ffi::Gles2) -> Result<CoverageProgram, G
         uniform_coverage: gl.GetUniformLocation(program, c"niri_coverage".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_coverage_rect: gl.GetUniformLocation(program, c"niri_coverage_rect".as_ptr()),
+        uniform_sdf_source: gl.GetUniformLocation(program, c"niri_sdf_source".as_ptr()),
+        uniform_sdf_destination: gl.GetUniformLocation(program, c"niri_sdf_destination".as_ptr()),
+        uniform_sdf_progress: gl.GetUniformLocation(program, c"niri_sdf_progress".as_ptr()),
+        uniform_sdf_source_rect: gl.GetUniformLocation(program, c"niri_sdf_source_rect".as_ptr()),
+        uniform_sdf_destination_rect: gl
+            .GetUniformLocation(program, c"niri_sdf_destination_rect".as_ptr()),
+        uniform_sdf_transition: gl.GetUniformLocation(program, c"niri_sdf_transition".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -3096,6 +3126,13 @@ unsafe fn render_coverage_mask(
 ) {
     gl.ActiveTexture(ffi::TEXTURE0);
     gl.BindTexture(ffi::TEXTURE_2D, coverage.texture.tex_id());
+    if let Some(transition) = &coverage.sdf_transition {
+        gl.ActiveTexture(ffi::TEXTURE2);
+        gl.BindTexture(ffi::TEXTURE_2D, transition.source.tex_id());
+        gl.ActiveTexture(ffi::TEXTURE3);
+        gl.BindTexture(ffi::TEXTURE_2D, transition.destination.tex_id());
+        gl.ActiveTexture(ffi::TEXTURE0);
+    }
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
     gl.TexParameteri(
@@ -3116,12 +3153,46 @@ unsafe fn render_coverage_mask(
         dst.tex_id(),
         0,
     );
+    debug_assert_eq!(
+        gl.CheckFramebufferStatus(ffi::DRAW_FRAMEBUFFER),
+        ffi::FRAMEBUFFER_COMPLETE
+    );
     gl.Disable(ffi::BLEND);
     gl.ClearColor(0.0, 0.0, 0.0, 0.0);
     gl.Clear(ffi::COLOR_BUFFER_BIT);
 
     gl.UseProgram(prog.program);
     gl.Uniform1i(prog.uniform_coverage, 0);
+    gl.Uniform1i(prog.uniform_sdf_source, 2);
+    gl.Uniform1i(prog.uniform_sdf_destination, 3);
+    gl.Uniform1i(
+        prog.uniform_sdf_transition,
+        i32::from(coverage.sdf_transition.is_some()),
+    );
+    gl.Uniform1f(
+        prog.uniform_sdf_progress,
+        coverage.sdf_transition.as_ref().map_or(0.0, |x| x.progress),
+    );
+    let transition_rect = |rect: Rectangle<i32, Buffer>| {
+        (
+            rect.loc.x as f32,
+            rect.loc.y as f32,
+            rect.size.w as f32,
+            rect.size.h as f32,
+        )
+    };
+    let (x, y, w, h) = coverage
+        .sdf_transition
+        .as_ref()
+        .map_or((0.0, 0.0, 0.0, 0.0), |x| transition_rect(x.source_rect));
+    gl.Uniform4f(prog.uniform_sdf_source_rect, x, y, w, h);
+    let (x, y, w, h) = coverage
+        .sdf_transition
+        .as_ref()
+        .map_or((0.0, 0.0, 0.0, 0.0), |x| {
+            transition_rect(x.destination_rect)
+        });
+    gl.Uniform4f(prog.uniform_sdf_destination_rect, x, y, w, h);
     gl.Uniform2f(prog.uniform_output_size, output_w as f32, output_h as f32);
     gl.Uniform4f(
         prog.uniform_coverage_rect,
@@ -3155,6 +3226,8 @@ unsafe fn render_coverage_mask(
         ffi::TEXTURE_WRAP_T,
         ffi::CLAMP_TO_EDGE as i32,
     );
+    gl.ActiveTexture(ffi::TEXTURE0);
+    check_gl_error(gl);
 }
 
 /// Run the full dual-Kawase down+up blur chain, writing the result

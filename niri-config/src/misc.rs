@@ -28,6 +28,8 @@ pub struct Cursor {
     /// rendered through the shader pipeline so refraction can sample the backdrop
     /// beyond the cursor's edges.
     pub effect_padding: u32,
+    /// Duration of named-cursor shape transitions, in milliseconds. Zero disables them.
+    pub shape_transition_duration_ms: u32,
     /// Custom shader pipeline applied to the cursor.
     pub shader_pipeline: Option<ShaderPipeline>,
 }
@@ -40,6 +42,7 @@ impl Default for Cursor {
             hide_when_typing: false,
             hide_after_inactive_ms: None,
             effect_padding: 32,
+            shape_transition_duration_ms: 150,
             shader_pipeline: None,
         }
     }
@@ -57,6 +60,8 @@ pub struct CursorPart {
     pub hide_after_inactive_ms: Option<u32>,
     #[knuffel(child, unwrap(argument))]
     pub effect_padding: Option<u32>,
+    #[knuffel(child, unwrap(argument))]
+    pub shape_transition_duration_ms: Option<u32>,
     #[knuffel(child)]
     pub shader_pipeline: Option<ShaderPipeline>,
 }
@@ -67,6 +72,9 @@ impl MergeWith<CursorPart> for Cursor {
         merge!((self, part), hide_when_typing);
         if let Some(x) = part.effect_padding {
             self.effect_padding = x;
+        }
+        if let Some(x) = part.shape_transition_duration_ms {
+            self.shape_transition_duration_ms = x;
         }
         merge_clone_opt!((self, part), hide_after_inactive_ms, shader_pipeline);
     }

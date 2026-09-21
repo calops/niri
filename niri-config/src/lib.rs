@@ -855,6 +855,7 @@ mod tests {
                 xcursor-size 16
                 hide-when-typing
                 hide-after-inactive-ms 3000
+                shape-transition-duration-ms 200
             }
 
             screenshot-path "~/Screenshots/screenshot.png"
@@ -1517,6 +1518,7 @@ mod tests {
                     3000,
                 ),
                 effect_padding: 32,
+                shape_transition_duration_ms: 200,
                 shader_pipeline: None,
             },
             screenshot_path: ScreenshotPath(

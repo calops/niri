@@ -105,10 +105,12 @@ layout {
 
 cursor {
     xcursor-theme "Adwaita"
-    xcursor-size 88
+    xcursor-size 66
     // Margin around the silhouette that the shader can refract the backdrop
     // from, in logical pixels.
     effect-padding 32
+    // Animate named cursor shape changes through signed-distance silhouettes.
+    shape-transition-duration-ms 150
     shader-pipeline {
         mask-pass "cursor-vectors"
         render-pass "dual-kawase-blur" passes=2 offset=1.2
