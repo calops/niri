@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -153,8 +155,12 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::{BlurOptions, CoverageMask};
+use crate::render_helpers::cursor_effect::{
+    cursor_effect_geometry, cursor_frame_identity, CursorEffect,
+};
 use crate::render_helpers::debug::push_opaque_regions;
+use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -341,6 +347,8 @@ pub struct Niri {
 
     pub cursor_manager: CursorManager,
     pub cursor_texture_cache: CursorTextureCache,
+    /// State for rendering the cursor through the shader pipeline.
+    pub cursor_effect: RefCell<CursorEffect>,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
@@ -2614,6 +2622,7 @@ impl Niri {
             xkb_from_locale1: None,
             cursor_manager,
             cursor_texture_cache: Default::default(),
+            cursor_effect: RefCell::new(CursorEffect::new()),
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
@@ -3732,6 +3741,7 @@ impl Niri {
         &self,
         renderer: &mut R,
         output: &Output,
+        allow_cursor_effect: bool,
         push: &mut dyn FnMut(PointerRenderElements<R>),
     ) {
         let _span = tracy_client::span!("Niri::render_pointer");
@@ -3749,6 +3759,19 @@ impl Niri {
         let render_cursor = self.cursor_manager.get_render_cursor(cursor_scale);
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
+
+        {
+            let cursor_kind = match &render_cursor {
+                RenderCursor::Hidden => "hidden",
+                RenderCursor::Surface { .. } => "surface",
+                RenderCursor::Named { .. } => "named",
+            };
+            trace!(
+                "render_pointer: cursor={cursor_kind} allow_effect={allow_cursor_effect} transform={:?} pipeline={}",
+                output.current_transform(),
+                self.config.borrow().cursor.shader_pipeline.is_some(),
+            );
+        }
 
         match render_cursor {
             RenderCursor::Hidden => (),
@@ -3773,22 +3796,101 @@ impl Niri {
             } => {
                 let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
                 let hotspot = XCursor::hotspot(frame).to_logical(scale);
-                let pointer_pos =
-                    (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
-                match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    pointer_pos,
-                    &texture,
-                    None,
-                    None,
-                    None,
-                    Kind::Cursor,
-                ) {
-                    Ok(element) => push(element.into()),
-                    Err(err) => {
-                        warn!("error importing a cursor texture: {err:?}");
+                // The cursor shader pipeline replaces the cursor visual
+                // entirely. Only the main output path uses it; screenshots and
+                // screencasts fall back to the plain cursor.
+                //
+                // The cursor mask uses the same placement convention as
+                // region-vectors, so it works under Normal and Flipped180
+                // (the latter is what the winit backend always uses). The
+                // quarter-turn transforms swap the mask dimensions and are not
+                // supported yet, so they fall back.
+                let transform_ok = matches!(
+                    output.current_transform(),
+                    Transform::Normal | Transform::Flipped180
+                );
+                let effect = if allow_cursor_effect && transform_ok {
+                    let config = self.config.borrow();
+                    let pipeline = config.cursor.shader_pipeline.clone();
+                    let padding = config.cursor.effect_padding as f64;
+                    let passes = config.blur.passes;
+                    let offset = config.blur.offset;
+                    drop(config);
+
+                    // Compile up front so an invalid pipeline falls back to the
+                    // plain cursor instead of the default Kawase blur, which
+                    // ignores the silhouette mask.
+                    let pipeline = pipeline.filter(|pipeline| {
+                        shaders::get_or_compile_custom_blur(renderer.as_gles_renderer(), pipeline)
+                            .is_some()
+                    });
+                    pipeline.map(|pipeline| (pipeline, padding, passes, offset))
+                } else {
+                    None
+                };
+
+                if let Some((pipeline, padding, passes, offset)) = effect {
+                    let frame_size = Size::from((
+                        frame.width as f64 / scale as f64,
+                        frame.height as f64 / scale as f64,
+                    ));
+                    let geometry = cursor_effect_geometry(
+                        pointer_pos,
+                        hotspot.to_f64(),
+                        frame_size,
+                        padding,
+                        output_scale,
+                    );
+                    let texture = self.cursor_texture_cache.get_coverage(
+                        renderer.as_gles_renderer(),
+                        icon,
+                        scale,
+                        &cursor,
+                        idx,
+                    );
+                    let identity =
+                        cursor_frame_identity(icon, scale, idx, frame.width, frame.height);
+                    let coverage = CoverageMask {
+                        texture,
+                        bbox: geometry.coverage_bbox,
+                        identity,
+                    };
+
+                    // Namespace the effect Id per output so that overlapping
+                    // outputs do not share (and thrash) one effect cache.
+                    let mut hasher = DefaultHasher::new();
+                    output.name().hash(&mut hasher);
+                    let ns = Some(hasher.finish() as usize);
+
+                    let element = self.cursor_effect.borrow_mut().render(
+                        ns,
+                        geometry,
+                        output.current_scale().fractional_scale(),
+                        coverage,
+                        passes,
+                        offset,
+                        pipeline,
+                    );
+                    push(element.into());
+                } else {
+                    let pointer_pos =
+                        (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
+
+                    let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        pointer_pos,
+                        &texture,
+                        None,
+                        None,
+                        None,
+                        Kind::Cursor,
+                    ) {
+                        Ok(element) => push(element.into()),
+                        Err(err) => {
+                            warn!("error importing a cursor texture: {err:?}");
+                        }
                     }
                 }
             }
@@ -4255,7 +4357,7 @@ impl Niri {
 
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
-            self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+            self.render_pointer(ctx.renderer, output, true, &mut |elem| push(elem.into()));
         }
 
         // Next, the screen transition texture.
@@ -5542,7 +5644,7 @@ impl Niri {
                 // show the pointer even when it's hidden through cursor {} options. The user can
                 // then toggle it in the screenshot UI as needed.
                 if self.pointer_visibility != PointerVisibility::Disabled {
-                    self.render_pointer(renderer, &output, &mut |elem| pointer.push(elem));
+                    self.render_pointer(renderer, &output, false, &mut |elem| pointer.push(elem));
                 }
 
                 let res_pointer = if pointer.is_empty() {
@@ -5644,7 +5746,7 @@ impl Niri {
                 // Pointer elements are at output-local physical coords.
                 // Relocate by -win_pos to make them window-relative.
                 let pos = win_pos.to_physical_precise_round(scale).upscale(-1);
-                self.render_pointer(renderer, output, &mut |elem| {
+                self.render_pointer(renderer, output, false, &mut |elem| {
                     let elem = RelocateRenderElement::from_element(elem, pos, Relocate::Relative);
                     elements.push(elem.into());
                 });
@@ -6546,6 +6648,7 @@ niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
+        FramebufferEffect = FramebufferEffectElement,
     }
 }
 

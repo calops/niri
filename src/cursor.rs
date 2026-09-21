@@ -8,6 +8,8 @@ use std::rc::Rc;
 use anyhow::{anyhow, Context};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::{ContextId, ImportMem, Renderer};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Physical, Point, Transform};
@@ -151,6 +153,13 @@ impl CursorManager {
 
     /// Set new cursor image provider.
     pub fn set_cursor_image(&mut self, cursor: CursorImageStatus) {
+        match &cursor {
+            CursorImageStatus::Hidden => debug!("cursor image: hidden"),
+            CursorImageStatus::Surface(_) => {
+                debug!("cursor image: client surface (cursor shader bypassed)")
+            }
+            CursorImageStatus::Named(icon) => debug!("cursor image: named {icon:?}"),
+        }
         self.current_cursor = cursor;
     }
 
@@ -226,15 +235,20 @@ pub enum RenderCursor {
 }
 
 type TextureCache = HashMap<(CursorIcon, i32), Vec<MemoryRenderBuffer>>;
+type CoverageCache = HashMap<(CursorIcon, i32, usize), (ContextId<GlesTexture>, GlesTexture)>;
 
 #[derive(Default)]
 pub struct CursorTextureCache {
     cache: RefCell<TextureCache>,
+    /// Cursor alpha coverage textures for the shader pipeline mask, keyed by
+    /// icon, scale, and animation frame.
+    coverage: RefCell<CoverageCache>,
 }
 
 impl CursorTextureCache {
     pub fn clear(&mut self) {
         self.cache.get_mut().clear();
+        self.coverage.get_mut().clear();
     }
 
     pub fn get(
@@ -265,6 +279,48 @@ impl CursorTextureCache {
             })[idx]
             .clone()
     }
+
+    /// Get the cursor frame as an alpha coverage texture for the shader
+    /// pipeline mask. Xcursor pixels are premultiplied ARGB, so the alpha
+    /// channel is the silhouette coverage. The texture is re-imported if the
+    /// renderer context changed.
+    pub fn get_coverage(
+        &self,
+        renderer: &mut GlesRenderer,
+        icon: CursorIcon,
+        scale: i32,
+        cursor: &XCursor,
+        idx: usize,
+    ) -> GlesTexture {
+        let context_id = renderer.context_id();
+        self.coverage
+            .borrow_mut()
+            .entry((icon, scale, idx))
+            .and_modify(|(cached_context, texture)| {
+                if *cached_context != context_id {
+                    let frame = &cursor.frames()[idx];
+                    *texture = import_coverage(renderer, frame);
+                    *cached_context = context_id.clone();
+                }
+            })
+            .or_insert_with(|| {
+                let frame = &cursor.frames()[idx];
+                (context_id, import_coverage(renderer, frame))
+            })
+            .1
+            .clone()
+    }
+}
+
+fn import_coverage(renderer: &mut GlesRenderer, frame: &Image) -> GlesTexture {
+    renderer
+        .import_memory(
+            &frame.pixels_rgba,
+            Fourcc::Argb8888,
+            (frame.width as i32, frame.height as i32).into(),
+            true,
+        )
+        .expect("error importing cursor coverage texture")
 }
 
 // The XCursorBuffer implementation is inspired by `wayland-rs`, thus provided under MIT license.

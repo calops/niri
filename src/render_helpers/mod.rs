@@ -30,6 +30,7 @@ pub mod background_effect;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;
+pub mod cursor_effect;
 pub mod custom_blur;
 pub mod damage;
 pub mod debug;

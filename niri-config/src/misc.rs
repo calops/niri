@@ -1,4 +1,6 @@
-use crate::appearance::{Color, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR};
+use crate::appearance::{
+    Color, ShaderPipeline, WorkspaceShadow, WorkspaceShadowPart, DEFAULT_BACKDROP_COLOR,
+};
 use crate::utils::{Flag, MergeWith};
 use crate::FloatOrInt;
 
@@ -20,6 +22,14 @@ pub struct Cursor {
     pub xcursor_size: u8,
     pub hide_when_typing: bool,
     pub hide_after_inactive_ms: Option<u32>,
+    /// Padding around the cursor silhouette's effect region, in logical pixels.
+    ///
+    /// The silhouette mask stays tight; this only widens the region captured and
+    /// rendered through the shader pipeline so refraction can sample the backdrop
+    /// beyond the cursor's edges.
+    pub effect_padding: u32,
+    /// Custom shader pipeline applied to the cursor.
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 impl Default for Cursor {
@@ -29,6 +39,8 @@ impl Default for Cursor {
             xcursor_size: 24,
             hide_when_typing: false,
             hide_after_inactive_ms: None,
+            effect_padding: 32,
+            shader_pipeline: None,
         }
     }
 }
@@ -43,13 +55,20 @@ pub struct CursorPart {
     pub hide_when_typing: Option<Flag>,
     #[knuffel(child, unwrap(argument))]
     pub hide_after_inactive_ms: Option<u32>,
+    #[knuffel(child, unwrap(argument))]
+    pub effect_padding: Option<u32>,
+    #[knuffel(child)]
+    pub shader_pipeline: Option<ShaderPipeline>,
 }
 
 impl MergeWith<CursorPart> for Cursor {
     fn merge_with(&mut self, part: &CursorPart) {
         merge_clone!((self, part), xcursor_theme, xcursor_size);
         merge!((self, part), hide_when_typing);
-        merge_clone_opt!((self, part), hide_after_inactive_ms);
+        if let Some(x) = part.effect_padding {
+            self.effect_padding = x;
+        }
+        merge_clone_opt!((self, part), hide_after_inactive_ms, shader_pipeline);
     }
 }
 

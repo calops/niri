@@ -1516,6 +1516,8 @@ mod tests {
                 hide_after_inactive_ms: Some(
                     3000,
                 ),
+                effect_padding: 32,
+                shader_pipeline: None,
             },
             screenshot_path: ScreenshotPath(
                 Some(

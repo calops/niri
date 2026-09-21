@@ -8,7 +8,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, link_program, GlesError, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
-use smithay::utils::{Buffer, Size};
+use smithay::utils::{Buffer, Rectangle, Size};
 
 use crate::render_helpers::custom_blur::{MaskPassStep, PipelineConfig, RenderPassStep};
 use crate::render_helpers::shaders::Shaders;
@@ -45,9 +45,15 @@ pub struct Blur {
     cached_mask_corner_radius: [f32; 4],
     cached_mask_pipeline: Option<Rc<CustomBlurProgramInner>>,
     cached_mask_texture_is_b: Option<bool>,
+    /// Cursor coverage identity and silhouette placement the mask was built
+    /// from. `None` when the active mask is rect-based.
+    cached_mask_coverage: Option<(u64, Rectangle<i32, Buffer>)>,
     /// Source-pixel rectangle data shared by all mask paths.
     cached_rects_px: Vec<[f32; 4]>,
     jfa_pipeline: Option<JfaPipeline>,
+    /// Compiled cursor-alpha coverage program. Reused by the source-sized
+    /// coverage mask and the bbox-local JFA seed.
+    coverage_program: Option<CoverageProgram>,
     jfa_textures: Option<JfaTextures>,
     /// Compiled instanced binary-mask program. Used by the source-sized
     /// binary mask and the bbox-local JFA input.
@@ -66,6 +72,8 @@ pub struct Blur {
     cached_jfa_rects_local: Vec<[f32; 4]>,
     cached_jfa_bbox_size: Option<(i32, i32)>,
     cached_jfa_bbox_origin: Option<(i32, i32)>,
+    /// Cursor coverage identity the bbox-local JFA output was computed for.
+    cached_jfa_coverage: Option<(u64, Rectangle<i32, Buffer>)>,
     /// Full-source mask texture that received the cached bbox-local JFA output.
     cached_jfa_mask_texture_id: Option<u32>,
 }
@@ -86,6 +94,31 @@ pub struct BlurOptions {
     /// default Kawase blur. Cached in `Shaders` keyed by a hash of the
     /// shader source strings.
     pub shader_pipeline: Option<niri_config::ShaderPipeline>,
+    /// Cursor alpha silhouette mask source. Mutually exclusive with
+    /// `subregion_rects`; when set, the JFA/Poisson mask is seeded from a
+    /// coverage texture instead of protocol region rectangles.
+    pub coverage_mask: Option<CoverageMask>,
+}
+
+/// A cursor-alpha mask source for the `cursor-vectors` mask pass.
+#[derive(Debug, Clone)]
+pub struct CoverageMask {
+    /// Cursor alpha coverage (premultiplied ARGB).
+    pub texture: GlesTexture,
+    /// Silhouette rect within the full mask, in mask pixels (GL bottom-left).
+    pub bbox: Rectangle<i32, Buffer>,
+    /// Identity of the cursor frame this texture was built from, used as the
+    /// mask/JFA cache key. Motion does not change it, so the expensive
+    /// pipeline is only recomputed when the cursor image itself changes.
+    pub identity: u64,
+}
+
+impl PartialEq for CoverageMask {
+    fn eq(&self, other: &Self) -> bool {
+        // The texture is a function of `identity`, so comparing identities
+        // (and placement) is enough and avoids requiring PartialEq on textures.
+        self.identity == other.identity && self.bbox == other.bbox
+    }
 }
 
 impl Default for BlurOptions {
@@ -100,6 +133,7 @@ impl Default for BlurOptions {
             mask_size: None,
             mask_uv_rect: [0.0, 0.0, 1.0, 1.0],
             shader_pipeline: None,
+            coverage_mask: None,
         }
     }
 }
@@ -130,6 +164,11 @@ impl BlurOptions {
         self.window_screen_rect = rect;
         self
     }
+
+    pub fn with_coverage_mask(mut self, coverage: CoverageMask) -> Self {
+        self.coverage_mask = Some(coverage);
+        self
+    }
 }
 
 impl From<niri_config::Blur> for BlurOptions {
@@ -144,6 +183,7 @@ impl From<niri_config::Blur> for BlurOptions {
             mask_size: None,
             mask_uv_rect: [0.0, 0.0, 1.0, 1.0],
             shader_pipeline: config.shader_pipeline,
+            coverage_mask: None,
         }
     }
 }
@@ -327,7 +367,9 @@ impl CustomBlurProgram {
                 let mut mask_programs = Vec::with_capacity(config.mask_passes.len());
                 for (i, step) in config.mask_passes.iter().enumerate() {
                     let prog = match step {
-                        MaskPassStep::WindowVectors | MaskPassStep::RegionVectors => None,
+                        MaskPassStep::WindowVectors
+                        | MaskPassStep::RegionVectors
+                        | MaskPassStep::CursorVectors => None,
                         MaskPassStep::Custom { source, name, .. } => {
                             Some(compile_custom_mask_pass(gl, source).with_context(|| {
                                 format!("error compiling custom mask pass {} ({:?})", i, name)
@@ -401,6 +443,15 @@ struct CustomMaskProgram {
     uniform_bbox_origin: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
+    attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct CoverageProgram {
+    program: ffi::types::GLuint,
+    uniform_coverage: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_coverage_rect: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -707,6 +758,19 @@ unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError
     })
 }
 
+unsafe fn compile_coverage_program(gl: &ffi::Gles2) -> Result<CoverageProgram, GlesError> {
+    let vert_src = include_str!("shaders/blur_custom.vert");
+    let frag_src = include_str!("shaders/mask_coverage.frag");
+    let program = unsafe { link_program(gl, vert_src, frag_src)? };
+    Ok(CoverageProgram {
+        program,
+        uniform_coverage: gl.GetUniformLocation(program, c"niri_coverage".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_coverage_rect: gl.GetUniformLocation(program, c"niri_coverage_rect".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
 unsafe fn compile_binary_program(gl: &ffi::Gles2) -> Result<JfaBinaryProgram, GlesError> {
     let vert_src = include_str!("shaders/mask_binary.vert");
     let frag_src = include_str!("shaders/mask_binary.frag");
@@ -867,8 +931,10 @@ impl Blur {
             cached_mask_corner_radius: [0.0; 4],
             cached_mask_pipeline: None,
             cached_mask_texture_is_b: None,
+            cached_mask_coverage: None,
             cached_rects_px: Vec::new(),
             jfa_pipeline: None,
+            coverage_program: None,
             jfa_textures: None,
             binary_program: None,
             rects_texture: None,
@@ -876,6 +942,7 @@ impl Blur {
             cached_jfa_rects_local: Vec::new(),
             cached_jfa_bbox_size: None,
             cached_jfa_bbox_origin: None,
+            cached_jfa_coverage: None,
             cached_jfa_mask_texture_id: None,
         })
     }
@@ -956,8 +1023,12 @@ impl Blur {
         Ok(())
     }
 
-    fn can_gpu_clip_custom_output(mask_passes: &[MaskPassStep], has_subregions: bool) -> bool {
-        has_subregions && matches!(mask_passes.last(), None | Some(MaskPassStep::RegionVectors))
+    fn can_gpu_clip_custom_output(mask_passes: &[MaskPassStep], has_exact_mask: bool) -> bool {
+        has_exact_mask
+            && matches!(
+                mask_passes.last(),
+                None | Some(MaskPassStep::RegionVectors | MaskPassStep::CursorVectors)
+            )
     }
 
     fn render_custom(
@@ -1004,10 +1075,10 @@ impl Blur {
             .copied()
             .context("custom pipeline has no render passes")?;
         let final_output_size = Size::new(final_output_w, final_output_h);
-        let mut apply_output_mask = Self::can_gpu_clip_custom_output(
-            &inner.mask_passes,
-            !options.subregion_rects.is_empty(),
-        );
+        let coverage = options.coverage_mask.as_ref();
+        let has_exact_mask = !options.subregion_rects.is_empty() || coverage.is_some();
+        let mut apply_output_mask =
+            Self::can_gpu_clip_custom_output(&inner.mask_passes, has_exact_mask);
 
         let needs_recreate = self.custom_textures.len() != pass_count
             || self
@@ -1040,6 +1111,8 @@ impl Blur {
         let mask_h = mask_size.h;
 
         let rects_changed = !Arc::ptr_eq(&self.cached_mask_rects, &options.subregion_rects);
+        let coverage_key = coverage.map(|c| (c.identity, c.bbox));
+        let coverage_changed = self.cached_mask_coverage != coverage_key;
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
         let mask_geometry_changed = self.cached_mask_geo_size != geo_size
             || self.cached_mask_corner_radius != corner_radius;
@@ -1047,8 +1120,11 @@ impl Blur {
             .cached_mask_pipeline
             .as_ref()
             .is_none_or(|cached| !Rc::ptr_eq(cached, &custom_program.0));
-        let mask_inputs_changed =
-            rects_changed || size_changed || mask_geometry_changed || pipeline_changed;
+        let mask_inputs_changed = rects_changed
+            || coverage_changed
+            || size_changed
+            || mask_geometry_changed
+            || pipeline_changed;
 
         if rects_changed
             || size_changed
@@ -1114,26 +1190,55 @@ impl Blur {
             rects_texture_changed = true;
         }
 
-        let has_region_vectors = inner
+        let uses_region_vectors = inner
             .mask_passes
             .iter()
             .any(|s| matches!(s, MaskPassStep::RegionVectors));
-        let mut jfa_need_alloc = false;
-        let jfa_bbox = if has_region_vectors && !self.cached_rects_px.is_empty() {
-            let mut bbox = [mask_w as f32, mask_h as f32, 0.0f32, 0.0f32];
+        let uses_cursor_vectors = inner
+            .mask_passes
+            .iter()
+            .any(|s| matches!(s, MaskPassStep::CursorVectors));
+        let coverage_key = if uses_cursor_vectors {
+            coverage.map(|c| (c.identity, c.bbox))
+        } else {
+            None
+        };
+
+        // The JFA/Poisson solve runs over the union of all vector-mask sources.
+        // For a cursor mask this is the tight silhouette bbox, which stays
+        // independent of the padded effect region (`mask_w`/`mask_h`).
+        let mut bbox_min_x = mask_w as f32;
+        let mut bbox_min_y = mask_h as f32;
+        let mut bbox_max_x = 0.0f32;
+        let mut bbox_max_y = 0.0f32;
+        let mut have_bbox = false;
+        if uses_region_vectors && !self.cached_rects_px.is_empty() {
             for rect in &self.cached_rects_px {
-                bbox[0] = bbox[0].min(rect[0]);
-                bbox[1] = bbox[1].min(rect[1]);
-                bbox[2] = bbox[2].max(rect[2]);
-                bbox[3] = bbox[3].max(rect[3]);
+                bbox_min_x = bbox_min_x.min(rect[0]);
+                bbox_min_y = bbox_min_y.min(rect[1]);
+                bbox_max_x = bbox_max_x.max(rect[2]);
+                bbox_max_y = bbox_max_y.max(rect[3]);
             }
+            have_bbox = true;
+        }
+        if let Some(c) = coverage_key {
+            let rect = c.1;
+            bbox_min_x = bbox_min_x.min(rect.loc.x as f32);
+            bbox_min_y = bbox_min_y.min(rect.loc.y as f32);
+            bbox_max_x = bbox_max_x.max((rect.loc.x + rect.size.w) as f32);
+            bbox_max_y = bbox_max_y.max((rect.loc.y + rect.size.h) as f32);
+            have_bbox = true;
+        }
+
+        let mut jfa_need_alloc = false;
+        let jfa_bbox = if have_bbox {
             const EPS: f32 = 1e-4;
-            let bbx = ((bbox[0] + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bby = ((bbox[1] + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bbw = ((bbox[2] - bbox[0] - EPS).ceil() as i32 + 2 * BBOX_BORDER)
+            let bbx = ((bbox_min_x + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bby = ((bbox_min_y + EPS).floor() as i32 - BBOX_BORDER).max(0);
+            let bbw = ((bbox_max_x - bbox_min_x - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                 .max(1)
                 .min(mask_w - bbx);
-            let bbh = ((bbox[3] - bbox[1] - EPS).ceil() as i32 + 2 * BBOX_BORDER)
+            let bbh = ((bbox_max_y - bbox_min_y - EPS).ceil() as i32 + 2 * BBOX_BORDER)
                 .max(1)
                 .min(mask_h - bby);
             if bbw > 0 && bbh > 0 {
@@ -1193,6 +1298,7 @@ impl Blur {
                     .collect();
                 let bbox_size = (bbw, bbh);
                 let hit = self.cached_jfa_bbox_size == Some(bbox_size)
+                    && self.cached_jfa_coverage == coverage_key
                     && self.cached_jfa_rects_local.len() == rects_local.len()
                     && self
                         .cached_jfa_rects_local
@@ -1212,12 +1318,14 @@ impl Blur {
                 self.cached_jfa_rects_local = rects_local;
                 self.cached_jfa_bbox_size = Some(bbox_size);
                 self.cached_jfa_bbox_origin = Some((bbx, bby));
+                self.cached_jfa_coverage = coverage_key;
                 hit
             }
             _ => {
                 self.cached_jfa_rects_local.clear();
                 self.cached_jfa_bbox_size = None;
                 self.cached_jfa_bbox_origin = None;
+                self.cached_jfa_coverage = None;
                 false
             }
         };
@@ -1254,7 +1362,11 @@ impl Blur {
             && self.cached_mask_texture_is_b.is_some();
         let first_mask_is_vector = matches!(
             mask_passes.first(),
-            Some(MaskPassStep::WindowVectors | MaskPassStep::RegionVectors)
+            Some(
+                MaskPassStep::WindowVectors
+                    | MaskPassStep::RegionVectors
+                    | MaskPassStep::CursorVectors
+            )
         );
 
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
@@ -1305,6 +1417,22 @@ impl Blur {
                                 );
                                 check_gl_error(gl);
                             }
+                        }
+                    } else if let Some(coverage) = coverage {
+                        // A first custom mask pass reads the source-sized
+                        // coverage mask built from the cursor silhouette.
+                        if ensure_coverage_program(gl, &mut self.coverage_program) {
+                            let prog = self.coverage_program.as_ref().unwrap();
+                            render_coverage_mask(
+                                gl,
+                                prog,
+                                coverage,
+                                mask_a,
+                                mask_w,
+                                mask_h,
+                                coverage.bbox,
+                            );
+                            check_gl_error(gl);
                         }
                     }
 
@@ -1393,43 +1521,62 @@ impl Blur {
                                 );
                             }
                         }
-                        MaskPassStep::RegionVectors => {
-                            match (
-                                jfa_bbox,
-                                self.jfa_textures.as_ref(),
-                                self.rects_texture.as_ref(),
-                            ) {
-                                (Some((bbx, bby, bbw, bbh)), Some(textures), Some(rects_tex)) => {
-                                    let mask_id = dst_mask.tex_id();
-                                    let previous_bbox = if i == 0
-                                        && self.cached_jfa_mask_texture_id == Some(mask_id)
-                                    {
-                                        jfa_cache_previous_bbox
-                                    } else {
-                                        None
+                        MaskPassStep::RegionVectors | MaskPassStep::CursorVectors => {
+                            match (jfa_bbox, self.jfa_textures.as_ref()) {
+                                (Some((bbx, bby, bbw, bbh)), Some(textures)) => {
+                                    let source = match step {
+                                        MaskPassStep::RegionVectors => self
+                                            .rects_texture
+                                            .as_ref()
+                                            .map(|rects_tex| JfaMaskSource::Rects {
+                                                rects_tex,
+                                                rects_px: &self.cached_rects_px,
+                                            }),
+                                        _ => coverage.map(|c| JfaMaskSource::Coverage {
+                                            coverage: c,
+                                            rect_local: Rectangle::new(
+                                                (c.bbox.loc.x - bbx, c.bbox.loc.y - bby).into(),
+                                                c.bbox.size,
+                                            ),
+                                        }),
                                     };
-                                    render_jfa_mask(
-                                        gl,
-                                        options,
-                                        mask_fbo,
-                                        mask_id,
-                                        bbx,
-                                        bby,
-                                        bbw,
-                                        bbh,
-                                        mask_w,
-                                        mask_h,
-                                        &mut self.jfa_pipeline,
-                                        textures,
-                                        rects_tex,
-                                        &self.cached_rects_px,
-                                        jfa_cache_hit,
-                                        previous_bbox,
-                                    );
-                                    self.cached_jfa_mask_texture_id = Some(mask_id);
+                                    match source {
+                                        Some(source) => {
+                                            let mask_id = dst_mask.tex_id();
+                                            let previous_bbox = if i == 0
+                                                && self.cached_jfa_mask_texture_id == Some(mask_id)
+                                            {
+                                                jfa_cache_previous_bbox
+                                            } else {
+                                                None
+                                            };
+                                            render_jfa_mask(
+                                                gl,
+                                                options,
+                                                mask_fbo,
+                                                mask_id,
+                                                bbx,
+                                                bby,
+                                                bbw,
+                                                bbh,
+                                                mask_w,
+                                                mask_h,
+                                                &mut self.jfa_pipeline,
+                                                textures,
+                                                source,
+                                                &mut self.coverage_program,
+                                                jfa_cache_hit,
+                                                previous_bbox,
+                                            );
+                                            self.cached_jfa_mask_texture_id = Some(mask_id);
+                                        }
+                                        None => {
+                                            warn!("vector mask pass: missing mask source");
+                                        }
+                                    }
                                 }
                                 _ => {
-                                    warn!("RegionVectors mask pass: no valid bbox/subregion rects");
+                                    warn!("vector mask pass: no valid bbox/textures");
                                 }
                             }
                         }
@@ -1538,8 +1685,10 @@ impl Blur {
                             }
                         }
                     }
-                    if !matches!(step, MaskPassStep::RegionVectors)
-                        && self.cached_jfa_mask_texture_id == Some(dst_mask.tex_id())
+                    if !matches!(
+                        step,
+                        MaskPassStep::RegionVectors | MaskPassStep::CursorVectors
+                    ) && self.cached_jfa_mask_texture_id == Some(dst_mask.tex_id())
                     {
                         self.cached_jfa_mask_texture_id = None;
                     }
@@ -1552,6 +1701,7 @@ impl Blur {
                 active_mask_is_b = self.cached_mask_texture_is_b.unwrap();
             } else {
                 self.cached_mask_rects = options.subregion_rects.clone();
+                self.cached_mask_coverage = coverage_key;
                 self.cached_mask_w = mask_w;
                 self.cached_mask_h = mask_h;
                 self.cached_mask_geo_size = geo_size;
@@ -1566,7 +1716,9 @@ impl Blur {
             if apply_output_mask {
                 apply_output_mask = match mask_passes.last() {
                     None => self.binary_program.is_some(),
-                    Some(MaskPassStep::RegionVectors) => self.jfa_pipeline.is_some(),
+                    Some(MaskPassStep::RegionVectors | MaskPassStep::CursorVectors) => {
+                        self.jfa_pipeline.is_some()
+                    }
                     Some(_) => false,
                 };
             }
@@ -1798,6 +1950,77 @@ impl Blur {
     }
 }
 
+/// Mask source for the shared JFA + Poisson vector pipeline.
+enum JfaMaskSource<'a> {
+    /// Protocol region rectangles (built-in `region-vectors`).
+    Rects {
+        rects_tex: &'a GlesTexture,
+        rects_px: &'a [[f32; 4]],
+    },
+    /// Cursor alpha silhouette (`cursor-vectors`).
+    Coverage {
+        coverage: &'a CoverageMask,
+        /// Silhouette rect in bbox-local pixels.
+        rect_local: Rectangle<i32, Buffer>,
+    },
+}
+
+/// Destination rect (in full-mask pixels) that the bbox-local encoded mask is
+/// blitted to. For rect sources this is the clamp of their union; for a
+/// coverage source it is the silhouette bbox itself.
+fn jfa_blit_dest(
+    source: &JfaMaskSource,
+    bbx: i32,
+    bby: i32,
+    bbw: i32,
+    bbh: i32,
+    mask_w: i32,
+    mask_h: i32,
+) -> Rectangle<i32, Buffer> {
+    let (fx1, fy1, fx2, fy2) = match source {
+        JfaMaskSource::Rects { rects_px, .. } => (
+            rects_px
+                .iter()
+                .map(|r| r[0] as i32)
+                .min()
+                .unwrap_or(bbx + BBOX_BORDER)
+                .max(0),
+            rects_px
+                .iter()
+                .map(|r| r[1] as i32)
+                .min()
+                .unwrap_or(bby + BBOX_BORDER)
+                .max(0),
+            rects_px
+                .iter()
+                .map(|r| r[2] as i32)
+                .max()
+                .unwrap_or(bbx + bbw - BBOX_BORDER)
+                .min(mask_w),
+            rects_px
+                .iter()
+                .map(|r| r[3] as i32)
+                .max()
+                .unwrap_or(bby + bbh - BBOX_BORDER)
+                .min(mask_h),
+        ),
+        JfaMaskSource::Coverage { coverage, .. } => {
+            let b = coverage.bbox;
+            (
+                b.loc.x.clamp(0, mask_w),
+                b.loc.y.clamp(0, mask_h),
+                (b.loc.x + b.size.w).clamp(0, mask_w),
+                (b.loc.y + b.size.h).clamp(0, mask_h),
+            )
+        }
+    };
+
+    Rectangle::new(
+        (fx1, fy1).into(),
+        ((fx2 - fx1).max(0), (fy2 - fy1).max(0)).into(),
+    )
+}
+
 fn render_jfa_mask(
     gl: &ffi::Gles2,
     options: &BlurOptions,
@@ -1811,8 +2034,8 @@ fn render_jfa_mask(
     mask_h: i32,
     jfa_pipeline: &mut Option<JfaPipeline>,
     textures: &JfaTextures,
-    rects_tex: &GlesTexture,
-    rects_px: &[[f32; 4]],
+    source: JfaMaskSource,
+    coverage_program: &mut Option<CoverageProgram>,
     cache_hit: bool,
     cache_previous_bbox: Option<(i32, i32, i32, i32)>,
 ) {
@@ -1825,18 +2048,8 @@ fn render_jfa_mask(
             }
             // textures.encoded is still valid from a previous frame
             // (bbox-local geometry hasn't changed), so we skip the JFA +
-            blit_to_mask_texture(
-                gl,
-                &textures.encoded,
-                mask_tex_id,
-                bbw,
-                bbh,
-                mask_w,
-                mask_h,
-                rects_px,
-                bbx,
-                bby,
-            );
+            let dest = jfa_blit_dest(&source, bbx, bby, bbw, bbh, mask_w, mask_h);
+            blit_to_mask_texture(gl, &textures.encoded, mask_tex_id, bbw, bbh, dest);
             gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
@@ -1863,17 +2076,30 @@ fn render_jfa_mask(
             }
         };
 
-        render_binary_mask(
-            gl,
-            &pipeline.binary_prog,
-            options,
-            &textures.bin,
-            rects_tex,
-            bbx,
-            bby,
-            bbw,
-            bbh,
-        );
+        match &source {
+            JfaMaskSource::Rects { rects_tex, .. } => {
+                render_binary_mask(
+                    gl,
+                    &pipeline.binary_prog,
+                    options,
+                    &textures.bin,
+                    rects_tex,
+                    bbx,
+                    bby,
+                    bbw,
+                    bbh,
+                );
+            }
+            JfaMaskSource::Coverage {
+                coverage,
+                rect_local,
+            } => {
+                if ensure_coverage_program(gl, coverage_program) {
+                    let prog = coverage_program.as_ref().unwrap();
+                    render_coverage_mask(gl, prog, coverage, &textures.bin, bbw, bbh, *rect_local);
+                }
+            }
+        }
         jfa_init_pass(
             gl,
             &pipeline.init_prog,
@@ -1975,18 +2201,8 @@ fn render_jfa_mask(
             bbh,
         );
 
-        blit_to_mask_texture(
-            gl,
-            &textures.encoded,
-            mask_tex_id,
-            bbw,
-            bbh,
-            mask_w,
-            mask_h,
-            rects_px,
-            bbx,
-            bby,
-        );
+        let dest = jfa_blit_dest(&source, bbx, bby, bbw, bbh, mask_w, mask_h);
+        blit_to_mask_texture(gl, &textures.encoded, mask_tex_id, bbw, bbh, dest);
 
         check_gl_error(gl);
 
@@ -2049,6 +2265,22 @@ unsafe fn clear_mask_texture_region(
     gl.ClearColor(0.0, 0.0, 0.0, 0.0);
     gl.Clear(ffi::COLOR_BUFFER_BIT);
     gl.Disable(ffi::SCISSOR_TEST);
+}
+
+unsafe fn ensure_coverage_program(
+    gl: &ffi::Gles2,
+    coverage_program: &mut Option<CoverageProgram>,
+) -> bool {
+    if coverage_program.is_none() {
+        match compile_coverage_program(gl) {
+            Ok(p) => *coverage_program = Some(p),
+            Err(err) => {
+                warn!("error compiling coverage mask shader: {err:?}");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 unsafe fn ensure_jfa_pipeline(
@@ -2814,38 +3046,8 @@ unsafe fn blit_to_mask_texture(
     mask_tex_id: ffi::types::GLuint,
     bbw: i32,
     bbh: i32,
-    source_w: i32,
-    source_h: i32,
-    rects_px: &[[f32; 4]],
-    bbx: i32,
-    bby: i32,
+    dest: Rectangle<i32, Buffer>,
 ) {
-    // Blit dest: union of region rects in source pixels (clamped to source bounds).
-    let blit_x1 = rects_px
-        .iter()
-        .map(|r| r[0] as i32)
-        .min()
-        .unwrap_or(bbx + BBOX_BORDER)
-        .max(0);
-    let blit_y1 = rects_px
-        .iter()
-        .map(|r| r[1] as i32)
-        .min()
-        .unwrap_or(bby + BBOX_BORDER)
-        .max(0);
-    let blit_x2 = rects_px
-        .iter()
-        .map(|r| r[2] as i32)
-        .max()
-        .unwrap_or(bbx + bbw - BBOX_BORDER)
-        .min(source_w);
-    let blit_y2 = rects_px
-        .iter()
-        .map(|r| r[3] as i32)
-        .max()
-        .unwrap_or(bby + bbh - BBOX_BORDER)
-        .min(source_h);
-
     let mut read_fbo = 0u32;
     gl.GenFramebuffers(1, &mut read_fbo);
     gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, read_fbo);
@@ -2870,15 +3072,89 @@ unsafe fn blit_to_mask_texture(
         BBOX_BORDER,
         bbw - BBOX_BORDER,
         bbh - BBOX_BORDER,
-        blit_x1,
-        blit_y1,
-        blit_x2,
-        blit_y2,
+        dest.loc.x,
+        dest.loc.y,
+        dest.loc.x + dest.size.w,
+        dest.loc.y + dest.size.h,
         ffi::COLOR_BUFFER_BIT,
         ffi::LINEAR,
     );
 
     gl.DeleteFramebuffers(1, &read_fbo);
+}
+
+/// Render cursor alpha coverage into `dst`, writing `R = alpha` and zero
+/// elsewhere. `rect` is the silhouette placement in `dst`-local pixels.
+unsafe fn render_coverage_mask(
+    gl: &ffi::Gles2,
+    prog: &CoverageProgram,
+    coverage: &CoverageMask,
+    dst: &GlesTexture,
+    output_w: i32,
+    output_h: i32,
+    rect: Rectangle<i32, Buffer>,
+) {
+    gl.ActiveTexture(ffi::TEXTURE0);
+    gl.BindTexture(ffi::TEXTURE_2D, coverage.texture.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+    gl.Disable(ffi::BLEND);
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(ffi::COLOR_BUFFER_BIT);
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_coverage, 0);
+    gl.Uniform2f(prog.uniform_output_size, output_w as f32, output_h as f32);
+    gl.Uniform4f(
+        prog.uniform_coverage_rect,
+        rect.loc.x as f32,
+        rect.loc.y as f32,
+        rect.size.w as f32,
+        rect.size.h as f32,
+    );
+
+    gl.Viewport(0, 0, output_w, output_h);
+    draw_fullscreen_quad(gl, prog.attrib_vert);
+
+    gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MIN_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_MAG_FILTER,
+        ffi::NEAREST as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
 }
 
 /// Run the full dual-Kawase down+up blur chain, writing the result
@@ -3286,6 +3562,10 @@ mod tests {
         assert!(Blur::can_gpu_clip_custom_output(&[], true));
         assert!(Blur::can_gpu_clip_custom_output(
             &[MaskPassStep::RegionVectors],
+            true
+        ));
+        assert!(Blur::can_gpu_clip_custom_output(
+            &[MaskPassStep::CursorVectors],
             true
         ));
         assert!(!Blur::can_gpu_clip_custom_output(

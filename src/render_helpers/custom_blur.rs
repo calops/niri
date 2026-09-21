@@ -9,6 +9,9 @@ use niri_config::{MaskPassKind, RenderPassKind};
 pub enum MaskPassStep {
     WindowVectors,
     RegionVectors,
+    /// Like `RegionVectors`, but seeded from the cursor alpha silhouette
+    /// instead of protocol region rectangles.
+    CursorVectors,
     Custom {
         name: String,
         source: String,
@@ -46,6 +49,9 @@ impl PipelineConfig {
                 MaskPassStep::RegionVectors => {
                     1u8.hash(&mut hasher);
                 }
+                MaskPassStep::CursorVectors => {
+                    3u8.hash(&mut hasher);
+                }
                 MaskPassStep::Custom { source, scale, .. } => {
                     2u8.hash(&mut hasher);
                     source.hash(&mut hasher);
@@ -81,6 +87,7 @@ pub fn resolve_pipeline(pipeline: &niri_config::ShaderPipeline) -> anyhow::Resul
         let step = match mask.kind {
             MaskPassKind::WindowVectors => MaskPassStep::WindowVectors,
             MaskPassKind::RegionVectors => MaskPassStep::RegionVectors,
+            MaskPassKind::CursorVectors => MaskPassStep::CursorVectors,
             MaskPassKind::Custom => {
                 let file = mask.file.as_deref().with_context(|| {
                     format!("mask-pass {i}: `custom` requires a `file` property")

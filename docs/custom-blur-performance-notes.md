@@ -131,6 +131,7 @@ The final mask ABI is inconsistent:
 - The binary mask stores anti-aliased coverage in R.
 - `window-vectors` stores normalized interior distance in R and a center vector in GB.
 - `region-vectors` stores normalized boundary distance in R and a scaled Poisson direction in GB.
+- `cursor-vectors` produces the same field as `region-vectors`, seeded from the cursor alpha silhouette instead of subregion rects.
 - The example render shaders treat R as a dome/depth coordinate rather than coverage.
 
 A clearer final convention would be:
@@ -158,7 +159,8 @@ Render shaders can derive center fading from R rather than relying on a hidden m
 
 ### Implemented
 
-- The source-resolution binary pass is skipped when the first mask pass is `window-vectors` or `region-vectors`.
+- The source-resolution binary pass is skipped when the first mask pass is `window-vectors`, `region-vectors`, or `cursor-vectors`. For `cursor-vectors` the binary coverage is instead sampled from `mask_coverage.frag`, seeded by the cursor alpha texture.
+- Cursor motion leaves both the silhouette identity and its placement in the padded mask unchanged, so the JFA cache hit path re-blits the encoded mask. The effect region is padded by `cursor.effect-padding` so refraction can sample the backdrop past the outline, while the mask itself stays tight.
 - The completed mask pipeline is cached by compiled pipeline identity, source size, rectangles, geometry size, and corner radii. Exact hits perform no mask GPU work.
 - Bbox-local JFA translation hits reuse the encoded field. When the JFA output texture is still its last writer, only the previous bbox is cleared before the new blit. Later ping-pong writers invalidate that ownership marker.
 - Pixel-space rectangles are converted and uploaded once per input change, then shared by binary, JFA, and custom mask paths.

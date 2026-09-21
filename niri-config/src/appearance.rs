@@ -1033,6 +1033,7 @@ impl Default for Blur {
 pub enum MaskPassKind {
     WindowVectors,
     RegionVectors,
+    CursorVectors,
     Custom,
 }
 
@@ -1041,6 +1042,7 @@ impl std::fmt::Display for MaskPassKind {
         match self {
             Self::WindowVectors => f.write_str("window-vectors"),
             Self::RegionVectors => f.write_str("region-vectors"),
+            Self::CursorVectors => f.write_str("cursor-vectors"),
             Self::Custom => f.write_str("custom"),
         }
     }
@@ -1479,5 +1481,27 @@ mod tests {
             ],
         }
         "#);
+    }
+
+    #[test]
+    fn parse_cursor_shader_pipeline() {
+        let config = Config::parse_mem(
+            r##"
+            cursor {
+                effect-padding 12
+                shader-pipeline {
+                    mask-pass "cursor-vectors"
+                    render-pass "custom" file="/path/to/glass.frag" scale=1.0
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(config.cursor.effect_padding, 12);
+        let pipeline = config.cursor.shader_pipeline.unwrap();
+        assert_eq!(pipeline.mask_passes.len(), 1);
+        assert_eq!(pipeline.mask_passes[0].kind, MaskPassKind::CursorVectors);
+        assert_eq!(pipeline.render_passes.len(), 1);
     }
 }
