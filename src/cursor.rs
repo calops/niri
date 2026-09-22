@@ -153,13 +153,6 @@ impl CursorManager {
 
     /// Set new cursor image provider.
     pub fn set_cursor_image(&mut self, cursor: CursorImageStatus) {
-        match &cursor {
-            CursorImageStatus::Hidden => debug!("cursor image: hidden"),
-            CursorImageStatus::Surface(_) => {
-                debug!("cursor image: client surface (cursor shader bypassed)")
-            }
-            CursorImageStatus::Named(icon) => debug!("cursor image: named {icon:?}"),
-        }
         self.current_cursor = cursor;
     }
 

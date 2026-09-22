@@ -34,11 +34,11 @@ const float u_refraction_strength = 1.55;
 const float u_chromatic = 0.10;
 const float u_edge_chromatic = 0.34;
 const float u_noise = 0.005;
-const float u_dark_tint = 0.10;
+const float u_interior_light_tint = 0.025;
+const float u_edge_light_tint = 0.28;
 const float u_saturation = 1.45;
 const float u_frost = 0.27;
-const vec3 u_tint_color = vec3(0.035, 0.045, 0.065);
-const vec3 u_frost_tint = vec3(0.68, 0.80, 0.96);
+const vec3 u_light_tint = vec3(0.78, 0.86, 1.0);
 
 // Fade lighting near the Poisson medial axis while retaining the full
 // direction signal for refraction. This prevents sharp lighting reversals
@@ -174,8 +174,11 @@ void main() {
     vec4 color = vec4(refracted_color, refracted_alpha) + noise * u_noise;
     color.rgb *= 1.0 + glow - rim_shadow;
     color.rgb = saturate_color(color.rgb, u_saturation);
-    color.rgb = mix(color.rgb, u_tint_color * color.a, u_dark_tint);
-    color.rgb = mix(color.rgb, u_frost_tint * color.a, u_frost * 0.32);
+
+    float edge_tint = pow(1.0 - mask, 2.5);
+    float light_tint = mix(u_interior_light_tint, u_edge_light_tint, edge_tint);
+    color.rgb = mix(color.rgb, u_light_tint * color.a, light_tint);
+
     vec3 edge_reflection_color = saturate_color(
         mix(color.rgb, vec3(color.a), 0.32),
         1.12

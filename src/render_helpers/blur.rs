@@ -105,8 +105,10 @@ pub struct BlurOptions {
 pub struct CoverageMask {
     /// Cursor alpha coverage (premultiplied ARGB).
     pub texture: GlesTexture,
-    /// Silhouette rect within the full mask, in mask pixels (GL bottom-left).
+    /// JFA solve bounds within the full mask, in mask pixels (GL bottom-left).
     pub bbox: Rectangle<i32, Buffer>,
+    /// Undeformed cursor image placement within the full mask.
+    pub coverage_rect: Rectangle<i32, Buffer>,
     /// Identity of the cursor frame this texture was built from, used as the
     /// mask/JFA cache key. Motion does not change it, so the expensive
     /// pipeline is only recomputed when the cursor image itself changes.
@@ -3210,23 +3212,35 @@ unsafe fn render_coverage_mask(
             rect.size.h as f32,
         )
     };
+    let local_rect = |full: Rectangle<i32, Buffer>| {
+        Rectangle::new(
+            (
+                full.loc.x - coverage.bbox.loc.x + rect.loc.x,
+                full.loc.y - coverage.bbox.loc.y + rect.loc.y,
+            )
+                .into(),
+            full.size,
+        )
+    };
     let (x, y, w, h) = coverage
         .sdf_transition
         .as_ref()
-        .map_or((0.0, 0.0, 0.0, 0.0), |x| transition_rect(x.source_rect));
+        .map_or((0.0, 0.0, 0.0, 0.0), |x| {
+            transition_rect(local_rect(x.source_rect))
+        });
     gl.Uniform4f(prog.uniform_sdf_source_rect, x, y, w, h);
     let (x, y, w, h) = coverage.sdf_transition.as_ref().map_or_else(
-        || transition_rect(rect),
-        |x| transition_rect(x.destination_rect),
+        || transition_rect(local_rect(coverage.coverage_rect)),
+        |x| transition_rect(local_rect(x.destination_rect)),
     );
     gl.Uniform4f(prog.uniform_sdf_destination_rect, x, y, w, h);
     gl.Uniform2f(prog.uniform_output_size, output_w as f32, output_h as f32);
     gl.Uniform4f(
         prog.uniform_coverage_rect,
-        rect.loc.x as f32,
-        rect.loc.y as f32,
-        rect.size.w as f32,
-        rect.size.h as f32,
+        local_rect(coverage.coverage_rect).loc.x as f32,
+        local_rect(coverage.coverage_rect).loc.y as f32,
+        coverage.coverage_rect.size.w as f32,
+        coverage.coverage_rect.size.h as f32,
     );
 
     gl.Viewport(0, 0, output_w, output_h);

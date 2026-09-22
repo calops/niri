@@ -105,6 +105,12 @@ impl CursorEffect {
         motion[4] = (geometry.geometry.size.h * geometry.scale.y) as f32
             - (geometry.pointer.y - geometry.origin.y) as f32;
         coverage.motion = motion;
+        if motion[2] > 0.0 {
+            coverage.bbox = Rectangle::from_size(Size::from((
+                (geometry.geometry.size.w * geometry.scale.x).round() as i32,
+                (geometry.geometry.size.h * geometry.scale.y).round() as i32,
+            )));
+        }
         coverage.identity = motion_identity(coverage.identity, coverage.motion);
         if state.last_identity != Some(coverage.identity) || coverage.sdf_transition.is_some() {
             // Intermediate progress changes the mask every frame, even when its
@@ -157,7 +163,6 @@ impl CursorEffect {
 }
 
 impl MotionState {
-    const SETTLE: Duration = Duration::from_millis(320);
     const RESPONSE: Duration = Duration::from_millis(55);
     const MAX_STRETCH: f32 = 0.35;
     const FULL_SPEED: f32 = 400.0;
@@ -169,17 +174,14 @@ impl MotionState {
         let delta = self.last_pointer.map_or([0.0; 2], |last| {
             [(pointer.x - last.x) as f32, (pointer.y - last.y) as f32]
         });
-        if dt > 0.0 && (delta[0] != 0.0 || delta[1] != 0.0) {
+        if dt > 0.0 {
             let target = [delta[0] / dt, delta[1] / dt];
-            // Low-pass the raw pointer velocity so high-resolution one-pixel
-            // deltas do not make the silhouette visibly twitch.
+            // Apply the same low-pass response to acceleration and deceleration
+            // so fast motion does not leave the silhouette stretched behind the
+            // pointer when movement slows or stops.
             let response = 1.0 - (-dt / Self::RESPONSE.as_secs_f32()).exp();
             self.velocity[0] += (target[0] - self.velocity[0]) * response;
             self.velocity[1] += (target[1] - self.velocity[1]) * response;
-        } else if dt > 0.0 {
-            let decay = (-dt / Self::SETTLE.as_secs_f32()).exp();
-            self.velocity[0] *= decay;
-            self.velocity[1] *= decay;
         }
         self.last_pointer = Some(pointer);
         self.last_at = Some(now);
@@ -197,13 +199,10 @@ impl MotionState {
         ]
     }
 
-    /// A non-zero tail requires output redraws so its deformation can settle.
-    fn active(&self, now: Duration) -> bool {
-        self.last_at.is_some_and(|then| {
-            let age = now.saturating_sub(then).as_secs_f32();
-            self.velocity[0].hypot(self.velocity[1]) * (-age / Self::SETTLE.as_secs_f32()).exp()
-                > 1.0
-        })
+    /// A non-zero filtered velocity requires output redraws so its deformation
+    /// can follow zero-velocity samples back to rest.
+    fn active(&self, _now: Duration) -> bool {
+        self.velocity[0].hypot(self.velocity[1]) > 1.0
     }
 }
 
@@ -288,6 +287,7 @@ impl CursorEffectState {
         // The JFA/coverage target is the full union canvas: both endpoint
         // contours must remain available throughout the morph.
         coverage.bbox = union.geometry.coverage_bbox;
+        coverage.coverage_rect = union.destination_rect;
         coverage.sdf_transition = Some(SdfTransition {
             source: transition.source.clone(),
             destination: transition.destination.clone(),
@@ -487,14 +487,19 @@ mod tests {
         let mut state = MotionState::default();
         let first = state.update(Point::from((0, 0)), Duration::ZERO, 1.0);
         assert_eq!(first[2], 0.0);
-        let moving = state.update(Point::from((30, 0)), Duration::from_millis(10), 1.0);
-        assert_eq!(moving[0], 1.0);
+        let moving = state.update(Point::from((3, 0)), Duration::from_millis(10), 1.0);
+        assert!((moving[0] - 1.0).abs() < 1e-5);
         assert_eq!(moving[1], 0.0);
         assert!(moving[2] > 0.0);
-        let settled = state.update(Point::from((30, 0)), Duration::from_millis(800), 1.0);
+
+        let moving_velocity = state.velocity[0];
+        let settled = state.update(Point::from((3, 0)), Duration::from_millis(20), 1.0);
+        let expected_decay = (-0.01 / MotionState::RESPONSE.as_secs_f32()).exp();
+        assert!((state.velocity[0] / moving_velocity - expected_decay).abs() < 1e-5);
         assert!(settled[2] > 0.0 && settled[2] < moving[2]);
-        assert!(state.active(Duration::from_millis(800)));
-        assert!(!state.active(Duration::from_secs(5)));
+
+        state.update(Point::from((3, 0)), Duration::from_millis(800), 1.0);
+        assert!(!state.active(Duration::from_millis(800)));
     }
 
     #[test]

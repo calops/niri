@@ -3761,19 +3761,6 @@ impl Niri {
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
-        {
-            let cursor_kind = match &render_cursor {
-                RenderCursor::Hidden => "hidden",
-                RenderCursor::Surface { .. } => "surface",
-                RenderCursor::Named { .. } => "named",
-            };
-            trace!(
-                "render_pointer: cursor={cursor_kind} allow_effect={allow_cursor_effect} transform={:?} pipeline={}",
-                output.current_transform(),
-                self.config.borrow().cursor.shader_pipeline.is_some(),
-            );
-        }
-
         match render_cursor {
             RenderCursor::Hidden => (),
             RenderCursor::Surface { surface, hotspot } => {
@@ -3884,6 +3871,7 @@ impl Niri {
                     let coverage = CoverageMask {
                         texture,
                         bbox: geometry.coverage_bbox,
+                        coverage_rect: geometry.coverage_bbox,
                         identity,
                         sdf: Some(sdf),
                         named_identity: Some(named_hasher.finish()),
