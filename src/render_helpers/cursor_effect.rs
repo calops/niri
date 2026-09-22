@@ -30,6 +30,14 @@ struct CursorEffectState {
     last_geometry: Option<CursorEffectGeometry>,
     transition: Option<CursorTransition>,
     force_transition: bool,
+    motion: MotionState,
+}
+
+#[derive(Debug, Default)]
+struct MotionState {
+    last_pointer: Option<Point<i32, Physical>>,
+    last_at: Option<Duration>,
+    velocity: [f32; 2],
 }
 
 #[derive(Debug)]
@@ -52,6 +60,7 @@ pub struct CursorEffectGeometry {
     pub geometry: Rectangle<f64, Logical>,
     pub coverage_bbox: Rectangle<i32, Buffer>,
     pointer: Point<i32, Physical>,
+    origin: Point<i32, Physical>,
     hotspot: Point<i32, Physical>,
     frame_size: Size<i32, Physical>,
     padding: i32,
@@ -72,6 +81,7 @@ impl CursorEffect {
         scale: f64,
         coverage: CoverageMask,
         shape_transition_duration_ms: u32,
+        motion_effect_strength: f64,
         passes: u8,
         offset: f64,
         pipeline: ShaderPipeline,
@@ -84,9 +94,18 @@ impl CursorEffect {
             last_geometry: None,
             transition: None,
             force_transition: false,
+            motion: MotionState::default(),
         });
-        let (geometry, coverage) =
+        let (geometry, mut coverage) =
             state.transition_coverage(coverage, geometry, now, shape_transition_duration_ms);
+        let mut motion = state
+            .motion
+            .update(geometry.pointer, now, motion_effect_strength as f32);
+        motion[3] = (geometry.pointer.x - geometry.origin.x) as f32;
+        motion[4] = (geometry.geometry.size.h * geometry.scale.y) as f32
+            - (geometry.pointer.y - geometry.origin.y) as f32;
+        coverage.motion = motion;
+        coverage.identity = motion_identity(coverage.identity, coverage.motion);
         if state.last_identity != Some(coverage.identity) || coverage.sdf_transition.is_some() {
             // Intermediate progress changes the mask every frame, even when its
             // element geometry is unchanged.
@@ -132,6 +151,58 @@ impl CursorEffect {
                 .transition
                 .as_ref()
                 .is_some_and(|transition| now < transition.started_at + transition.duration)
+                || state.motion.active(now)
+        })
+    }
+}
+
+impl MotionState {
+    const SETTLE: Duration = Duration::from_millis(320);
+    const RESPONSE: Duration = Duration::from_millis(55);
+    const MAX_STRETCH: f32 = 0.35;
+    const FULL_SPEED: f32 = 400.0;
+
+    fn update(&mut self, pointer: Point<i32, Physical>, now: Duration, strength: f32) -> [f32; 5] {
+        let dt = self
+            .last_at
+            .map_or(0.0, |then| now.saturating_sub(then).as_secs_f32());
+        let delta = self.last_pointer.map_or([0.0; 2], |last| {
+            [(pointer.x - last.x) as f32, (pointer.y - last.y) as f32]
+        });
+        if dt > 0.0 && (delta[0] != 0.0 || delta[1] != 0.0) {
+            let target = [delta[0] / dt, delta[1] / dt];
+            // Low-pass the raw pointer velocity so high-resolution one-pixel
+            // deltas do not make the silhouette visibly twitch.
+            let response = 1.0 - (-dt / Self::RESPONSE.as_secs_f32()).exp();
+            self.velocity[0] += (target[0] - self.velocity[0]) * response;
+            self.velocity[1] += (target[1] - self.velocity[1]) * response;
+        } else if dt > 0.0 {
+            let decay = (-dt / Self::SETTLE.as_secs_f32()).exp();
+            self.velocity[0] *= decay;
+            self.velocity[1] *= decay;
+        }
+        self.last_pointer = Some(pointer);
+        self.last_at = Some(now);
+        let speed = self.velocity[0].hypot(self.velocity[1]);
+        let scale = if speed > 0.01 { 1.0 / speed } else { 0.0 };
+        let stretch =
+            (strength.clamp(0.0, 1.0) * Self::MAX_STRETCH * (speed / Self::FULL_SPEED).min(1.0))
+                .max(0.0);
+        [
+            self.velocity[0] * scale,
+            -self.velocity[1] * scale,
+            stretch,
+            pointer.x as f32,
+            pointer.y as f32,
+        ]
+    }
+
+    /// A non-zero tail requires output redraws so its deformation can settle.
+    fn active(&self, now: Duration) -> bool {
+        self.last_at.is_some_and(|then| {
+            let age = now.saturating_sub(then).as_secs_f32();
+            self.velocity[0].hypot(self.velocity[1]) * (-age / Self::SETTLE.as_secs_f32()).exp()
+                > 1.0
         })
     }
 }
@@ -278,6 +349,7 @@ fn cursor_effect_geometry_physical(
         geometry: geo_phys.to_f64().to_logical(scale),
         coverage_bbox,
         pointer,
+        origin: geo_phys.loc,
         hotspot,
         frame_size,
         padding,
@@ -346,6 +418,7 @@ fn cursor_effect_union_geometry(
                 union_phys.size.h,
             ))),
             pointer,
+            origin: union_phys.loc,
             hotspot: destination.hotspot,
             frame_size: destination.frame_size,
             padding: destination.padding,
@@ -354,6 +427,17 @@ fn cursor_effect_union_geometry(
         source_rect: rect(source_silhouette),
         destination_rect: rect(destination_silhouette),
     }
+}
+
+fn motion_identity(identity: u64, motion: [f32; 5]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    for value in motion {
+        // Quantization keeps the cache stable when the damped tail is visually
+        // unchanged while still invalidating it for meaningful deformation.
+        (value * 1_000.0).round().to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn transition_identity(
@@ -397,6 +481,29 @@ pub fn cursor_frame_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_stretches_in_velocity_direction_then_settles() {
+        let mut state = MotionState::default();
+        let first = state.update(Point::from((0, 0)), Duration::ZERO, 1.0);
+        assert_eq!(first[2], 0.0);
+        let moving = state.update(Point::from((30, 0)), Duration::from_millis(10), 1.0);
+        assert_eq!(moving[0], 1.0);
+        assert_eq!(moving[1], 0.0);
+        assert!(moving[2] > 0.0);
+        let settled = state.update(Point::from((30, 0)), Duration::from_millis(800), 1.0);
+        assert!(settled[2] > 0.0 && settled[2] < moving[2]);
+        assert!(state.active(Duration::from_millis(800)));
+        assert!(!state.active(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn zero_motion_strength_disables_stretch() {
+        let mut state = MotionState::default();
+        state.update(Point::from((0, 0)), Duration::ZERO, 0.0);
+        let motion = state.update(Point::from((30, 0)), Duration::from_millis(10), 0.0);
+        assert_eq!(motion[2], 0.0);
+    }
 
     #[test]
     fn padding_widens_the_region_and_insets_the_silhouette() {

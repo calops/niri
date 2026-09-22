@@ -118,6 +118,9 @@ pub struct CoverageMask {
     /// Optional SDF endpoints, aligned placement rects, and interpolation progress
     /// for a named-shape morph.
     pub sdf_transition: Option<SdfTransition>,
+    /// Velocity direction (xy), longitudinal stretch, and hotspot position (xy)
+    /// in the mask's GL pixel coordinates.
+    pub motion: [f32; 5],
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +137,7 @@ impl PartialEq for CoverageMask {
     fn eq(&self, other: &Self) -> bool {
         // The texture is a function of `identity`, so comparing identities
         // (and placement) is enough and avoids requiring PartialEq on textures.
-        self.identity == other.identity && self.bbox == other.bbox
+        self.identity == other.identity && self.bbox == other.bbox && self.motion == other.motion
     }
 }
 
@@ -475,6 +478,9 @@ struct CoverageProgram {
     uniform_sdf_source_rect: ffi::types::GLint,
     uniform_sdf_destination_rect: ffi::types::GLint,
     uniform_sdf_transition: ffi::types::GLint,
+    uniform_sdf_available: ffi::types::GLint,
+    uniform_motion: ffi::types::GLint,
+    uniform_motion_anchor: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -797,6 +803,9 @@ unsafe fn compile_coverage_program(gl: &ffi::Gles2) -> Result<CoverageProgram, G
         uniform_sdf_destination_rect: gl
             .GetUniformLocation(program, c"niri_sdf_destination_rect".as_ptr()),
         uniform_sdf_transition: gl.GetUniformLocation(program, c"niri_sdf_transition".as_ptr()),
+        uniform_sdf_available: gl.GetUniformLocation(program, c"niri_sdf_available".as_ptr()),
+        uniform_motion: gl.GetUniformLocation(program, c"niri_motion".as_ptr()),
+        uniform_motion_anchor: gl.GetUniformLocation(program, c"niri_motion_anchor".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -3131,8 +3140,11 @@ unsafe fn render_coverage_mask(
         gl.BindTexture(ffi::TEXTURE_2D, transition.source.tex_id());
         gl.ActiveTexture(ffi::TEXTURE3);
         gl.BindTexture(ffi::TEXTURE_2D, transition.destination.tex_id());
-        gl.ActiveTexture(ffi::TEXTURE0);
+    } else if let Some(sdf) = &coverage.sdf {
+        gl.ActiveTexture(ffi::TEXTURE3);
+        gl.BindTexture(ffi::TEXTURE_2D, sdf.tex_id());
     }
+    gl.ActiveTexture(ffi::TEXTURE0);
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
     gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
     gl.TexParameteri(
@@ -3169,6 +3181,23 @@ unsafe fn render_coverage_mask(
         prog.uniform_sdf_transition,
         i32::from(coverage.sdf_transition.is_some()),
     );
+    gl.Uniform1i(
+        prog.uniform_sdf_available,
+        i32::from(coverage.sdf.is_some()),
+    );
+    gl.Uniform3f(
+        prog.uniform_motion,
+        coverage.motion[0],
+        coverage.motion[1],
+        coverage.motion[2],
+    );
+    // `rect` can be bbox-local for the JFA seed, whereas the motion anchor is
+    // expressed in the full padded mask coordinates.
+    gl.Uniform2f(
+        prog.uniform_motion_anchor,
+        coverage.motion[3] - coverage.bbox.loc.x as f32 + rect.loc.x as f32,
+        coverage.motion[4] - coverage.bbox.loc.y as f32 + rect.loc.y as f32,
+    );
     gl.Uniform1f(
         prog.uniform_sdf_progress,
         coverage.sdf_transition.as_ref().map_or(0.0, |x| x.progress),
@@ -3186,12 +3215,10 @@ unsafe fn render_coverage_mask(
         .as_ref()
         .map_or((0.0, 0.0, 0.0, 0.0), |x| transition_rect(x.source_rect));
     gl.Uniform4f(prog.uniform_sdf_source_rect, x, y, w, h);
-    let (x, y, w, h) = coverage
-        .sdf_transition
-        .as_ref()
-        .map_or((0.0, 0.0, 0.0, 0.0), |x| {
-            transition_rect(x.destination_rect)
-        });
+    let (x, y, w, h) = coverage.sdf_transition.as_ref().map_or_else(
+        || transition_rect(rect),
+        |x| transition_rect(x.destination_rect),
+    );
     gl.Uniform4f(prog.uniform_sdf_destination_rect, x, y, w, h);
     gl.Uniform2f(prog.uniform_output_size, output_w as f32, output_h as f32);
     gl.Uniform4f(

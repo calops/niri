@@ -1490,6 +1490,7 @@ mod tests {
             cursor {
                 effect-padding 12
                 shape-transition-duration-ms 75
+                motion-effect-strength 0.5
                 shader-pipeline {
                     mask-pass "cursor-vectors"
                     render-pass "custom" file="/path/to/glass.frag" scale=1.0
@@ -1501,6 +1502,7 @@ mod tests {
 
         assert_eq!(config.cursor.effect_padding, 12);
         assert_eq!(config.cursor.shape_transition_duration_ms, 75);
+        assert_eq!(config.cursor.motion_effect_strength, 0.5);
         let pipeline = config.cursor.shader_pipeline.unwrap();
         assert_eq!(pipeline.mask_passes.len(), 1);
         assert_eq!(pipeline.mask_passes[0].kind, MaskPassKind::CursorVectors);

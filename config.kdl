@@ -111,6 +111,8 @@ cursor {
     effect-padding 32
     // Animate named cursor shape changes through signed-distance silhouettes.
     shape-transition-duration-ms 150
+    // Stretch the silhouette slightly in the direction of cursor motion (0 disables).
+    motion-effect-strength 1.0
     shader-pipeline {
         mask-pass "cursor-vectors"
         render-pass "dual-kawase-blur" passes=2 offset=1.2

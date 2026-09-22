@@ -1519,6 +1519,7 @@ mod tests {
                 ),
                 effect_padding: 32,
                 shape_transition_duration_ms: 200,
+                motion_effect_strength: 1.0,
                 shader_pipeline: None,
             },
             screenshot_path: ScreenshotPath(

@@ -30,6 +30,8 @@ pub struct Cursor {
     pub effect_padding: u32,
     /// Duration of named-cursor shape transitions, in milliseconds. Zero disables them.
     pub shape_transition_duration_ms: u32,
+    /// Strength of the velocity-reactive cursor silhouette deformation. Zero disables it.
+    pub motion_effect_strength: f64,
     /// Custom shader pipeline applied to the cursor.
     pub shader_pipeline: Option<ShaderPipeline>,
 }
@@ -43,6 +45,7 @@ impl Default for Cursor {
             hide_after_inactive_ms: None,
             effect_padding: 32,
             shape_transition_duration_ms: 150,
+            motion_effect_strength: 1.0,
             shader_pipeline: None,
         }
     }
@@ -62,6 +65,8 @@ pub struct CursorPart {
     pub effect_padding: Option<u32>,
     #[knuffel(child, unwrap(argument))]
     pub shape_transition_duration_ms: Option<u32>,
+    #[knuffel(child, unwrap(argument))]
+    pub motion_effect_strength: Option<FloatOrInt<0, 1>>,
     #[knuffel(child)]
     pub shader_pipeline: Option<ShaderPipeline>,
 }
@@ -76,6 +81,7 @@ impl MergeWith<CursorPart> for Cursor {
         if let Some(x) = part.shape_transition_duration_ms {
             self.shape_transition_duration_ms = x;
         }
+        merge!((self, part), motion_effect_strength);
         merge_clone_opt!((self, part), hide_after_inactive_ms, shader_pipeline);
     }
 }

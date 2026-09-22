@@ -3816,6 +3816,7 @@ impl Niri {
                     let pipeline = config.cursor.shader_pipeline.clone();
                     let padding = config.cursor.effect_padding as f64;
                     let shape_transition_duration_ms = config.cursor.shape_transition_duration_ms;
+                    let motion_effect_strength = config.cursor.motion_effect_strength;
                     let passes = config.blur.passes;
                     let offset = config.blur.offset;
                     drop(config);
@@ -3832,6 +3833,7 @@ impl Niri {
                             pipeline,
                             padding,
                             shape_transition_duration_ms,
+                            motion_effect_strength,
                             passes,
                             offset,
                         )
@@ -3840,8 +3842,14 @@ impl Niri {
                     None
                 };
 
-                if let Some((pipeline, padding, shape_transition_duration_ms, passes, offset)) =
-                    effect
+                if let Some((
+                    pipeline,
+                    padding,
+                    shape_transition_duration_ms,
+                    motion_effect_strength,
+                    passes,
+                    offset,
+                )) = effect
                 {
                     let frame_size = Size::from((
                         frame.width as f64 / scale as f64,
@@ -3880,6 +3888,7 @@ impl Niri {
                         sdf: Some(sdf),
                         named_identity: Some(named_hasher.finish()),
                         sdf_transition: None,
+                        motion: [0.0; 5],
                     };
 
                     // Namespace the effect Id per output so that overlapping
@@ -3896,6 +3905,7 @@ impl Niri {
                         output.current_scale().fractional_scale(),
                         coverage,
                         shape_transition_duration_ms,
+                        motion_effect_strength,
                         passes,
                         offset,
                         pipeline,
