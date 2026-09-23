@@ -4,17 +4,18 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 
-// Renders the shadertoy shader in waves.frag on a fullscreen background layer surface.
+// Renders the shadertoy shader in truchet.frag on a fullscreen background layer surface.
+// waves.frag is kept as the previous wallpaper; point sourcePath at it to switch back.
 ShellRoot {
     id: root
 
     // Qt 6 ShaderEffect only accepts preprocessed .qsb shaders; compile-shader.sh runs qsb on
-    // waves.frag and the result is cached between runs.
+    // truchet.frag and the result is cached between runs.
     readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME")
         || Quickshell.env("HOME") + "/.local/state") + "/quickshell/shaders"
     readonly property string scriptPath: Qt.resolvedUrl("compile-shader.sh").toString().replace(/^file:\/\//, "")
-    readonly property string sourcePath: Qt.resolvedUrl("waves.frag").toString().replace(/^file:\/\//, "")
-    readonly property string compiledPath: root.stateDir + "/niri-waves.frag.qsb"
+    readonly property string sourcePath: Qt.resolvedUrl("truchet.frag").toString().replace(/^file:\/\//, "")
+    readonly property string compiledPath: root.stateDir + "/niri-truchet.frag.qsb"
 
     property string fragmentShaderUrl: ""
 
@@ -63,12 +64,12 @@ ShellRoot {
             mask: Region {}
 
             ShaderEffect {
-                id: waves
+                id: shader
                 anchors.fill: parent
                 visible: root.fragmentShaderUrl !== ""
                 fragmentShader: root.fragmentShaderUrl
 
-                // Uniform block order must match waves.frag's std140 block.
+                // Uniform block order must match truchet.frag's std140 block.
                 property real iTime: 0
                 property vector2d iResolution: Qt.vector2d(
                     Math.round(width * Screen.devicePixelRatio),
