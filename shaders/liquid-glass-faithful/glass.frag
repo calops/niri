@@ -65,17 +65,29 @@ float cornerRadius(vec2 p) {
 vec2 roundedRectOutward(vec2 pixel) {
     vec2 half_size = niri_geo_size * 0.5;
     vec2 p = pixel - half_size;
-    float radius = min(cornerRadius(p), min(half_size.x, half_size.y));
+    float geometry_radius = min(cornerRadius(p), min(half_size.x, half_size.y));
+
+    // A square silhouette has no radial corner field, so its exact
+    // rounded-rectangle gradient exposes a nearest-edge split from each corner.
+    // Give lighting alone enough optical rounding to move that split beyond the
+    // active glow. The mask, clipping, and refraction still use the configured
+    // geometry radius.
+    float glow_width = u_glowEdge0 * min(half_size.x, half_size.y);
+    float radius = max(geometry_radius, glow_width);
     vec2 q = abs(p) - half_size + radius;
-    vec2 outside = max(q, 0.0);
 
-    if (dot(outside, outside) > 1e-6) {
-        return normalize(outside) * sign(p);
-    }
+    // Smooth the remaining medial transition while retaining radial normals
+    // across the optically rounded corner.
+    float softness = clamp(radius * 0.25, 2.0, 12.0);
+    float x_weight = smoothstep(-softness, softness, q.x - q.y);
+    vec2 medial = normalize(vec2(x_weight, 1.0 - x_weight));
+    vec2 corner_vector = max(q, 0.0);
+    float corner_length = length(corner_vector);
+    vec2 corner = corner_length > 1e-5 ? corner_vector / corner_length : medial;
+    float corner_weight = smoothstep(0.0, softness, min(q.x, q.y));
+    vec2 local_outward = normalize(mix(medial, corner, corner_weight));
 
-    return q.x > q.y
-        ? vec2(sign(p.x), 0.0)
-        : vec2(0.0, sign(p.y));
+    return local_outward * sign(p);
 }
 
 float rand(vec2 co) {
@@ -141,7 +153,7 @@ void main() {
     // Rough Blinn-Phong reflection from the same screen-space source. This is
     // independent from the diffuse edge illumination above: the highlight
     // appears only where the curved edge normal reflects the source toward the
-    // viewer. Using the analytical radial field keeps the normal seam-free.
+    // viewer. The smoothed analytical field avoids nearest-edge ownership seams.
     vec3 surface_normal = normalize(vec3(outward * u_edgeSlope * specular_mask, 1.0));
     vec3 light_direction = normalize(vec3(to_light_field, 0.42));
     vec3 view_direction = vec3(0.0, 0.0, 1.0);
