@@ -359,7 +359,8 @@ layer-rule {
     noise 0.0
     shader-pipeline {
         mask-pass "region-vectors"
-        render-pass "dual-kawase-blur"
+        render-pass "dual-kawase-blur" passes=2 offset=2
+        render-pass "custom" file="shaders/liquid-glass-faithful/region.frag" scale=1.0
     }
   }
 }
@@ -372,8 +373,8 @@ layer-rule {
     noise 0.0
     shader-pipeline {
         mask-pass "region-vectors"
-        render-pass "dual-kawase-blur" passes=1 offset=1
-        render-pass "custom" file="shaders/prism-glass/region.frag" scale=1.0
+        render-pass "dual-kawase-blur" passes=2 offset=2
+        render-pass "custom" file="shaders/liquid-glass-faithful/region.frag" scale=1.0
     }
   }
 }

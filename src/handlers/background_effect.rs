@@ -49,9 +49,6 @@ fn recompute_blur_region(states: &SurfaceData, inner: &mut CachedBlurRegionInner
     let cached = &states.cached_state;
 
     let rects = if let Some(arc) = &mut inner.rects {
-        if Arc::strong_count(arc) > 1 {
-            debug!("cloning rects due to non-unique reference");
-        }
         arc
     } else {
         inner.rects.insert(Arc::new(Vec::new()))
