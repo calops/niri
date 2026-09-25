@@ -105,7 +105,7 @@ layout {
 
 cursor {
     xcursor-theme "Adwaita"
-    xcursor-size 66
+    xcursor-size 55
     // Margin around the silhouette that the shader can refract the backdrop
     // from, in logical pixels.
     effect-padding 32
@@ -145,7 +145,7 @@ blur {
     noise 0
     shader-pipeline {
         mask-pass "window-vectors"
-        render-pass "dual-kawase-blur" passes=2 offset=1
+        render-pass "dual-kawase-blur" passes=2 offset=2
         render-pass "custom" file="shaders/liquid-glass-faithful/glass.frag" scale=1.0
     }
 }
@@ -293,7 +293,7 @@ window-rule {
   background-effect {
     shader-pipeline {
         mask-pass "window-vectors"
-        render-pass "dual-kawase-blur" passes=2 offset=1
+        render-pass "dual-kawase-blur" passes=2 offset=2
         render-pass "custom" file="shaders/liquid-glass-faithful/glass.frag" scale=1.0
         // render-pass "custom" file="shaders/magnify/magnify.frag" scale=1.0
         // render-pass "custom" file="shaders/magnify/glass.frag" scale=1.0
