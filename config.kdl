@@ -145,7 +145,7 @@ blur {
     noise 0
     shader-pipeline {
         mask-pass "window-vectors"
-        render-pass "dual-kawase-blur" passes=2 offset=2
+        render-pass "dual-kawase-blur" passes=2 offset=3
         render-pass "custom" file="shaders/liquid-glass-faithful/glass.frag" scale=1.0
     }
 }

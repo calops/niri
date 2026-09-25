@@ -19,6 +19,9 @@ out vec4 frag_color;
 
 const float M_E = 2.718281828459045;
 
+// Physical width of the refractive and illuminated edge in source pixels.
+const float u_glassThicknessPx = 32.0;
+
 // Defaults from OverShifted/LiquidGlass. The original exposes these through
 // ImGui; keeping them literal makes this shader's transfer function identical.
 const float u_a = 0.7;
@@ -72,7 +75,7 @@ vec2 roundedRectOutward(vec2 pixel) {
     // Give lighting alone enough optical rounding to move that split beyond the
     // active glow. The mask, clipping, and refraction still use the configured
     // geometry radius.
-    float glow_width = u_glowEdge0 * min(half_size.x, half_size.y);
+    float glow_width = min(u_glassThicknessPx, min(half_size.x, half_size.y));
     float radius = max(geometry_radius, glow_width);
     vec2 q = abs(p) - half_size + radius;
 
@@ -105,12 +108,19 @@ void main() {
         return;
     }
 
+    // window-vectors normalizes distance by half the shorter geometry axis.
+    // Remap it to the original curve's domain through a fixed pixel width so
+    // differently sized windows retain the same apparent glass thickness.
+    float min_half_size = 0.5 * min(niri_geo_size.x, niri_geo_size.y);
+    float distance_px = dist * min_half_size;
+    float optical_dist = distance_px * u_glowEdge0 / u_glassThicknessPx;
+
     // The original computes p in local object coordinates, scales p radially by
     // pow(f(distance), power), then maps it back into screen space. niri's GB
     // channels give the exact vector from this fragment to the window centre,
     // so p * scale becomes uv + to_center * (1 - scale).
     vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-    float scale = pow(max(refractionCurve(dist), 0.0), u_fPower);
+    float scale = pow(max(refractionCurve(optical_dist), 0.0), u_fPower);
     float displacement = 1.0 - scale;
 
     vec2 uv_g = clamp(uv + to_center * displacement, 0.0, 1.0);
@@ -145,8 +155,8 @@ void main() {
         exp(-pow(light_distance / u_lightRadius, 2.0))
     );
     float glow = dot(outward, to_light) * light_falloff;
-    float glow_mask = smoothstep(u_glowEdge0, u_glowEdge1, dist);
-    float specular_mask = smoothstep(0.085, 0.0, dist);
+    float glow_mask = smoothstep(u_glowEdge0, u_glowEdge1, optical_dist);
+    float specular_mask = smoothstep(0.085, 0.0, optical_dist);
     float highlight = max(glow, 0.0) * glow_mask;
     float shadow = max(-glow, 0.0) * glow_mask;
 
