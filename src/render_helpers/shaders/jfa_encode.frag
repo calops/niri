@@ -8,8 +8,8 @@ uniform sampler2D niri_input;         // JFA result (RG = nearest exterior pixel
 uniform sampler2D niri_poisson_u;     // R = Poisson solution u at level 0
 uniform sampler2D niri_binary;        // R = authoritative binary coverage
 uniform vec2 niri_output_size;
-uniform float niri_max_dist;          // normalization scale for the R channel
-
+uniform float niri_max_dist;
+uniform float niri_logical_per_pixel;
 out vec4 frag_color;
 
 void main() {
@@ -22,13 +22,17 @@ void main() {
     // their own coordinates in a half-float texture, so recomputing their
     // distance can produce a small positive value rather than exact zero.
     // That numerical residue must not turn the whole JFA bbox into coverage.
-    if (coverage < 0.5 || nearest.x < 0.0) {
-        frag_color = vec4(0.0, 0.5, 0.5, 1.0);
+    if (coverage <= 0.0 || nearest.x < 0.0) {
+        frag_color = vec4(0.0);
+        return;
+    }
+    if (coverage < 0.5) {
+        frag_color = vec4(0.0, 0.0, 0.0, coverage);
         return;
     }
 
     float dc = length(nearest - pixel);
-    float mask = clamp(dc / niri_max_dist, 0.0, 1.0);
+    float normalized_distance = clamp(dc / niri_max_dist, 0.0, 1.0);
 
     // Direction: central-difference gradient of the Poisson field.
     // ∇u points INTO the interior (toward larger u); that's exactly
@@ -43,9 +47,7 @@ void main() {
     // conservative so real gradients are not hidden while tiny coarse-grid
     // residuals cannot become unit vectors.
     //
-    // Magnitude is still derived from the JFA distance field (R channel):
-    // it is maximal at boundaries and falls to zero at the centre. The
-    // confidence only fades direction; it does not alter the R channel.
+    // Confidence fades direction near medial axes; distance remains exact.
     vec2 st = 1.0 / niri_output_size;
     float r = texture(niri_poisson_u, uv + vec2(st.x, 0.0)).r;
     float l = texture(niri_poisson_u, uv - vec2(st.x, 0.0)).r;
@@ -62,8 +64,8 @@ void main() {
     float gradient_confidence = smoothstep(0.02, 0.10, normalized_gradient);
     vec2 unit_dir =
         gradient_confidence > 0.0 ? grad_raw / max(gmag, 1e-6) : vec2(0.0);
-    float magnitude = cos(mask * 1.57079632679) * 0.2;
-    vec2 dir = unit_dir * (magnitude * gradient_confidence);
+    float medial_confidence = cos(normalized_distance * 1.57079632679);
+    vec2 inward = unit_dir * (medial_confidence * gradient_confidence);
 
-    frag_color = vec4(mask, dir.x * 0.5 + 0.5, dir.y * 0.5 + 0.5, 1.0);
+    frag_color = vec4(dc * niri_logical_per_pixel, inward, coverage);
 }

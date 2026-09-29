@@ -4,41 +4,37 @@ precision highp float;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
-uniform vec2 niri_output_size;
-uniform vec2 niri_input_size;
-uniform vec2 niri_half_pixel;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 
 out vec4 frag_color;
 
 void main() {
-    vec2 uv = v_coords;
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, v_coords);
+    vec4 field = texture(niri_field, field_uv);
+    vec4 background = texture(niri_color, v_coords);
 
-    vec4 bg = texture(niri_input, uv);
-
-    if (mask < 0.001) {
-        frag_color = vec4(bg.rgb * 0.3, 1.0);
+    if (field.a <= 0.0) {
+        frag_color = vec4(background.rgb * 0.3, 1.0);
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-    float direction_magnitude = length(to_center);
-    vec3 mask_color = vec3(0.5, mask, 0.5);
+    float direction_magnitude = length(field.gb);
+    vec3 field_color = vec3(0.5, clamp(field.r / 64.0, 0.0, 1.0), 0.5);
     if (direction_magnitude > 1e-6) {
-        float angle = atan(to_center.y, to_center.x);
+        float angle = atan(field.b, field.g);
         vec3 direction_color = vec3(
             sin(angle) * 0.5 + 0.5,
-            mask,
+            clamp(field.r / 64.0, 0.0, 1.0),
             cos(angle) * 0.5 + 0.5
         );
-        float direction_visibility = smoothstep(0.0, 0.02, direction_magnitude);
-        mask_color = mix(mask_color, direction_color, direction_visibility);
+        field_color = mix(
+            field_color,
+            direction_color,
+            smoothstep(0.0, 0.02, direction_magnitude)
+        );
     }
 
-    frag_color = vec4(mask_color, 1.0);
+    frag_color = vec4(field_color, 1.0);
 }

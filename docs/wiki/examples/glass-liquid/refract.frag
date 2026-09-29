@@ -1,11 +1,10 @@
-#version 100
+#version 300 es
 precision highp float;
 
-varying vec2 v_coords;
-uniform sampler2D niri_input;
-uniform vec2 niri_input_size;
-uniform vec2 niri_output_size;
-uniform vec2 niri_geo_size;
+in vec2 v_coords;
+uniform sampler2D niri_color;
+
+out vec4 frag_color;
 
 void main() {
     vec2 center = v_coords - 0.5;
@@ -17,6 +16,5 @@ void main() {
     float distortion = 1.0 + k1 * r2 + k2 * r4;
 
     vec2 distorted = center * distortion + 0.5;
-
-    gl_FragColor = texture2D(niri_input, distorted);
+    frag_color = texture(niri_color, distorted);
 }

@@ -394,24 +394,22 @@ pub fn get_or_compile_custom_blur(
     // Cache miss: compile (needs &mut renderer), then write into the
     // cache. We re-acquire &Shaders after the compile so the borrows
     // don't overlap.
-    for (i, step) in config.mask_passes.iter().enumerate() {
-        match step {
-            crate::render_helpers::custom_blur::MaskPassStep::Custom { name, .. } => {
-                info!("custom blur pipeline has mask pass {i} ({name:?})");
-            }
-            step => {
-                info!("custom blur pipeline has mask pass {i} ({step:?})");
-            }
-        }
+    for (i, step) in config.field_passes.iter().enumerate() {
+        info!(
+            "custom blur pipeline has field shader {i} ({:?})",
+            step.name
+        );
     }
     let program = CustomBlurProgram::compile(renderer, &config)
         .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
         .ok();
 
-    info!(
-        "loaded custom blur shader with {} render passes",
-        config.render_passes.len()
-    );
+    if program.is_some() {
+        info!(
+            "loaded custom blur shader with {} render passes",
+            config.render_passes.len()
+        );
+    }
 
     Shaders::get(renderer)
         .custom_blur

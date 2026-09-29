@@ -4,7 +4,7 @@ precision highp float;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
+uniform sampler2D niri_color;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -17,15 +17,15 @@ void main() {
 
     vec4 sum = vec4(0.0);
 
-    sum += texture(niri_input, uv + vec2(-o.x * 2.0, 0.0));
-    sum += texture(niri_input, uv + vec2( o.x * 2.0, 0.0));
-    sum += texture(niri_input, uv + vec2(0.0, -o.y * 2.0));
-    sum += texture(niri_input, uv + vec2(0.0,  o.y * 2.0));
+    sum += texture(niri_color, uv + vec2(-o.x * 2.0, 0.0));
+    sum += texture(niri_color, uv + vec2( o.x * 2.0, 0.0));
+    sum += texture(niri_color, uv + vec2(0.0, -o.y * 2.0));
+    sum += texture(niri_color, uv + vec2(0.0,  o.y * 2.0));
 
-    sum += texture(niri_input, uv + vec2(-o.x,  o.y)) * 2.0;
-    sum += texture(niri_input, uv + vec2( o.x,  o.y)) * 2.0;
-    sum += texture(niri_input, uv + vec2(-o.x, -o.y)) * 2.0;
-    sum += texture(niri_input, uv + vec2( o.x, -o.y)) * 2.0;
+    sum += texture(niri_color, uv + vec2(-o.x,  o.y)) * 2.0;
+    sum += texture(niri_color, uv + vec2( o.x,  o.y)) * 2.0;
+    sum += texture(niri_color, uv + vec2(-o.x, -o.y)) * 2.0;
+    sum += texture(niri_color, uv + vec2( o.x, -o.y)) * 2.0;
 
     frag_color = sum / 12.0;
 }

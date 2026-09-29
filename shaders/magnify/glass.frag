@@ -5,9 +5,9 @@ precision highp int;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -39,27 +39,23 @@ float rand(uvec2 pixel) {
 void main() {
     vec2 uv = v_coords;
 
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, uv);
+    vec4 field = texture(niri_field, field_uv);
 
-    if (mask < 0.001) {
-        frag_color = texture(niri_input, uv);
+    if (field.a <= 0.0) {
+        frag_color = texture(niri_color, uv);
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-    float to_center_mag = length(to_center);
-    float center_fade = smoothstep(0.0, u_centerThreshold, to_center_mag);
-    vec2 unit_dir = to_center_mag > 1e-6 ? to_center / to_center_mag : vec2(0.0);
-    vec2 dir = unit_dir * center_fade;
+    float depth = clamp(field.r / 64.0, 0.0, 1.0);
+    vec2 dir = field.gb;
 
     // --- Lighting ---
 
-    float slope = (1.0 - mask) * 5.0;
+    float slope = (1.0 - depth) * 5.0;
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
-    vec2 screen_uv = niri_window_screen_rect.xy + mask_uv * niri_window_screen_rect.zw;
+    vec2 screen_uv = niri_window_screen_rect.xy + field_uv * niri_window_screen_rect.zw;
     vec2 to_light = light_pos - screen_uv;
     vec2 light_dir_2d = to_light * inversesqrt(max(dot(to_light, to_light), 1e-12));
     vec3 light_dir = normalize(vec3(to_light, 0.04));
@@ -70,7 +66,7 @@ void main() {
     float light_alignment = dot(-dir, light_dir_2d);
     float facing = max(light_alignment, 0.0);
     float away = max(-light_alignment, 0.0);
-    float edge = pow(1.0 - mask, 3.0);
+    float edge = pow(1.0 - depth, 3.0);
     float rim_light = facing * edge * 1.5;
     float rim_shadow = away * edge * 0.35;
 
@@ -78,7 +74,7 @@ void main() {
 
     // --- Compose ---
     vec4 noise = vec4(vec3(rand(uvec2(gl_FragCoord.xy)) - 0.5), 0.0);
-    vec4 color = texture(niri_input, uv) + noise * u_noise;
+    vec4 color = texture(niri_color, uv) + noise * u_noise;
     color.rgb *= 1.0 + glow - rim_shadow;
 
     frag_color = color;

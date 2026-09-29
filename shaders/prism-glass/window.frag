@@ -5,9 +5,9 @@ precision highp int;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -32,30 +32,25 @@ const vec2 light_pos = vec2(0.12, 0.67);
 
 vec4 sampleFrosted(vec2 uv, float radius) {
     vec2 step_uv = vec2(radius) / niri_input_size;
-    vec4 color = texture(niri_input, uv) * 0.4;
-    color += texture(niri_input, clamp(uv + vec2(step_uv.x, 0.0), 0.0, 1.0)) * 0.15;
-    color += texture(niri_input, clamp(uv - vec2(step_uv.x, 0.0), 0.0, 1.0)) * 0.15;
-    color += texture(niri_input, clamp(uv + vec2(0.0, step_uv.y), 0.0, 1.0)) * 0.15;
-    color += texture(niri_input, clamp(uv - vec2(0.0, step_uv.y), 0.0, 1.0)) * 0.15;
+    vec4 color = texture(niri_color, uv) * 0.4;
+    color += texture(niri_color, clamp(uv + vec2(step_uv.x, 0.0), 0.0, 1.0)) * 0.15;
+    color += texture(niri_color, clamp(uv - vec2(step_uv.x, 0.0), 0.0, 1.0)) * 0.15;
+    color += texture(niri_color, clamp(uv + vec2(0.0, step_uv.y), 0.0, 1.0)) * 0.15;
+    color += texture(niri_color, clamp(uv - vec2(0.0, step_uv.y), 0.0, 1.0)) * 0.15;
     return color;
 }
 
 void main() {
     vec2 uv = v_coords;
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, uv);
+    vec4 field = texture(niri_field, field_uv);
+    float inside = field.r;
 
-    if (mask < 0.001) {
-        frag_color = texture(niri_input, uv);
+    if (field.a <= 0.0) {
+        frag_color = texture(niri_color, uv);
         return;
     }
 
-    // window-vectors stores exact normalized interior distance in R and a
-    // globally smooth vector to the window centre in GB. Reusing that vector,
-    // as overshifted3 does, avoids all nearest-edge/Voronoi ownership seams.
-    float min_half = 0.5 * min(niri_geo_size.x, niri_geo_size.y);
-    float inside = mask * min_half;
     float width = min(bevel_width, 0.45 * min(niri_geo_size.x, niri_geo_size.y));
     float bevel_position = clamp(inside / width, 0.0, 1.0);
 
@@ -67,10 +62,8 @@ void main() {
         / sqrt(max(curve_softness + 1.0 - circle_x * circle_x, 1e-4));
     float profile = 1.0 - smoothstep(0.0, 1.0, bevel_position);
 
-    // Keep the raw center field exactly as encoded. Normalizing it would throw
-    // away its smooth magnitude and introduce a directional singularity at the
-    // centre—the seams this mask representation was designed to avoid.
-    vec2 inward_field = (mask_sample.gb - 0.5) * 2.0;
+    // The field magnitude carries confidence and fades at medial axes.
+    vec2 inward_field = field.gb;
     vec2 outward_field = -inward_field;
 
 
@@ -80,15 +73,13 @@ void main() {
     vec3 normal = normalize(vec3(outward_field * slope * 2.0, 1.0));
 
     float displacement = refraction_px * profile;
-    // Linear scaling preserves the raw field exactly. At a side rim the field
-    // magnitude is 0.5, so the factor of two reaches the requested pixel shift.
-    vec2 offset_uv = inward_field * (2.0 * displacement) / niri_input_size;
-    vec2 chroma_uv = inward_field * (2.0 * chromatic_px * profile) / niri_input_size;
+    vec2 offset_uv = inward_field * displacement / niri_input_size;
+    vec2 chroma_uv = inward_field * (chromatic_px * profile) / niri_input_size;
     vec2 refracted_uv = clamp(uv + offset_uv, 0.0, 1.0);
 
-    float red = texture(niri_input, clamp(refracted_uv - chroma_uv, 0.0, 1.0)).r;
-    vec4 center = texture(niri_input, refracted_uv);
-    float blue = texture(niri_input, clamp(refracted_uv + chroma_uv, 0.0, 1.0)).b;
+    float red = texture(niri_color, clamp(refracted_uv - chroma_uv, 0.0, 1.0)).r;
+    vec4 center = texture(niri_color, refracted_uv);
+    float blue = texture(niri_color, clamp(refracted_uv + chroma_uv, 0.0, 1.0)).b;
     vec4 softened = sampleFrosted(refracted_uv, 5.0 + 5.0 * profile);
     vec4 color = mix(vec4(red, center.g, blue, center.a), softened, frost + 0.10 * profile);
     color.rgb = mix(color.rgb, color.rgb * face_tint, 0.045);
@@ -103,7 +94,7 @@ void main() {
         * pow(profile, 0.65);
     color.rgb = mix(color.rgb, color.rgb * body_tint, clamp(body_density * 0.42, 0.0, 0.14));
 
-    vec2 screen_uv = niri_window_screen_rect.xy + mask_uv * niri_window_screen_rect.zw;
+    vec2 screen_uv = niri_window_screen_rect.xy + field_uv * niri_window_screen_rect.zw;
     vec2 to_light_2d = light_pos - screen_uv;
     float light_distance = length(to_light_2d);
     float area_light = exp(-pow(light_distance / light_radius, 2.0));
@@ -119,7 +110,7 @@ void main() {
     vec2 light_direction_2d = light_distance > 1e-5
         ? to_light_2d / light_distance
         : vec2(0.0);
-    float light_facing = clamp(dot(outward_field * 2.0, light_direction_2d), 0.0, 1.0);
+    float light_facing = clamp(dot(outward_field, light_direction_2d), 0.0, 1.0);
 
     // Three reflections describe the slab's thickness: a broad reflection over
     // the curved face, a soft shoulder near the plateau, and a narrow glint at

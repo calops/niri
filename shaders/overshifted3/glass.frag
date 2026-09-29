@@ -5,9 +5,9 @@ precision highp int;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -56,49 +56,42 @@ float rand(uvec2 pixel) {
 void main() {
     vec2 uv = v_coords;
 
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, uv);
+    vec4 field = texture(niri_field, field_uv);
 
-    if (mask < 0.001) {
-        frag_color = texture(niri_input, uv);
+    if (field.a <= 0.0) {
+        frag_color = texture(niri_color, uv);
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-
-    // Fade the lighting direction before constructing the nonlinear
-    // specular normal so medial-axis noise cannot become a full-strength
-    // highlight. Refraction still uses the full encoded vector.
-    float to_center_mag = length(to_center);
-    float center_fade = smoothstep(0.0, u_centerThreshold, to_center_mag);
-    vec2 unit_dir = to_center_mag > 1e-6 ? to_center / to_center_mag : vec2(0.0);
-    vec2 dir = unit_dir * center_fade;
+    float depth = clamp(field.r / 64.0, 0.0, 1.0);
+    vec2 inward = field.gb;
+    vec2 dir = inward;
 
     // --- Chromatic refraction ---
-    float base = max(f(mask), 0.0);
+    float base = max(f(depth), 0.0);
     float base_warp = pow(base, u_fPower);
     float warp_r = pow(base, u_fPower * (1.0 - u_chromatic));
     float warp_b = pow(base, u_fPower * (1.0 + u_chromatic));
 
-    vec2 uv_r = clamp(uv + to_center * (1.0 - warp_r), 0.0, 1.0);
-    vec2 uv_g = clamp(uv + to_center * (1.0 - base_warp), 0.0, 1.0);
-    vec2 uv_b = clamp(uv + to_center * (1.0 - warp_b), 0.0, 1.0);
+    vec2 uv_r = clamp(uv + inward * (1.0 - warp_r) * 64.0 / niri_input_size, 0.0, 1.0);
+    vec2 uv_g = clamp(uv + inward * (1.0 - base_warp) * 64.0 / niri_input_size, 0.0, 1.0);
+    vec2 uv_b = clamp(uv + inward * (1.0 - warp_b) * 64.0 / niri_input_size, 0.0, 1.0);
 
-    float cr = texture(niri_input, uv_r).r;
-    vec4 green_alpha_sample = texture(niri_input, uv_g);
+    float cr = texture(niri_color, uv_r).r;
+    vec4 green_alpha_sample = texture(niri_color, uv_g);
     float cg = green_alpha_sample.g;
-    float cb = texture(niri_input, uv_b).b;
+    float cb = texture(niri_color, uv_b).b;
     float ca = green_alpha_sample.a;
 
     // --- Lighting ---
 
     // Surface normal from dome curvature.
-    float slope = (1.0 - mask) * 5.0;
+    float slope = (1.0 - depth) * 5.0;
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
     // Point light grazing from the configured light position.
-    vec2 screen_uv = niri_window_screen_rect.xy + mask_uv * niri_window_screen_rect.zw;
+    vec2 screen_uv = niri_window_screen_rect.xy + field_uv * niri_window_screen_rect.zw;
     vec2 to_light = light_pos - screen_uv;
     vec2 light_dir_2d = to_light * inversesqrt(max(dot(to_light, to_light), 1e-12));
     vec3 light_dir = normalize(vec3(to_light, 0.04));
@@ -113,7 +106,7 @@ void main() {
     float light_alignment = dot(-dir, light_dir_2d);
     float facing = max(light_alignment, 0.0);
     float away = max(-light_alignment, 0.0);
-    float edge = pow(1.0 - mask, 3.0);
+    float edge = pow(1.0 - depth, 3.0);
     float rim_light = facing * edge * 1.5;
     float rim_shadow = away * edge * 0.35;
 

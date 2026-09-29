@@ -5,9 +5,9 @@ precision highp int;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -68,12 +68,11 @@ float rand(uvec2 pixel) {
 void main() {
     vec2 uv = v_coords;
 
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, uv);
+    vec4 field = texture(niri_field, field_uv);
 
-    if (mask < 0.001) {
-        frag_color = texture(niri_input, uv);
+    if (field.a <= 0.0) {
+        frag_color = texture(niri_color, uv);
         return;
     }
 
@@ -91,10 +90,10 @@ void main() {
     // --- Chromatic aberration ---
     float ca = u_chromatic * dist;
 
-    vec4 center_sample = texture(niri_input, warped);
-    float cr = texture(niri_input, warped + vec2(ca, 0.0)).r;
+    vec4 center_sample = texture(niri_color, warped);
+    float cr = texture(niri_color, warped + vec2(ca, 0.0)).r;
     float cg = center_sample.g;
-    float cb = texture(niri_input, warped - vec2(ca, 0.0)).b;
+    float cb = texture(niri_color, warped - vec2(ca, 0.0)).b;
     float ca_val = center_sample.a;
 
     vec4 color = vec4(cr, cg, cb, ca_val);
@@ -103,10 +102,10 @@ void main() {
     vec4 bloom = vec4(0.0);
     float bloom_kernel = 4.0 / niri_output_size.y;
     bloom += center_sample * 0.5;
-    bloom += texture(niri_input, warped + vec2(bloom_kernel, 0.0)) * 0.125;
-    bloom += texture(niri_input, warped - vec2(bloom_kernel, 0.0)) * 0.125;
-    bloom += texture(niri_input, warped + vec2(0.0, bloom_kernel)) * 0.125;
-    bloom += texture(niri_input, warped - vec2(0.0, bloom_kernel)) * 0.125;
+    bloom += texture(niri_color, warped + vec2(bloom_kernel, 0.0)) * 0.125;
+    bloom += texture(niri_color, warped - vec2(bloom_kernel, 0.0)) * 0.125;
+    bloom += texture(niri_color, warped + vec2(0.0, bloom_kernel)) * 0.125;
+    bloom += texture(niri_color, warped - vec2(0.0, bloom_kernel)) * 0.125;
     color.rgb += bloom.rgb * u_bloomStrength;
 
     float row_period = mod(floor(gl_FragCoord.y), 2.0);

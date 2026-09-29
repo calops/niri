@@ -3789,11 +3789,11 @@ impl Niri {
                 // entirely. Only the main output path uses it; screenshots and
                 // screencasts fall back to the plain cursor.
                 //
-                // The cursor mask uses the same placement convention as
-                // region-vectors, so it works under Normal and Flipped180
-                // (the latter is what the winit backend always uses). The
-                // quarter-turn transforms swap the mask dimensions and are not
-                // supported yet, so they fall back.
+                // The cursor field uses the same stable full-surface placement
+                // convention as region fields, so it works under Normal and
+                // Flipped180 (the latter is what the winit backend always
+                // uses). Quarter-turn transforms swap the field dimensions and
+                // are not supported yet, so they fall back.
                 let transform_ok = matches!(
                     output.current_transform(),
                     Transform::Normal | Transform::Flipped180

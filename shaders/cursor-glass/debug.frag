@@ -1,11 +1,10 @@
 #version 300 es
 
-// Debug render pass: paints solid magenta. With a `cursor-vectors` mask pass
-// the exact GPU clip leaves only the cursor silhouette visible, so if you see a
-// magenta arrow the effect path, the coverage mask, and the output clip all
-// work. If you see the plain themed cursor instead, the effect path was not
-// taken (client surface cursor or pipeline fallback). If you see nothing, the
-// mask is empty.
+// Debug render pass: paints solid magenta. The automatic cursor field's exact
+// GPU clip leaves only the cursor silhouette visible, so a magenta arrow proves
+// the effect path, coverage field, and output clip all ran. A plain themed
+// cursor means the effect path was not taken (client surface cursor or pipeline
+// fallback); no cursor means the field is empty.
 
 precision highp float;
 

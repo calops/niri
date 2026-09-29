@@ -1,2 +1,1 @@
-mask-pass "region-vectors"
-render-pass "custom" file="viz.frag" scale=1.0
+shader "viz.frag"

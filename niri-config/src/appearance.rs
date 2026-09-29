@@ -1029,58 +1029,14 @@ impl Default for Blur {
     }
 }
 
-#[derive(knuffel::DecodeScalar, Debug, Clone, PartialEq)]
-pub enum MaskPassKind {
-    WindowVectors,
-    RegionVectors,
-    CursorVectors,
-    Custom,
-}
-
-impl std::fmt::Display for MaskPassKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WindowVectors => f.write_str("window-vectors"),
-            Self::RegionVectors => f.write_str("region-vectors"),
-            Self::CursorVectors => f.write_str("cursor-vectors"),
-            Self::Custom => f.write_str("custom"),
-        }
-    }
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct FieldShaderPart {
+    #[knuffel(argument)]
+    pub file: String,
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct MaskPassPart {
-    #[knuffel(argument)]
-    pub kind: MaskPassKind,
-    #[knuffel(property)]
-    pub file: Option<String>,
-    #[knuffel(property, default = 1.0)]
-    pub scale: f32,
-}
-
-#[derive(knuffel::DecodeScalar, Debug, Clone, PartialEq)]
-pub enum RenderPassKind {
-    DualKawaseBlur,
-    Custom,
-}
-
-impl std::fmt::Display for RenderPassKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DualKawaseBlur => f.write_str("dual-kawase-blur"),
-            Self::Custom => f.write_str("custom"),
-        }
-    }
-}
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct RenderPassPart {
-    #[knuffel(argument)]
-    pub kind: RenderPassKind,
-    #[knuffel(property)]
-    pub file: Option<String>,
-    #[knuffel(property, default = 1.0)]
-    pub scale: f32,
+pub struct BlurPassPart {
     #[knuffel(property)]
     pub passes: Option<u8>,
     #[knuffel(property)]
@@ -1088,11 +1044,26 @@ pub struct RenderPassPart {
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct ShaderPassPart {
+    #[knuffel(argument)]
+    pub file: String,
+    #[knuffel(property, default = 1.0)]
+    pub scale: f32,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub enum ShaderPipelineStage {
+    FieldShader(FieldShaderPart),
+    Blur(BlurPassPart),
+    Shader(ShaderPassPart),
+}
+
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct ShaderPipeline {
-    #[knuffel(children(name = "mask-pass"))]
-    pub mask_passes: Vec<MaskPassPart>,
-    #[knuffel(children(name = "render-pass"))]
-    pub render_passes: Vec<RenderPassPart>,
+    #[knuffel(property)]
+    pub version: u8,
+    #[knuffel(children)]
+    pub stages: Vec<ShaderPipelineStage>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
@@ -1431,11 +1402,10 @@ mod tests {
         let pipeline = Config::parse_mem(
             r##"
             blur {
-                shader-pipeline {
-                    mask-pass "window-vectors"
-                    mask-pass "custom" file="/path/to/mask.frag" scale=0.5
-                    render-pass "dual-kawase-blur"
-                    render-pass "custom" file="/path/to/pass1.frag" scale=1.0
+                shader-pipeline version=1 {
+                    field-shader "/path/to/field.frag"
+                    blur passes=2 offset=1.5
+                    shader "/path/to/pass1.frag" scale=0.5
                 }
             }
             "##,
@@ -1447,37 +1417,31 @@ mod tests {
 
         assert_debug_snapshot!(pipeline, @r#"
         ShaderPipeline {
-            mask_passes: [
-                MaskPassPart {
-                    kind: WindowVectors,
-                    file: None,
-                    scale: 1.0,
-                },
-                MaskPassPart {
-                    kind: Custom,
-                    file: Some(
-                        "/path/to/mask.frag",
-                    ),
-                    scale: 0.5,
-                },
-            ],
-            render_passes: [
-                RenderPassPart {
-                    kind: DualKawaseBlur,
-                    file: None,
-                    scale: 1.0,
-                    passes: None,
-                    offset: None,
-                },
-                RenderPassPart {
-                    kind: Custom,
-                    file: Some(
-                        "/path/to/pass1.frag",
-                    ),
-                    scale: 1.0,
-                    passes: None,
-                    offset: None,
-                },
+            version: 1,
+            stages: [
+                FieldShader(
+                    FieldShaderPart {
+                        file: "/path/to/field.frag",
+                    },
+                ),
+                Blur(
+                    BlurPassPart {
+                        passes: Some(
+                            2,
+                        ),
+                        offset: Some(
+                            FloatOrInt(
+                                1.5,
+                            ),
+                        ),
+                    },
+                ),
+                Shader(
+                    ShaderPassPart {
+                        file: "/path/to/pass1.frag",
+                        scale: 0.5,
+                    },
+                ),
             ],
         }
         "#);
@@ -1491,9 +1455,8 @@ mod tests {
                 effect-padding 12
                 shape-transition-duration-ms 75
                 motion-effect-strength 0.5
-                shader-pipeline {
-                    mask-pass "cursor-vectors"
-                    render-pass "custom" file="/path/to/glass.frag" scale=1.0
+                shader-pipeline version=1 {
+                    shader "/path/to/glass.frag"
                 }
             }
             "##,
@@ -1504,8 +1467,10 @@ mod tests {
         assert_eq!(config.cursor.shape_transition_duration_ms, 75);
         assert_eq!(config.cursor.motion_effect_strength, 0.5);
         let pipeline = config.cursor.shader_pipeline.unwrap();
-        assert_eq!(pipeline.mask_passes.len(), 1);
-        assert_eq!(pipeline.mask_passes[0].kind, MaskPassKind::CursorVectors);
-        assert_eq!(pipeline.render_passes.len(), 1);
+        assert_eq!(pipeline.version, 1);
+        assert!(matches!(
+            pipeline.stages.as_slice(),
+            [ShaderPipelineStage::Shader(_)]
+        ));
     }
 }

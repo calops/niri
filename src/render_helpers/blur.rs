@@ -1,16 +1,18 @@
-use std::cmp::{max, min};
+use std::cmp::{max, min, Reverse};
+use std::collections::{BTreeMap, BinaryHeap};
 use std::iter::{once, zip};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context as _};
+use ordered_float::NotNan;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{ffi, link_program, GlesError, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ContextId, Offscreen as _, Renderer as _, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::{Buffer, Rectangle, Size};
 
-use crate::render_helpers::custom_blur::{MaskPassStep, PipelineConfig, RenderPassStep};
+use crate::render_helpers::custom_blur::{PipelineConfig, RenderPassStep};
 use crate::render_helpers::shaders::Shaders;
 
 #[derive(Debug)]
@@ -24,20 +26,21 @@ pub struct Blur {
     textures: Vec<GlesTexture>,
     /// Intermediate textures for custom blur passes.
     custom_textures: Vec<GlesTexture>,
-    /// Final custom-pipeline output multiplied by the exact region mask.
+    /// Final custom-pipeline output multiplied by authoritative field coverage.
     masked_output_texture: Option<GlesTexture>,
-    /// Mask texture at source resolution, rendered from GPU mask shader.
-    /// Primary buffer in the mask ping-pong pair.
+    /// Full-resolution geometry-field texture, primary ping-pong buffer.
     mask_texture_a: Option<GlesTexture>,
-    /// Secondary buffer for mask ping-pong.
+    /// Full-resolution geometry-field texture, secondary ping-pong buffer.
     mask_texture_b: Option<GlesTexture>,
-    /// Compiled analytical full-window mask program.
+    /// Compiled analytical full-window field program.
     mask_program: Option<MaskProgram>,
-    /// Program applying the exact mask to a custom-pipeline output.
+    /// Compiled instanced analytical rectangle-field program.
+    rect_field_program: Option<RectFieldProgram>,
+    /// Program applying authoritative field coverage to the rendered output.
     mask_output_program: Option<MaskOutputProgram>,
-    /// Cached mask inputs and final texture. A matching custom pipeline and
-    /// geometry can reuse the fully rendered mask without touching either
-    /// ping-pong texture.
+    /// Cached field inputs and final texture. Matching pipeline and geometry
+    /// inputs reuse the complete field without touching either ping-pong
+    /// texture.
     cached_mask_rects: Arc<Vec<[f32; 4]>>,
     cached_mask_w: i32,
     cached_mask_h: i32,
@@ -45,36 +48,30 @@ pub struct Blur {
     cached_mask_corner_radius: [f32; 4],
     cached_mask_pipeline: Option<Rc<CustomBlurProgramInner>>,
     cached_mask_texture_is_b: Option<bool>,
-    /// Cursor coverage identity and silhouette placement the mask was built
-    /// from. `None` when the active mask is rect-based.
+    /// Cursor coverage identity and silhouette placement the field was built
+    /// from. `None` when the active field is rect-based.
     cached_mask_coverage: Option<(u64, Rectangle<i32, Buffer>)>,
-    /// Source-pixel rectangle data shared by all mask paths.
+    /// Source-pixel rectangle data shared by analytical and JFA field paths.
     cached_rects_px: Vec<[f32; 4]>,
     jfa_pipeline: Option<JfaPipeline>,
-    /// Compiled cursor-alpha coverage program. Reused by the source-sized
-    /// coverage mask and the bbox-local JFA seed.
+    /// Compiled cursor-alpha coverage program used for the bbox-local JFA seed.
     coverage_program: Option<CoverageProgram>,
     jfa_textures: Option<JfaTextures>,
-    /// Compiled instanced binary-mask program. Used by the source-sized
-    /// binary mask and the bbox-local JFA input.
-    binary_program: Option<JfaBinaryProgram>,
     /// Row-major RGBA32F texture holding the subregion rects (one texel per
     /// rect, RGBA = x1,y1,x2,y2 in source pixels). Wraps to additional rows
     /// at GL_MAX_TEXTURE_SIZE and grows when needed; never shrunk.
     rects_texture: Option<GlesTexture>,
     rects_capacity: i32,
-    /// Cache for the JFA mask pipeline. The whole pipeline is computed in
-    /// bbox-local coordinates, so its output (`jfa_textures.encoded`) is
-    /// invariant under cursor motion — only the absolute bbox origin
-    /// changes. When these values match the previous frame, we skip the
-    /// entire pipeline and just re-blit the cached encoded texture at
-    /// the new screen position.
+    /// Cache for the bbox-local JFA field pipeline. Its encoded output is
+    /// invariant under translation when bbox-local geometry or cursor coverage
+    /// identity is unchanged, so translation hits only re-blit the cached
+    /// texture at the new full-field position.
     cached_jfa_rects_local: Vec<[f32; 4]>,
     cached_jfa_bbox_size: Option<(i32, i32)>,
     cached_jfa_bbox_origin: Option<(i32, i32)>,
     /// Cursor coverage identity the bbox-local JFA output was computed for.
     cached_jfa_coverage: Option<(u64, Rectangle<i32, Buffer>)>,
-    /// Full-source mask texture that received the cached bbox-local JFA output.
+    /// Full-field texture that received the cached bbox-local JFA output.
     cached_jfa_mask_texture_id: Option<u32>,
 }
 
@@ -86,28 +83,28 @@ pub struct BlurOptions {
     pub corner_radius: [f32; 4],
     pub subregion_rects: Arc<Vec<[f32; 4]>>,
     pub window_screen_rect: [f32; 4],
-    /// Full mask texture size, independent of the currently visible source crop.
+    /// Stable full-field texture size, independent of the visible source crop.
     pub mask_size: Option<Size<i32, Buffer>>,
-    /// Visible source crop in full-mask UV coordinates: x1, y1, x2, y2.
+    /// Visible source crop in stable full-field UV coordinates: x1, y1, x2, y2.
     pub mask_uv_rect: [f32; 4],
-    /// Inline custom shader pipeline definition, or `None` to use the
-    /// default Kawase blur. Cached in `Shaders` keyed by a hash of the
-    /// shader source strings.
+    /// Versioned custom field/color pipeline definition, or `None` to use the
+    /// default Kawase blur. Cached in `Shaders` by ABI version, shader sources,
+    /// and stage options.
     pub shader_pipeline: Option<niri_config::ShaderPipeline>,
-    /// Cursor alpha silhouette mask source. Mutually exclusive with
-    /// `subregion_rects`; when set, the JFA/Poisson mask is seeded from a
-    /// coverage texture instead of protocol region rectangles.
+    /// Cursor alpha silhouette source. Mutually exclusive with
+    /// `subregion_rects`; when set, the automatic JFA/Poisson field is seeded
+    /// from cursor coverage instead of protocol region rectangles.
     pub coverage_mask: Option<CoverageMask>,
 }
 
-/// A cursor-alpha mask source for the `cursor-vectors` mask pass.
+/// Cursor-alpha input for automatic cursor field generation.
 #[derive(Debug, Clone)]
 pub struct CoverageMask {
     /// Cursor alpha coverage (premultiplied ARGB).
     pub texture: GlesTexture,
-    /// JFA solve bounds within the full mask, in mask pixels (GL bottom-left).
+    /// JFA solve bounds within the stable field, in buffer pixels (GL bottom-left).
     pub bbox: Rectangle<i32, Buffer>,
-    /// Undeformed cursor image placement within the full mask.
+    /// Undeformed cursor image placement within the stable full field.
     pub coverage_rect: Rectangle<i32, Buffer>,
     /// Identity of the cursor frame this texture was built from, used as the
     /// mask/JFA cache key. Motion does not change it, so the expensive
@@ -287,13 +284,13 @@ struct CustomBlurPassProgram {
     uniform_mask: ffi::types::GLint,
     uniform_window_screen_rect: ffi::types::GLint,
     uniform_mask_uv_rect: ffi::types::GLint,
+    uniform_analytical_window: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
 #[derive(Debug)]
 struct CustomBlurProgramInner {
-    mask_passes: Vec<MaskPassStep>,
-    mask_programs: Vec<Option<CustomMaskProgram>>,
+    field_programs: Vec<CustomFieldProgram>,
     render_passes: Vec<RenderPassStep>,
     render_programs: Vec<Option<CustomBlurPassProgram>>,
 }
@@ -308,7 +305,7 @@ unsafe fn compile_custom_pass(
     let vert_src = include_str!("shaders/blur_custom.vert");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
-    let input = c"niri_input";
+    let input = c"niri_color";
     let output_size = c"niri_output_size";
     let input_size = c"niri_input_size";
     let half_pixel = c"niri_half_pixel";
@@ -316,9 +313,10 @@ unsafe fn compile_custom_pass(
     let pass_count = c"niri_pass_count";
     let geo_size = c"niri_geo_size";
     let corner_radius = c"niri_corner_radius";
-    let mask = c"niri_mask";
+    let mask = c"niri_field";
     let window_screen_rect = c"niri_window_screen_rect";
-    let mask_uv_rect = c"niri_mask_uv_rect";
+    let mask_uv_rect = c"niri_field_uv_rect";
+    let analytical_window = c"niri_analytical_window";
     let vert = c"vert";
 
     Ok(CustomBlurPassProgram {
@@ -334,6 +332,7 @@ unsafe fn compile_custom_pass(
         uniform_mask: gl.GetUniformLocation(program, mask.as_ptr()),
         uniform_window_screen_rect: gl.GetUniformLocation(program, window_screen_rect.as_ptr()),
         uniform_mask_uv_rect: gl.GetUniformLocation(program, mask_uv_rect.as_ptr()),
+        uniform_analytical_window: gl.GetUniformLocation(program, analytical_window.as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
     })
 }
@@ -348,37 +347,30 @@ unsafe fn compile_mask_output_program(gl: &ffi::Gles2) -> Result<MaskOutputProgr
     };
     Ok(MaskOutputProgram {
         program,
-        uniform_input: gl.GetUniformLocation(program, c"niri_input".as_ptr()),
-        uniform_mask: gl.GetUniformLocation(program, c"niri_mask".as_ptr()),
-        uniform_mask_uv_rect: gl.GetUniformLocation(program, c"niri_mask_uv_rect".as_ptr()),
+        uniform_input: gl.GetUniformLocation(program, c"niri_color".as_ptr()),
+        uniform_mask: gl.GetUniformLocation(program, c"niri_field".as_ptr()),
+        uniform_mask_uv_rect: gl.GetUniformLocation(program, c"niri_field_uv_rect".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
 
-unsafe fn compile_custom_mask_pass(
+unsafe fn compile_custom_field_pass(
     gl: &ffi::Gles2,
     frag_src: &str,
-) -> Result<CustomMaskProgram, GlesError> {
+) -> Result<CustomFieldProgram, GlesError> {
     let vert_src = include_str!("shaders/blur_custom.vert");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
-    let subregion_count = c"niri_subregion_count";
-    let subregion_rects = c"niri_subregion_rects";
-    let output_size = c"niri_output_size";
-    let bbox_origin = c"niri_bbox_origin";
-    let geo_size = c"niri_geo_size";
-    let corner_radius = c"niri_corner_radius";
-    let vert = c"vert";
-
-    Ok(CustomMaskProgram {
+    Ok(CustomFieldProgram {
         program,
-        uniform_subregion_count: gl.GetUniformLocation(program, subregion_count.as_ptr()),
-        uniform_subregion_rects: gl.GetUniformLocation(program, subregion_rects.as_ptr()),
-        uniform_output_size: gl.GetUniformLocation(program, output_size.as_ptr()),
-        uniform_bbox_origin: gl.GetUniformLocation(program, bbox_origin.as_ptr()),
-        uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
-        uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+        uniform_field: gl.GetUniformLocation(program, c"niri_field".as_ptr()),
+        uniform_subregion_count: gl.GetUniformLocation(program, c"niri_subregion_count".as_ptr()),
+        uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, c"niri_geo_size".as_ptr()),
+        uniform_corner_radius: gl.GetUniformLocation(program, c"niri_corner_radius".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
 
@@ -386,19 +378,11 @@ impl CustomBlurProgram {
     pub fn compile(renderer: &mut GlesRenderer, config: &PipelineConfig) -> anyhow::Result<Self> {
         renderer
             .with_context(move |gl| unsafe {
-                let mut mask_programs = Vec::with_capacity(config.mask_passes.len());
-                for (i, step) in config.mask_passes.iter().enumerate() {
-                    let prog = match step {
-                        MaskPassStep::WindowVectors
-                        | MaskPassStep::RegionVectors
-                        | MaskPassStep::CursorVectors => None,
-                        MaskPassStep::Custom { source, name, .. } => {
-                            Some(compile_custom_mask_pass(gl, source).with_context(|| {
-                                format!("error compiling custom mask pass {} ({:?})", i, name)
-                            })?)
-                        }
-                    };
-                    mask_programs.push(prog);
+                let mut field_programs = Vec::with_capacity(config.field_passes.len());
+                for (i, step) in config.field_passes.iter().enumerate() {
+                    field_programs.push(compile_custom_field_pass(gl, &step.source).with_context(
+                        || format!("error compiling custom field pass {} ({:?})", i, step.name),
+                    )?);
                 }
 
                 let mut render_programs = Vec::with_capacity(config.render_passes.len());
@@ -414,8 +398,7 @@ impl CustomBlurProgram {
                     render_programs.push(prog);
                 }
                 Ok(Self(Rc::new(CustomBlurProgramInner {
-                    mask_passes: config.mask_passes.clone(),
-                    mask_programs,
+                    field_programs,
                     render_passes: config.render_passes.clone(),
                     render_programs,
                 })))
@@ -425,10 +408,8 @@ impl CustomBlurProgram {
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         renderer.with_context(move |gl| unsafe {
-            for prog in &self.0.mask_programs {
-                if let Some(p) = prog {
-                    gl.DeleteProgram(p.program);
-                }
+            for prog in &self.0.field_programs {
+                gl.DeleteProgram(prog.program);
             }
             for prog in &self.0.render_programs {
                 if let Some(p) = prog {
@@ -442,9 +423,18 @@ impl CustomBlurProgram {
 #[derive(Debug)]
 struct MaskProgram {
     program: ffi::types::GLuint,
+    uniform_output_size: ffi::types::GLint,
     uniform_geo_size: ffi::types::GLint,
     uniform_corner_radius: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
+}
+
+#[derive(Debug)]
+struct RectFieldProgram {
+    program: ffi::types::GLuint,
+    uniform_subregion_rects: ffi::types::GLint,
+    uniform_output_size: ffi::types::GLint,
+    uniform_geo_size: ffi::types::GLint,
 }
 
 #[derive(Debug)]
@@ -457,8 +447,9 @@ struct MaskOutputProgram {
 }
 
 #[derive(Debug)]
-struct CustomMaskProgram {
+struct CustomFieldProgram {
     program: ffi::types::GLuint,
+    uniform_field: ffi::types::GLint,
     uniform_subregion_count: ffi::types::GLint,
     uniform_subregion_rects: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
@@ -565,6 +556,7 @@ struct JfaEncodeProgram {
     uniform_binary: ffi::types::GLint,
     uniform_output_size: ffi::types::GLint,
     uniform_max_dist: ffi::types::GLint,
+    uniform_logical_per_pixel: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -644,6 +636,132 @@ const V_CYCLES: usize = 1;
 
 /// Pixels of exterior border padding around the JFA bbox.
 const BBOX_BORDER: i32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticFieldSource {
+    Window,
+    AnalyticalRects,
+    JfaRects,
+    Cursor,
+}
+
+impl AutomaticFieldSource {
+    fn is_analytical_window(self) -> bool {
+        self == Self::Window
+    }
+}
+
+/// Whether one instanced draw can evaluate every rectangle independently.
+///
+/// Expanding by half a pixel matches the analytical draw bounds. Any overlap
+/// between expanded rectangles—including geometrically touching rectangles—
+/// requires the union-aware JFA/Poisson path.
+fn analytical_rects_are_independent(rects: &[[f32; 4]]) -> bool {
+    if rects.len() <= 1 {
+        return true;
+    }
+
+    let mut sorted = Vec::with_capacity(rects.len());
+    for (id, rect) in rects.iter().enumerate() {
+        let Ok(x1) = NotNan::new(rect[0] - 0.5) else {
+            return false;
+        };
+        let Ok(y1) = NotNan::new(rect[1] - 0.5) else {
+            return false;
+        };
+        let Ok(x2) = NotNan::new(rect[2] + 0.5) else {
+            return false;
+        };
+        let Ok(y2) = NotNan::new(rect[3] + 0.5) else {
+            return false;
+        };
+        sorted.push((x1, x2, y1, y2, id));
+    }
+    sorted.sort_unstable_by_key(|rect| rect.0);
+
+    let mut by_x_end = BinaryHeap::new();
+    let mut by_y_start = BTreeMap::new();
+    for (x1, x2, y1, y2, id) in sorted {
+        while let Some(Reverse((x_end, active_id, active_y1))) = by_x_end.peek().copied() {
+            if x_end > x1 {
+                break;
+            }
+            by_x_end.pop();
+            by_y_start.remove(&(active_y1, active_id));
+        }
+
+        if by_y_start
+            .range(..=(y1, usize::MAX))
+            .next_back()
+            .is_some_and(|(_, active_y2)| *active_y2 > y1)
+        {
+            return false;
+        }
+        if by_y_start
+            .range((
+                std::ops::Bound::Excluded((y1, usize::MAX)),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|((active_y1, _), _)| *active_y1 < y2)
+        {
+            return false;
+        }
+
+        by_x_end.push(Reverse((x2, id, y1)));
+        by_y_start.insert((y1, id), y2);
+    }
+
+    true
+}
+
+/// Whether one protocol rectangle covers the entire stable field.
+///
+/// Clients such as Kitty advertise a full-surface blur region even when the
+/// compositor clips the window to rounded geometry. Treating that rectangle as
+/// an independent sharp rectangle discards the compositor corner radii.
+fn rects_cover_full_field(rects: &[[f32; 4]], width: i32, height: i32) -> bool {
+    const EDGE_EPSILON: f32 = 0.5;
+    let [rect] = rects else {
+        return false;
+    };
+
+    rect[0] <= EDGE_EPSILON
+        && rect[1] <= EDGE_EPSILON
+        && rect[2] >= width as f32 - EDGE_EPSILON
+        && rect[3] >= height as f32 - EDGE_EPSILON
+}
+
+/// Pixel-aligned JFA work area for the visible part of a field source.
+///
+/// Clamp both source edges before deriving the size. Clamping only the origin
+/// leaves the clipped-off extent in `bbw`/`bbh`, which later resamples the
+/// remaining field when a source crosses the left or bottom texture edge.
+fn jfa_bbox(
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    mask_w: i32,
+    mask_h: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    const EPS: f32 = 1e-4;
+
+    let min_x = min_x.max(0.0);
+    let min_y = min_y.max(0.0);
+    let max_x = max_x.min(mask_w as f32);
+    let max_y = max_y.min(mask_h as f32);
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    let x1 = ((min_x + EPS).floor() as i32 - BBOX_BORDER).max(0);
+    let y1 = ((min_y + EPS).floor() as i32 - BBOX_BORDER).max(0);
+    let x2 = ((max_x - EPS).ceil() as i32 + BBOX_BORDER).min(mask_w);
+    let y2 = ((max_y - EPS).ceil() as i32 + BBOX_BORDER).min(mask_h);
+
+    (x2 > x1 && y2 > y1).then_some((x1, y1, x2 - x1, y2 - y1))
+}
 
 unsafe fn check_gl_error(gl: &ffi::Gles2) {
     let mut had_error = false;
@@ -772,20 +890,35 @@ fn create_float_buffer(
     Ok(unsafe { GlesTexture::from_raw(renderer, Some(internal_format), false, tex, size) })
 }
 
+/// Compile the rounded-window distance and boundary-flow provider.
 unsafe fn compile_mask_program(gl: &ffi::Gles2) -> Result<MaskProgram, GlesError> {
     let vert_src = include_str!("shaders/blur_custom.vert");
     let frag_src = include_str!("shaders/mask.frag");
     let program = unsafe { link_program(gl, vert_src, frag_src)? };
 
-    let geo_size = c"niri_geo_size";
-    let corner_radius = c"niri_corner_radius";
-    let vert = c"vert";
-
     Ok(MaskProgram {
         program,
-        uniform_geo_size: gl.GetUniformLocation(program, geo_size.as_ptr()),
-        uniform_corner_radius: gl.GetUniformLocation(program, corner_radius.as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, vert.as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, c"niri_geo_size".as_ptr()),
+        uniform_corner_radius: gl.GetUniformLocation(program, c"niri_corner_radius".as_ptr()),
+        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
+    })
+}
+
+/// Compile the normalized center-flow provider for independent rectangles.
+unsafe fn compile_rect_field_program(gl: &ffi::Gles2) -> Result<RectFieldProgram, GlesError> {
+    let program = unsafe {
+        link_program(
+            gl,
+            include_str!("shaders/mask_rect_field.vert"),
+            include_str!("shaders/mask_rect_field.frag"),
+        )?
+    };
+    Ok(RectFieldProgram {
+        program,
+        uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
+        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
+        uniform_geo_size: gl.GetUniformLocation(program, c"niri_geo_size".as_ptr()),
     })
 }
 
@@ -936,6 +1069,8 @@ unsafe fn compile_jfa_encode(gl: &ffi::Gles2) -> Result<JfaEncodeProgram, GlesEr
         uniform_binary: gl.GetUniformLocation(program, c"niri_binary".as_ptr()),
         uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
         uniform_max_dist: gl.GetUniformLocation(program, c"niri_max_dist".as_ptr()),
+        uniform_logical_per_pixel: gl
+            .GetUniformLocation(program, c"niri_logical_per_pixel".as_ptr()),
         attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
     })
 }
@@ -963,6 +1098,7 @@ impl Blur {
             mask_texture_a: None,
             mask_texture_b: None,
             mask_program: None,
+            rect_field_program: None,
             masked_output_texture: None,
             cached_mask_rects: Arc::new(Vec::new()),
             cached_mask_w: 0,
@@ -977,7 +1113,6 @@ impl Blur {
             jfa_pipeline: None,
             coverage_program: None,
             jfa_textures: None,
-            binary_program: None,
             rects_texture: None,
             rects_capacity: 0,
             cached_jfa_rects_local: Vec::new(),
@@ -1064,14 +1199,6 @@ impl Blur {
         Ok(())
     }
 
-    fn can_gpu_clip_custom_output(mask_passes: &[MaskPassStep], has_exact_mask: bool) -> bool {
-        has_exact_mask
-            && matches!(
-                mask_passes.last(),
-                None | Some(MaskPassStep::RegionVectors | MaskPassStep::CursorVectors)
-            )
-    }
-
     fn render_custom(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -1118,8 +1245,7 @@ impl Blur {
         let final_output_size = Size::new(final_output_w, final_output_h);
         let coverage = options.coverage_mask.as_ref();
         let has_exact_mask = !options.subregion_rects.is_empty() || coverage.is_some();
-        let mut apply_output_mask =
-            Self::can_gpu_clip_custom_output(&inner.mask_passes, has_exact_mask);
+        let mut apply_output_mask = has_exact_mask;
 
         let needs_recreate = self.custom_textures.len() != pass_count
             || self
@@ -1231,19 +1357,22 @@ impl Blur {
             rects_texture_changed = true;
         }
 
-        let uses_region_vectors = inner
-            .mask_passes
-            .iter()
-            .any(|s| matches!(s, MaskPassStep::RegionVectors));
-        let uses_cursor_vectors = inner
-            .mask_passes
-            .iter()
-            .any(|s| matches!(s, MaskPassStep::CursorVectors));
-        let coverage_key = if uses_cursor_vectors {
-            coverage.map(|c| (c.identity, c.bbox))
+        let automatic_field_source = if coverage.is_some() {
+            AutomaticFieldSource::Cursor
+        } else if self.cached_rects_px.is_empty()
+            || rects_cover_full_field(&self.cached_rects_px, mask_w, mask_h)
+        {
+            AutomaticFieldSource::Window
+        } else if analytical_rects_are_independent(&self.cached_rects_px) {
+            AutomaticFieldSource::AnalyticalRects
         } else {
-            None
+            AutomaticFieldSource::JfaRects
         };
+        let uses_region_vectors = automatic_field_source == AutomaticFieldSource::JfaRects;
+        let uses_cursor_vectors = automatic_field_source == AutomaticFieldSource::Cursor;
+        let coverage_key = uses_cursor_vectors
+            .then(|| coverage.map(|c| (c.identity, c.bbox)))
+            .flatten();
 
         // The JFA/Poisson solve runs over the union of all vector-mask sources.
         // For a cursor mask this is the tight silhouette bbox, which stays
@@ -1273,16 +1402,9 @@ impl Blur {
 
         let mut jfa_need_alloc = false;
         let jfa_bbox = if have_bbox {
-            const EPS: f32 = 1e-4;
-            let bbx = ((bbox_min_x + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bby = ((bbox_min_y + EPS).floor() as i32 - BBOX_BORDER).max(0);
-            let bbw = ((bbox_max_x - bbox_min_x - EPS).ceil() as i32 + 2 * BBOX_BORDER)
-                .max(1)
-                .min(mask_w - bbx);
-            let bbh = ((bbox_max_y - bbox_min_y - EPS).ceil() as i32 + 2 * BBOX_BORDER)
-                .max(1)
-                .min(mask_h - bby);
-            if bbw > 0 && bbh > 0 {
+            if let Some((bbx, bby, bbw, bbh)) = jfa_bbox(
+                bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y, mask_w, mask_h,
+            ) {
                 let bbox_size = Size::new(bbw, bbh);
                 let need_alloc = match &self.jfa_textures {
                     Some(t) => t.size != bbox_size,
@@ -1371,8 +1493,7 @@ impl Blur {
             }
         };
 
-        let mask_passes = &inner.mask_passes;
-        let mask_programs = &inner.mask_programs;
+        let field_programs = &inner.field_programs;
 
         // If any render step is DualKawaseBlur, prepare Kawase textures
         // before entering the GL context. Use the maximum passes across
@@ -1401,14 +1522,6 @@ impl Blur {
             && !need_mask_b
             && !mask_inputs_changed
             && self.cached_mask_texture_is_b.is_some();
-        let first_mask_is_vector = matches!(
-            mask_passes.first(),
-            Some(
-                MaskPassStep::WindowVectors
-                    | MaskPassStep::RegionVectors
-                    | MaskPassStep::CursorVectors
-            )
-        );
 
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
@@ -1430,64 +1543,189 @@ impl Blur {
                 }
             }
 
-            // Step 0: binary mask into mask_texture_a. A built-in vector
-            // pass is self-contained, so it does not need this source mask.
+            // Step 1: generate the compositor-owned geometry field, then run
+            // optional user field transformations at the same stable size.
             let mask_a = self.mask_texture_a.as_ref().unwrap();
             let mask_b = self.mask_texture_b.as_ref().unwrap();
-            let mut src_mask = mask_a;
             let mut active_mask_is_b = false;
+            let mut field_available = mask_cache_hit;
 
             if !mask_cache_hit {
-                if !first_mask_is_vector {
-                    let mask_a_id = mask_a.tex_id();
-                    clear_mask_texture(gl, mask_fbo, mask_a_id);
-
-                    if !options.subregion_rects.is_empty() {
-                        if let Some(rects_tex) = self.rects_texture.as_ref() {
-                            if self.binary_program.is_none() {
-                                match compile_binary_program(gl) {
-                                    Ok(p) => self.binary_program = Some(p),
-                                    Err(err) => {
-                                        warn!("error compiling binary mask shader: {err:?}");
-                                    }
+                match automatic_field_source {
+                    AutomaticFieldSource::Window => {
+                        if self.mask_program.is_none() {
+                            match compile_mask_program(gl) {
+                                Ok(program) => self.mask_program = Some(program),
+                                Err(err) => {
+                                    warn!("error compiling analytical window field: {err:?}");
                                 }
                             }
-                            if let Some(bin_prog) = self.binary_program.as_ref() {
-                                render_binary_mask(
-                                    gl, bin_prog, options, mask_a, rects_tex, 0, 0, mask_w, mask_h,
-                                );
-                                check_gl_error(gl);
-                            }
                         }
-                    } else if let Some(coverage) = coverage {
-                        // A first custom mask pass reads the source-sized
-                        // coverage mask built from the cursor silhouette.
-                        if ensure_coverage_program(gl, &mut self.coverage_program) {
-                            let prog = self.coverage_program.as_ref().unwrap();
-                            render_coverage_mask(
-                                gl,
-                                prog,
-                                coverage,
-                                mask_a,
-                                mask_w,
-                                mask_h,
-                                coverage.bbox,
+                        if let Some(program) = self.mask_program.as_ref() {
+                            gl.FramebufferTexture2D(
+                                ffi::DRAW_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                mask_a.tex_id(),
+                                0,
                             );
-                            check_gl_error(gl);
+                            gl.UseProgram(program.program);
+                            gl.Uniform2f(program.uniform_output_size, mask_w as f32, mask_h as f32);
+                            gl.Uniform2f(program.uniform_geo_size, geo_size.0, geo_size.1);
+                            gl.Uniform4f(
+                                program.uniform_corner_radius,
+                                corner_radius[0],
+                                corner_radius[1],
+                                corner_radius[2],
+                                corner_radius[3],
+                            );
+                            gl.Viewport(0, 0, mask_w, mask_h);
+                            draw_fullscreen_quad(gl, program.attrib_vert);
+                            field_available = true;
                         }
                     }
+                    AutomaticFieldSource::AnalyticalRects => {
+                        if self.rect_field_program.is_none() {
+                            match compile_rect_field_program(gl) {
+                                Ok(program) => self.rect_field_program = Some(program),
+                                Err(err) => {
+                                    warn!("error compiling analytical rectangle field: {err:?}");
+                                }
+                            }
+                        }
+                        if let (Some(program), Some(rects_tex)) = (
+                            self.rect_field_program.as_ref(),
+                            self.rects_texture.as_ref(),
+                        ) {
+                            render_analytical_rect_fields(
+                                gl, program, mask_a, rects_tex, needed, mask_w, mask_h, geo_size,
+                            );
+                            field_available = true;
+                        }
+                    }
+                    AutomaticFieldSource::JfaRects | AutomaticFieldSource::Cursor => {
+                        match (jfa_bbox, self.jfa_textures.as_ref()) {
+                            (Some((bbx, bby, bbw, bbh)), Some(textures)) => {
+                                let source = match automatic_field_source {
+                                    AutomaticFieldSource::JfaRects => self
+                                        .rects_texture
+                                        .as_ref()
+                                        .map(|rects_tex| JfaMaskSource::Rects { rects_tex }),
+                                    AutomaticFieldSource::Cursor => {
+                                        coverage.map(|coverage| JfaMaskSource::Coverage {
+                                            coverage,
+                                            rect_local: Rectangle::new(
+                                                (
+                                                    coverage.bbox.loc.x - bbx,
+                                                    coverage.bbox.loc.y - bby,
+                                                )
+                                                    .into(),
+                                                coverage.bbox.size,
+                                            ),
+                                        })
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                if let Some(source) = source {
+                                    let previous_bbox = (self.cached_jfa_mask_texture_id
+                                        == Some(mask_a.tex_id()))
+                                    .then_some(jfa_cache_previous_bbox)
+                                    .flatten();
+                                    field_available = render_jfa_mask(
+                                        gl,
+                                        options,
+                                        mask_fbo,
+                                        mask_a.tex_id(),
+                                        bbx,
+                                        bby,
+                                        bbw,
+                                        bbh,
+                                        mask_w,
+                                        mask_h,
+                                        &mut self.jfa_pipeline,
+                                        textures,
+                                        source,
+                                        &mut self.coverage_program,
+                                        jfa_cache_hit,
+                                        previous_bbox,
+                                    );
+                                    if field_available {
+                                        self.cached_jfa_mask_texture_id = Some(mask_a.tex_id());
+                                    } else {
+                                        self.cached_jfa_mask_texture_id = None;
+                                        self.cached_jfa_rects_local.clear();
+                                        self.cached_jfa_bbox_size = None;
+                                        self.cached_jfa_bbox_origin = None;
+                                        self.cached_jfa_coverage = None;
+                                    }
+                                } else {
+                                    warn!("automatic field source is unavailable");
+                                }
+                            }
+                            (None, _) => {
+                                // The source is fully outside the stable field.
+                                // Keep a valid zero field so color and output
+                                // clipping cannot sample stale mask contents.
+                                clear_mask_texture(gl, mask_fbo, mask_a.tex_id());
+                                field_available = true;
+                                self.cached_jfa_mask_texture_id = None;
+                                self.cached_jfa_rects_local.clear();
+                                self.cached_jfa_bbox_size = None;
+                                self.cached_jfa_bbox_origin = None;
+                                self.cached_jfa_coverage = None;
+                            }
+                            (Some(_), None) => {
+                                warn!("automatic JFA field textures are unavailable");
+                            }
+                        }
+                    }
+                }
 
-                    gl.BindTexture(ffi::TEXTURE_2D, mask_a_id);
-                    gl.TexParameteri(
+                if !matches!(
+                    automatic_field_source,
+                    AutomaticFieldSource::JfaRects | AutomaticFieldSource::Cursor
+                ) && self.cached_jfa_mask_texture_id == Some(mask_a.tex_id())
+                {
+                    self.cached_jfa_mask_texture_id = None;
+                }
+
+                gl.BindTexture(ffi::TEXTURE_2D, mask_a.tex_id());
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_S,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_WRAP_T,
+                    ffi::CLAMP_TO_EDGE as i32,
+                );
+
+                let mut src_field = mask_a;
+                for program in field_programs {
+                    let dst_field = if active_mask_is_b { mask_a } else { mask_b };
+
+                    if let (Some(rects_tex), true) = (
+                        self.rects_texture.as_ref(),
+                        !options.subregion_rects.is_empty(),
+                    ) {
+                        gl.ActiveTexture(ffi::TEXTURE1);
+                        gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
+                    }
+
+                    gl.FramebufferTexture2D(
+                        ffi::DRAW_FRAMEBUFFER,
+                        ffi::COLOR_ATTACHMENT0,
                         ffi::TEXTURE_2D,
-                        ffi::TEXTURE_MIN_FILTER,
-                        ffi::NEAREST as i32,
+                        dst_field.tex_id(),
+                        0,
                     );
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_MAG_FILTER,
-                        ffi::NEAREST as i32,
-                    );
+                    gl.ActiveTexture(ffi::TEXTURE0);
+                    gl.BindTexture(ffi::TEXTURE_2D, src_field.tex_id());
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
                     gl.TexParameteri(
                         ffi::TEXTURE_2D,
                         ffi::TEXTURE_WRAP_S,
@@ -1498,249 +1736,68 @@ impl Blur {
                         ffi::TEXTURE_WRAP_T,
                         ffi::CLAMP_TO_EDGE as i32,
                     );
-                }
 
-                // Step 1: mask pipeline passes (binary → mask_texture_a → passes).
-                for (i, step) in mask_passes.iter().enumerate() {
-                    let dst_mask = if active_mask_is_b { mask_a } else { mask_b };
-
-                    match step {
-                        MaskPassStep::WindowVectors => {
-                            if self.mask_program.is_none() {
-                                match compile_mask_program(gl) {
-                                    Ok(p) => self.mask_program = Some(p),
-                                    Err(err) => {
-                                        warn!("error compiling analytical mask shader: {err:?}");
-                                        src_mask = dst_mask;
-                                        active_mask_is_b = !active_mask_is_b;
-                                        continue;
-                                    }
-                                }
-                            }
-                            if let Some(mask_prog) = self.mask_program.as_ref() {
-                                gl.FramebufferTexture2D(
-                                    ffi::DRAW_FRAMEBUFFER,
-                                    ffi::COLOR_ATTACHMENT0,
-                                    ffi::TEXTURE_2D,
-                                    dst_mask.tex_id(),
-                                    0,
-                                );
-
-                                gl.UseProgram(mask_prog.program);
-                                gl.Uniform2f(mask_prog.uniform_geo_size, geo_size.0, geo_size.1);
-                                gl.Uniform4f(
-                                    mask_prog.uniform_corner_radius,
-                                    corner_radius[0],
-                                    corner_radius[1],
-                                    corner_radius[2],
-                                    corner_radius[3],
-                                );
-
-                                gl.Viewport(0, 0, mask_w, mask_h);
-                                draw_fullscreen_quad(gl, mask_prog.attrib_vert);
-
-                                gl.BindTexture(ffi::TEXTURE_2D, dst_mask.tex_id());
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MIN_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MAG_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_S,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_T,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-                            }
-                        }
-                        MaskPassStep::RegionVectors | MaskPassStep::CursorVectors => {
-                            match (jfa_bbox, self.jfa_textures.as_ref()) {
-                                (Some((bbx, bby, bbw, bbh)), Some(textures)) => {
-                                    let source = match step {
-                                        MaskPassStep::RegionVectors => self
-                                            .rects_texture
-                                            .as_ref()
-                                            .map(|rects_tex| JfaMaskSource::Rects {
-                                                rects_tex,
-                                                rects_px: &self.cached_rects_px,
-                                            }),
-                                        _ => coverage.map(|c| JfaMaskSource::Coverage {
-                                            coverage: c,
-                                            rect_local: Rectangle::new(
-                                                (c.bbox.loc.x - bbx, c.bbox.loc.y - bby).into(),
-                                                c.bbox.size,
-                                            ),
-                                        }),
-                                    };
-                                    match source {
-                                        Some(source) => {
-                                            let mask_id = dst_mask.tex_id();
-                                            let previous_bbox = if i == 0
-                                                && self.cached_jfa_mask_texture_id == Some(mask_id)
-                                            {
-                                                jfa_cache_previous_bbox
-                                            } else {
-                                                None
-                                            };
-                                            render_jfa_mask(
-                                                gl,
-                                                options,
-                                                mask_fbo,
-                                                mask_id,
-                                                bbx,
-                                                bby,
-                                                bbw,
-                                                bbh,
-                                                mask_w,
-                                                mask_h,
-                                                &mut self.jfa_pipeline,
-                                                textures,
-                                                source,
-                                                &mut self.coverage_program,
-                                                jfa_cache_hit,
-                                                previous_bbox,
-                                            );
-                                            self.cached_jfa_mask_texture_id = Some(mask_id);
-                                        }
-                                        None => {
-                                            warn!("vector mask pass: missing mask source");
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    warn!("vector mask pass: no valid bbox/textures");
-                                }
-                            }
-                        }
-
-                        MaskPassStep::Custom { .. } => {
-                            if let Some(Some(prog)) = mask_programs.get(i) {
-                                if let (Some(rects_tex), true) = (
-                                    self.rects_texture.as_ref(),
-                                    !options.subregion_rects.is_empty(),
-                                ) {
-                                    gl.ActiveTexture(ffi::TEXTURE1);
-                                    gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
-                                    gl.ActiveTexture(ffi::TEXTURE0);
-                                }
-
-                                gl.FramebufferTexture2D(
-                                    ffi::DRAW_FRAMEBUFFER,
-                                    ffi::COLOR_ATTACHMENT0,
-                                    ffi::TEXTURE_2D,
-                                    dst_mask.tex_id(),
-                                    0,
-                                );
-
-                                gl.ActiveTexture(ffi::TEXTURE0);
-                                gl.BindTexture(ffi::TEXTURE_2D, src_mask.tex_id());
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MIN_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MAG_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_S,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_T,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-
-                                gl.UseProgram(prog.program);
-                                if prog.uniform_subregion_count >= 0 {
-                                    gl.Uniform1i(
-                                        prog.uniform_subregion_count,
-                                        options.subregion_rects.len() as i32,
-                                    );
-                                }
-                                if prog.uniform_subregion_rects >= 0 {
-                                    gl.Uniform1i(prog.uniform_subregion_rects, 1);
-                                }
-                                if prog.uniform_output_size >= 0 {
-                                    gl.Uniform2f(
-                                        prog.uniform_output_size,
-                                        mask_w as f32,
-                                        mask_h as f32,
-                                    );
-                                }
-                                if prog.uniform_bbox_origin >= 0 {
-                                    gl.Uniform2f(prog.uniform_bbox_origin, 0.0, 0.0);
-                                }
-                                if prog.uniform_geo_size >= 0 {
-                                    gl.Uniform2f(prog.uniform_geo_size, geo_size.0, geo_size.1);
-                                }
-                                if prog.uniform_corner_radius >= 0 {
-                                    gl.Uniform4f(
-                                        prog.uniform_corner_radius,
-                                        corner_radius[0],
-                                        corner_radius[1],
-                                        corner_radius[2],
-                                        corner_radius[3],
-                                    );
-                                }
-
-                                gl.Viewport(0, 0, mask_w, mask_h);
-                                draw_fullscreen_quad(gl, prog.attrib_vert);
-                                check_gl_error(gl);
-
-                                gl.ActiveTexture(ffi::TEXTURE0);
-                                gl.BindTexture(ffi::TEXTURE_2D, dst_mask.tex_id());
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MIN_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_MAG_FILTER,
-                                    ffi::LINEAR as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_S,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-                                gl.TexParameteri(
-                                    ffi::TEXTURE_2D,
-                                    ffi::TEXTURE_WRAP_T,
-                                    ffi::CLAMP_TO_EDGE as i32,
-                                );
-                            }
-                        }
+                    gl.UseProgram(program.program);
+                    if program.uniform_field >= 0 {
+                        gl.Uniform1i(program.uniform_field, 0);
                     }
-                    if !matches!(
-                        step,
-                        MaskPassStep::RegionVectors | MaskPassStep::CursorVectors
-                    ) && self.cached_jfa_mask_texture_id == Some(dst_mask.tex_id())
-                    {
+                    if program.uniform_subregion_count >= 0 {
+                        gl.Uniform1i(
+                            program.uniform_subregion_count,
+                            options.subregion_rects.len() as i32,
+                        );
+                    }
+                    if program.uniform_subregion_rects >= 0 {
+                        gl.Uniform1i(program.uniform_subregion_rects, 1);
+                    }
+                    if program.uniform_output_size >= 0 {
+                        gl.Uniform2f(program.uniform_output_size, mask_w as f32, mask_h as f32);
+                    }
+                    if program.uniform_bbox_origin >= 0 {
+                        gl.Uniform2f(program.uniform_bbox_origin, 0.0, 0.0);
+                    }
+                    if program.uniform_geo_size >= 0 {
+                        gl.Uniform2f(program.uniform_geo_size, geo_size.0, geo_size.1);
+                    }
+                    if program.uniform_corner_radius >= 0 {
+                        gl.Uniform4f(
+                            program.uniform_corner_radius,
+                            corner_radius[0],
+                            corner_radius[1],
+                            corner_radius[2],
+                            corner_radius[3],
+                        );
+                    }
+
+                    gl.Viewport(0, 0, mask_w, mask_h);
+                    draw_fullscreen_quad(gl, program.attrib_vert);
+                    check_gl_error(gl);
+
+                    gl.BindTexture(ffi::TEXTURE_2D, dst_field.tex_id());
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_WRAP_S,
+                        ffi::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.TexParameteri(
+                        ffi::TEXTURE_2D,
+                        ffi::TEXTURE_WRAP_T,
+                        ffi::CLAMP_TO_EDGE as i32,
+                    );
+
+                    if self.cached_jfa_mask_texture_id == Some(dst_field.tex_id()) {
                         self.cached_jfa_mask_texture_id = None;
                     }
-
-                    src_mask = dst_mask;
+                    src_field = dst_field;
                     active_mask_is_b = !active_mask_is_b;
                 }
             }
+
             if mask_cache_hit {
                 active_mask_is_b = self.cached_mask_texture_is_b.unwrap();
-            } else {
+            } else if field_available {
                 self.cached_mask_rects = options.subregion_rects.clone();
                 self.cached_mask_coverage = coverage_key;
                 self.cached_mask_w = mask_w;
@@ -1749,20 +1806,12 @@ impl Blur {
                 self.cached_mask_corner_radius = corner_radius;
                 self.cached_mask_pipeline = Some(custom_program.0.clone());
                 self.cached_mask_texture_is_b = Some(active_mask_is_b);
+            } else {
+                self.cached_mask_pipeline = None;
+                self.cached_mask_texture_is_b = None;
             }
 
-            // Only advertise an exact GPU clip when the built-in program
-            // that produced the final mask is available. A compile failure
-            // keeps the existing CPU region-clipping fallback.
-            if apply_output_mask {
-                apply_output_mask = match mask_passes.last() {
-                    None => self.binary_program.is_some(),
-                    Some(MaskPassStep::RegionVectors | MaskPassStep::CursorVectors) => {
-                        self.jfa_pipeline.is_some()
-                    }
-                    Some(_) => false,
-                };
-            }
+            apply_output_mask &= field_available;
 
             let active_mask = if active_mask_is_b { mask_b } else { mask_a };
             gl.ActiveTexture(ffi::TEXTURE1);
@@ -1849,6 +1898,13 @@ impl Blur {
                                     options.window_screen_rect[1],
                                     options.window_screen_rect[2],
                                     options.window_screen_rect[3],
+                                );
+                            }
+
+                            if pass.uniform_analytical_window >= 0 {
+                                gl.Uniform1i(
+                                    pass.uniform_analytical_window,
+                                    automatic_field_source.is_analytical_window() as i32,
                                 );
                             }
 
@@ -1950,16 +2006,8 @@ impl Blur {
 
                 gl.ActiveTexture(ffi::TEXTURE1);
                 gl.BindTexture(ffi::TEXTURE_2D, active_mask.tex_id());
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_MIN_FILTER,
-                    ffi::NEAREST as i32,
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_MAG_FILTER,
-                    ffi::NEAREST as i32,
-                );
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
                 gl.TexParameteri(
                     ffi::TEXTURE_2D,
                     ffi::TEXTURE_WRAP_S,
@@ -1991,75 +2039,16 @@ impl Blur {
     }
 }
 
-/// Mask source for the shared JFA + Poisson vector pipeline.
+/// Shape source for the shared JFA + Poisson field pipeline.
 enum JfaMaskSource<'a> {
-    /// Protocol region rectangles (built-in `region-vectors`).
-    Rects {
-        rects_tex: &'a GlesTexture,
-        rects_px: &'a [[f32; 4]],
-    },
-    /// Cursor alpha silhouette (`cursor-vectors`).
+    /// Touching, overlapping, or composite protocol region rectangles.
+    Rects { rects_tex: &'a GlesTexture },
+    /// Cursor alpha silhouette.
     Coverage {
         coverage: &'a CoverageMask,
         /// Silhouette rect in bbox-local pixels.
         rect_local: Rectangle<i32, Buffer>,
     },
-}
-
-/// Destination rect (in full-mask pixels) that the bbox-local encoded mask is
-/// blitted to. For rect sources this is the clamp of their union; for a
-/// coverage source it is the silhouette bbox itself.
-fn jfa_blit_dest(
-    source: &JfaMaskSource,
-    bbx: i32,
-    bby: i32,
-    bbw: i32,
-    bbh: i32,
-    mask_w: i32,
-    mask_h: i32,
-) -> Rectangle<i32, Buffer> {
-    let (fx1, fy1, fx2, fy2) = match source {
-        JfaMaskSource::Rects { rects_px, .. } => (
-            rects_px
-                .iter()
-                .map(|r| r[0] as i32)
-                .min()
-                .unwrap_or(bbx + BBOX_BORDER)
-                .max(0),
-            rects_px
-                .iter()
-                .map(|r| r[1] as i32)
-                .min()
-                .unwrap_or(bby + BBOX_BORDER)
-                .max(0),
-            rects_px
-                .iter()
-                .map(|r| r[2] as i32)
-                .max()
-                .unwrap_or(bbx + bbw - BBOX_BORDER)
-                .min(mask_w),
-            rects_px
-                .iter()
-                .map(|r| r[3] as i32)
-                .max()
-                .unwrap_or(bby + bbh - BBOX_BORDER)
-                .min(mask_h),
-        ),
-        JfaMaskSource::Coverage { coverage, .. } => {
-            let b = coverage.bbox;
-            (
-                b.loc.x.clamp(0, mask_w),
-                b.loc.y.clamp(0, mask_h),
-                (b.loc.x + b.size.w).clamp(0, mask_w),
-                (b.loc.y + b.size.h).clamp(0, mask_h),
-            )
-        }
-    };
-
-    Rectangle::new(
-        (fx1, fy1).into(),
-        ((fx2 - fx1).max(0), (fy2 - fy1).max(0)).into(),
-    )
 }
 
 fn render_jfa_mask(
@@ -2079,7 +2068,7 @@ fn render_jfa_mask(
     coverage_program: &mut Option<CoverageProgram>,
     cache_hit: bool,
     cache_previous_bbox: Option<(i32, i32, i32, i32)>,
-) {
+) -> bool {
     unsafe {
         if cache_hit {
             if let Some((old_x, old_y, old_w, old_h)) = cache_previous_bbox {
@@ -2087,10 +2076,14 @@ fn render_jfa_mask(
             } else {
                 clear_mask_texture(gl, mask_fbo, mask_tex_id);
             }
-            // textures.encoded is still valid from a previous frame
-            // (bbox-local geometry hasn't changed), so we skip the JFA +
-            let dest = jfa_blit_dest(&source, bbx, bby, bbw, bbh, mask_w, mask_h);
-            blit_to_mask_texture(gl, &textures.encoded, mask_tex_id, bbw, bbh, dest);
+            // `textures.encoded` is still valid from a previous frame because
+            // bbox-local geometry has not changed, so skip JFA and Poisson.
+            blit_to_mask_texture(
+                gl,
+                &textures.encoded,
+                mask_tex_id,
+                Rectangle::new((bbx, bby).into(), (bbw, bbh).into()),
+            );
             gl.BindTexture(ffi::TEXTURE_2D, mask_tex_id);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
@@ -2104,7 +2097,7 @@ fn render_jfa_mask(
                 ffi::TEXTURE_WRAP_T,
                 ffi::CLAMP_TO_EDGE as i32,
             );
-            return;
+            return true;
         }
 
         clear_mask_texture(gl, mask_fbo, mask_tex_id);
@@ -2113,7 +2106,7 @@ fn render_jfa_mask(
             Ok(()) => jfa_pipeline.as_ref().unwrap(),
             Err(err) => {
                 warn!("error compiling JFA shaders: {err:?}");
-                return;
+                return false;
             }
         };
 
@@ -2135,10 +2128,11 @@ fn render_jfa_mask(
                 coverage,
                 rect_local,
             } => {
-                if ensure_coverage_program(gl, coverage_program) {
-                    let prog = coverage_program.as_ref().unwrap();
-                    render_coverage_mask(gl, prog, coverage, &textures.bin, bbw, bbh, *rect_local);
+                if !ensure_coverage_program(gl, coverage_program) {
+                    return false;
                 }
+                let prog = coverage_program.as_ref().unwrap();
+                render_coverage_mask(gl, prog, coverage, &textures.bin, bbw, bbh, *rect_local);
             }
         }
         jfa_init_pass(
@@ -2232,6 +2226,7 @@ fn render_jfa_mask(
             bbw,
             bbh,
             max_dist,
+            (options.geo_size.0 / mask_w as f32).min(options.geo_size.1 / mask_h as f32),
         );
         smooth_encoded_output(
             gl,
@@ -2242,8 +2237,12 @@ fn render_jfa_mask(
             bbh,
         );
 
-        let dest = jfa_blit_dest(&source, bbx, bby, bbw, bbh, mask_w, mask_h);
-        blit_to_mask_texture(gl, &textures.encoded, mask_tex_id, bbw, bbh, dest);
+        blit_to_mask_texture(
+            gl,
+            &textures.encoded,
+            mask_tex_id,
+            Rectangle::new((bbx, bby).into(), (bbw, bbh).into()),
+        );
 
         check_gl_error(gl);
 
@@ -2262,6 +2261,7 @@ fn render_jfa_mask(
             ffi::CLAMP_TO_EDGE as i32,
         );
     }
+    true
 }
 
 unsafe fn clear_mask_texture(
@@ -2423,6 +2423,51 @@ unsafe fn render_binary_mask(
         ffi::TEXTURE_MAG_FILTER,
         ffi::NEAREST as i32,
     );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_S,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+    gl.TexParameteri(
+        ffi::TEXTURE_2D,
+        ffi::TEXTURE_WRAP_T,
+        ffi::CLAMP_TO_EDGE as i32,
+    );
+}
+
+unsafe fn render_analytical_rect_fields(
+    gl: &ffi::Gles2,
+    prog: &RectFieldProgram,
+    dst: &GlesTexture,
+    rects_tex: &GlesTexture,
+    rect_count: i32,
+    mask_w: i32,
+    mask_h: i32,
+    geo_size: (f32, f32),
+) {
+    gl.ActiveTexture(ffi::TEXTURE1);
+    gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
+    gl.FramebufferTexture2D(
+        ffi::DRAW_FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
+        dst.tex_id(),
+        0,
+    );
+    gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+    gl.Clear(ffi::COLOR_BUFFER_BIT);
+
+    gl.UseProgram(prog.program);
+    gl.Uniform1i(prog.uniform_subregion_rects, 1);
+    gl.Uniform2f(prog.uniform_output_size, mask_w as f32, mask_h as f32);
+    gl.Uniform2f(prog.uniform_geo_size, geo_size.0, geo_size.1);
+    gl.Viewport(0, 0, mask_w, mask_h);
+    gl.DrawArraysInstanced(ffi::TRIANGLES, 0, 6, rect_count);
+    gl.ActiveTexture(ffi::TEXTURE0);
+
+    gl.BindTexture(ffi::TEXTURE_2D, dst.tex_id());
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
     gl.TexParameteri(
         ffi::TEXTURE_2D,
         ffi::TEXTURE_WRAP_S,
@@ -2968,6 +3013,7 @@ unsafe fn encode_output(
     bbw: i32,
     bbh: i32,
     max_dist: f32,
+    logical_per_pixel: f32,
 ) {
     gl.FramebufferTexture2D(
         ffi::DRAW_FRAMEBUFFER,
@@ -2983,6 +3029,7 @@ unsafe fn encode_output(
     gl.Uniform1i(prog.uniform_binary, 2);
     gl.Uniform2f(prog.uniform_output_size, bbw as f32, bbh as f32);
     gl.Uniform1f(prog.uniform_max_dist, max_dist);
+    gl.Uniform1f(prog.uniform_logical_per_pixel, logical_per_pixel);
 
     gl.Viewport(0, 0, bbw, bbh);
 
@@ -3085,8 +3132,6 @@ unsafe fn blit_to_mask_texture(
     gl: &ffi::Gles2,
     src_encoded: &GlesTexture,
     mask_tex_id: ffi::types::GLuint,
-    bbw: i32,
-    bbh: i32,
     dest: Rectangle<i32, Buffer>,
 ) {
     let mut read_fbo = 0u32;
@@ -3109,16 +3154,16 @@ unsafe fn blit_to_mask_texture(
     );
 
     gl.BlitFramebuffer(
-        BBOX_BORDER,
-        BBOX_BORDER,
-        bbw - BBOX_BORDER,
-        bbh - BBOX_BORDER,
+        0,
+        0,
+        dest.size.w,
+        dest.size.h,
         dest.loc.x,
         dest.loc.y,
         dest.loc.x + dest.size.w,
         dest.loc.y + dest.size.h,
         ffi::COLOR_BUFFER_BIT,
-        ffi::LINEAR,
+        ffi::NEAREST,
     );
 
     gl.DeleteFramebuffers(1, &read_fbo);
@@ -3672,37 +3717,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gpu_output_clip_requires_an_exact_builtin_region_mask() {
-        assert!(Blur::can_gpu_clip_custom_output(&[], true));
-        assert!(Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::RegionVectors],
-            true
-        ));
-        assert!(Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::CursorVectors],
-            true
-        ));
-        assert!(!Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::WindowVectors],
-            true
-        ));
+    fn analytical_rectangles_must_have_disjoint_pixel_footprints() {
+        assert!(analytical_rects_are_independent(&[]));
+        assert!(analytical_rects_are_independent(&[[0.0, 0.0, 10.0, 10.0]]));
+        assert!(analytical_rects_are_independent(&[
+            [0.0, 0.0, 10.0, 10.0],
+            [12.0, 0.0, 22.0, 10.0],
+            [0.0, 12.0, 10.0, 22.0],
+        ]));
 
-        assert!(!Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::RegionVectors, MaskPassStep::WindowVectors],
-            true
+        assert!(!analytical_rects_are_independent(&[
+            [0.0, 0.0, 10.0, 10.0],
+            [10.0, 0.0, 20.0, 10.0],
+        ]));
+        assert!(!analytical_rects_are_independent(&[
+            [0.0, 0.0, 10.0, 10.0],
+            [9.0, 2.0, 20.0, 8.0],
+        ]));
+        assert!(!analytical_rects_are_independent(&[
+            [0.0, 0.0, 10.0, 10.0],
+            [10.0, 10.0, 20.0, 20.0],
+        ]));
+    }
+
+    #[test]
+    fn full_field_protocol_rect_uses_rounded_window_field() {
+        assert!(rects_cover_full_field(&[[0.0, 0.0, 100.0, 80.0]], 100, 80));
+        assert!(rects_cover_full_field(
+            &[[-10.0, -5.0, 110.0, 90.0]],
+            100,
+            80
         ));
-        assert!(!Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::Custom {
-                name: "mask".to_owned(),
-                source: String::new(),
-                scale: 1.0,
-            }],
-            true
+        assert!(!rects_cover_full_field(&[[0.0, 0.0, 99.0, 80.0]], 100, 80));
+        assert!(!rects_cover_full_field(
+            &[[0.0, 0.0, 100.0, 80.0], [10.0, 10.0, 20.0, 20.0]],
+            100,
+            80
         ));
-        assert!(!Blur::can_gpu_clip_custom_output(
-            &[MaskPassStep::RegionVectors],
-            false
-        ));
+    }
+
+    #[test]
+    fn jfa_bbox_clips_each_texture_edge_without_rescaling() {
+        assert_eq!(
+            jfa_bbox(-50.0, 20.0, 150.0, 80.0, 100, 100),
+            Some((0, 19, 100, 62))
+        );
+        assert_eq!(
+            jfa_bbox(50.0, 20.0, 150.0, 80.0, 100, 100),
+            Some((49, 19, 51, 62))
+        );
+        assert_eq!(
+            jfa_bbox(20.0, -50.0, 80.0, 150.0, 100, 100),
+            Some((19, 0, 62, 100))
+        );
+        assert_eq!(
+            jfa_bbox(20.0, 50.0, 80.0, 150.0, 100, 100),
+            Some((19, 49, 62, 51))
+        );
+    }
+
+    #[test]
+    fn jfa_bbox_rejects_fully_offscreen_sources() {
+        assert_eq!(jfa_bbox(-20.0, 10.0, -1.0, 20.0, 100, 100), None);
+        assert_eq!(jfa_bbox(101.0, 10.0, 120.0, 20.0, 100, 100), None);
+        assert_eq!(jfa_bbox(10.0, -20.0, 20.0, -1.0, 100, 100), None);
+        assert_eq!(jfa_bbox(10.0, 101.0, 20.0, 120.0, 100, 100), None);
     }
     #[test]
     fn default_mask_uv_covers_the_full_texture() {

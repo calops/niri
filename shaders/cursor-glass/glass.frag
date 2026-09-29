@@ -1,19 +1,17 @@
 #version 300 es
 
-// Cursor glass lens. Same model as shaders/overshifted3/glass.frag, applied to
-// the cursor silhouette: `niri_mask` is the cursor's interior distance field
-// (0 at the outline, 1 at the center) baked by the `cursor-vectors` mask pass,
-// and `niri_input` is the padded backdrop captured beneath the cursor so the
-// refraction can sample past the outline.
+// Cursor glass lens. `niri_field` carries logical-pixel interior distance,
+// signed inward flow, and authoritative cursor coverage; `niri_color` is the
+// padded backdrop captured beneath the cursor.
 
 precision highp float;
 precision highp int;
 
 in vec2 v_coords;
 
-uniform sampler2D niri_input;
-uniform sampler2D niri_mask;
-uniform vec4 niri_mask_uv_rect;
+uniform sampler2D niri_color;
+uniform sampler2D niri_field;
+uniform vec4 niri_field_uv_rect;
 uniform vec2 niri_output_size;
 uniform vec2 niri_input_size;
 uniform vec2 niri_half_pixel;
@@ -74,76 +72,55 @@ vec3 saturate_color(vec3 color, float amount) {
 void main() {
     vec2 uv = v_coords;
 
-    vec2 mask_uv = mix(niri_mask_uv_rect.xy, niri_mask_uv_rect.zw, uv);
-    vec4 mask_sample = texture(niri_mask, mask_uv);
-    float mask = mask_sample.r;
+    vec2 field_uv = mix(niri_field_uv_rect.xy, niri_field_uv_rect.zw, uv);
+    vec4 field = texture(niri_field, field_uv);
 
-    if (mask < 0.001) {
-        // Transparent outside the silhouette. This lets the pipeline work both
-        // with the exact GPU output clip (mask_output.frag) and with the CPU
-        // damage fallback used by custom mask passes.
+    if (field.a <= 0.0) {
         frag_color = vec4(0.0);
         return;
     }
 
-    vec2 to_center = (mask_sample.gb - 0.5) * 2.0;
-
-    // Fade the lighting direction before constructing the nonlinear
-    // specular normal so medial-axis noise cannot become a full-strength
-    // highlight. Refraction still uses the full encoded vector.
-    float to_center_mag = length(to_center);
-    float center_fade = smoothstep(0.0, u_centerThreshold, to_center_mag);
-    vec2 unit_dir = to_center_mag > 1e-6 ? to_center / to_center_mag : vec2(0.0);
-    vec2 dir = unit_dir * center_fade;
+    float depth = clamp(field.r / 32.0, 0.0, 1.0);
+    vec2 inward = field.gb;
+    vec2 dir = inward;
 
     // --- Chromatic refraction ---
-    float base = max(f(mask), 0.0);
+    float base = max(f(depth), 0.0);
     float base_warp = pow(base, u_fPower);
-    float edge_chromatic = mix(u_chromatic, u_edge_chromatic, pow(1.0 - mask, 1.6));
+    float edge_chromatic = mix(u_chromatic, u_edge_chromatic, pow(1.0 - depth, 1.6));
     float warp_r = pow(base, u_fPower * (1.0 - edge_chromatic));
     float warp_b = pow(base, u_fPower * (1.0 + edge_chromatic));
 
-    vec2 uv_r = clamp(
-        uv + to_center * (1.0 - warp_r) * u_refraction_strength,
-        0.0,
-        1.0
-    );
-    vec2 uv_g = clamp(
-        uv + to_center * (1.0 - base_warp) * u_refraction_strength,
-        0.0,
-        1.0
-    );
-    vec2 uv_b = clamp(
-        uv + to_center * (1.0 - warp_b) * u_refraction_strength,
-        0.0,
-        1.0
-    );
+    vec2 refraction_scale = vec2(48.0 * u_refraction_strength) / niri_input_size;
+    vec2 uv_r = clamp(uv + inward * (1.0 - warp_r) * refraction_scale, 0.0, 1.0);
+    vec2 uv_g = clamp(uv + inward * (1.0 - base_warp) * refraction_scale, 0.0, 1.0);
+    vec2 uv_b = clamp(uv + inward * (1.0 - warp_b) * refraction_scale, 0.0, 1.0);
 
-    float cr = texture(niri_input, uv_r).r;
-    vec4 green_alpha_sample = texture(niri_input, uv_g);
+    float cr = texture(niri_color, uv_r).r;
+    vec4 green_alpha_sample = texture(niri_color, uv_g);
     float cg = green_alpha_sample.g;
-    float cb = texture(niri_input, uv_b).b;
+    float cb = texture(niri_color, uv_b).b;
     float ca = green_alpha_sample.a;
 
     // A small tent filter softens the refracted image without obscuring it.
     // The preceding Kawase pass supplies the broader, low-frequency blur.
     vec2 frost_step = niri_half_pixel * 2.5;
     vec4 frost = green_alpha_sample * 0.4;
-    frost += texture(niri_input, clamp(uv_g + vec2(frost_step.x, 0.0), 0.0, 1.0)) * 0.15;
-    frost += texture(niri_input, clamp(uv_g - vec2(frost_step.x, 0.0), 0.0, 1.0)) * 0.15;
-    frost += texture(niri_input, clamp(uv_g + vec2(0.0, frost_step.y), 0.0, 1.0)) * 0.15;
-    frost += texture(niri_input, clamp(uv_g - vec2(0.0, frost_step.y), 0.0, 1.0)) * 0.15;
+    frost += texture(niri_color, clamp(uv_g + vec2(frost_step.x, 0.0), 0.0, 1.0)) * 0.15;
+    frost += texture(niri_color, clamp(uv_g - vec2(frost_step.x, 0.0), 0.0, 1.0)) * 0.15;
+    frost += texture(niri_color, clamp(uv_g + vec2(0.0, frost_step.y), 0.0, 1.0)) * 0.15;
+    frost += texture(niri_color, clamp(uv_g - vec2(0.0, frost_step.y), 0.0, 1.0)) * 0.15;
     vec3 refracted_color = mix(vec3(cr, cg, cb), frost.rgb, u_frost);
     float refracted_alpha = mix(ca, frost.a, u_frost);
 
     // --- Lighting ---
 
     // Surface normal from dome curvature.
-    float slope = (1.0 - mask) * 5.0;
+    float slope = (1.0 - depth) * 5.0;
     vec3 normal = normalize(vec3(-slope * dir, 3.0));
 
     // Point light grazing from the configured light position.
-    vec2 screen_uv = niri_window_screen_rect.xy + mask_uv * niri_window_screen_rect.zw;
+    vec2 screen_uv = niri_window_screen_rect.xy + field_uv * niri_window_screen_rect.zw;
     vec2 to_light = light_pos - screen_uv;
     vec2 light_dir_2d = to_light * inversesqrt(max(dot(to_light, to_light), 1e-12));
     vec3 light_dir = normalize(vec3(to_light, 0.04));
@@ -158,13 +135,13 @@ void main() {
     float light_alignment = dot(-dir, light_dir_2d);
     float facing = max(light_alignment, 0.0);
     float away = max(-light_alignment, 0.0);
-    float edge = pow(1.0 - mask, 3.0);
+    float edge = pow(1.0 - depth, 3.0);
     float rim_light = facing * edge * 1.5;
     float rim_shadow = away * edge * 0.35;
 
     // Let the silhouette be defined by a directional reflection rather than
     // a uniform stroke. Even the fully lit edge retains its refracted color.
-    float edge_band = 1.0 - smoothstep(0.015, 0.075, mask);
+    float edge_band = 1.0 - smoothstep(0.5, 3.0, field.r);
     float edge_reflection = edge_band * (0.08 + 0.92 * facing);
     float edge_shadow = edge_band * away * 0.16;
     float glow = spec * 0.85 + rim_light;
@@ -175,7 +152,7 @@ void main() {
     color.rgb *= 1.0 + glow - rim_shadow;
     color.rgb = saturate_color(color.rgb, u_saturation);
 
-    float edge_tint = pow(1.0 - mask, 2.5);
+    float edge_tint = pow(1.0 - depth, 2.5);
     float light_tint = mix(u_interior_light_tint, u_edge_light_tint, edge_tint);
     color.rgb = mix(color.rgb, u_light_tint * color.a, light_tint);
 
