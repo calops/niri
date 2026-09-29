@@ -1,2 +1,2 @@
 blur
-shader "glass.frag"
+shader file="glass.frag"

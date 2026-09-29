@@ -1,2 +1,2 @@
 blur
-shader "debug.frag"
+shader file="debug.frag"

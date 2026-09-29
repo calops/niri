@@ -22,9 +22,8 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
-    /// Cache of compiled custom blur pipelines keyed by a hash of all
-    /// shader source strings in the pipeline. The `Option` inside caches
-    /// compilation failures so we don't retry-storm on bad pipelines.
+    /// Cache of compiled custom blur pipelines keyed by decoded source and
+    /// stage options. The `Option` inside caches compilation failures.
     pub custom_blur: RefCell<HashMap<u64, Option<CustomBlurProgram>>>,
 }
 
@@ -359,29 +358,16 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
     }
 }
 
-/// Look up a custom blur pipeline by its inline config definition. Compiles
-/// lazily on first request; subsequent calls with the same shader source
-/// texts (same hash) return the cached result. Compile failures are cached
-/// too so we don't retry-storm on a bad pipeline.
+/// Look up a custom blur pipeline by its decoded source specification.
+///
+/// Source files are loaded while parsing the config. Cache hits therefore do
+/// not touch the filesystem or hash complete source strings in the render path.
 pub fn get_or_compile_custom_blur(
     renderer: &mut GlesRenderer,
     pipeline: &niri_config::ShaderPipeline,
 ) -> Option<CustomBlurProgram> {
-    // Resolve file paths → shader source strings.  If any file fails to
-    // read, the pipeline is invalid and we return `None` without caching
-    // (the error is transient — the file may appear on a later frame).
-    let config = match super::custom_blur::resolve_pipeline(pipeline) {
-        Ok(c) => c,
-        Err(err) => {
-            warn!("error loading custom blur pipeline: {err:?}");
-            return None;
-        }
-    };
+    let key = super::custom_blur::cache_key(pipeline);
 
-    let key = config.cache_key();
-
-    // Cache hit: short-scope the &Shaders borrow so we can re-borrow
-    // renderer mutably on miss.
     let cached = Shaders::get(renderer)
         .custom_blur
         .borrow()
@@ -391,15 +377,18 @@ pub fn get_or_compile_custom_blur(
         return entry;
     }
 
-    // Cache miss: compile (needs &mut renderer), then write into the
-    // cache. We re-acquire &Shaders after the compile so the borrows
-    // don't overlap.
-    for (i, step) in config.field_passes.iter().enumerate() {
-        info!(
-            "custom blur pipeline has field shader {i} ({:?})",
-            step.name
-        );
-    }
+    let config = match super::custom_blur::resolve_pipeline(pipeline) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!("error loading custom blur pipeline: {err:?}");
+            Shaders::get(renderer)
+                .custom_blur
+                .borrow_mut()
+                .insert(key, None);
+            return None;
+        }
+    };
+
     let program = CustomBlurProgram::compile(renderer, &config)
         .inspect_err(|err| warn!("error compiling custom blur shader: {err:?}"))
         .ok();

@@ -1,1 +1,1 @@
-shader "viz.frag"
+shader file="viz.frag"

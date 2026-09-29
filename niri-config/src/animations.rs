@@ -1,8 +1,9 @@
 use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
 
+use crate::shader::{decode_shader_source, PositionalShaderSource};
 use crate::utils::{expect_only_children, parse_arg_node, MergeWith};
-use crate::FloatOrInt;
+use crate::{FloatOrInt, ShaderSource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Animations {
@@ -154,7 +155,7 @@ impl Default for WorkspaceSwitchAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowOpenAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
+    pub custom_shader: Option<ShaderSource>,
 }
 
 impl Default for WindowOpenAnim {
@@ -175,7 +176,7 @@ impl Default for WindowOpenAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowCloseAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
+    pub custom_shader: Option<ShaderSource>,
 }
 
 impl Default for WindowCloseAnim {
@@ -228,7 +229,7 @@ impl Default for WindowMovementAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowResizeAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
+    pub custom_shader: Option<ShaderSource>,
 }
 
 impl Default for WindowResizeAnim {
@@ -383,7 +384,12 @@ where
         let mut custom_shader = None;
         let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
             if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                custom_shader = Some(decode_shader_source(
+                    child,
+                    ctx,
+                    PositionalShaderSource::Inline,
+                    &[],
+                )?);
                 Ok(true)
             } else {
                 Ok(false)
@@ -409,7 +415,12 @@ where
         let mut custom_shader = None;
         let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
             if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                custom_shader = Some(decode_shader_source(
+                    child,
+                    ctx,
+                    PositionalShaderSource::Inline,
+                    &[],
+                )?);
                 Ok(true)
             } else {
                 Ok(false)
@@ -435,7 +446,12 @@ where
         let mut custom_shader = None;
         let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
             if &**child.node_name == "custom-shader" {
-                custom_shader = parse_arg_node("custom-shader", child, ctx)?;
+                custom_shader = Some(decode_shader_source(
+                    child,
+                    ctx,
+                    PositionalShaderSource::Inline,
+                    &[],
+                )?);
                 Ok(true)
             } else {
                 Ok(false)

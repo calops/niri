@@ -115,12 +115,12 @@ cursor {
     motion-effect-strength 1.0
     shader-pipeline version=1 {
         blur passes=2 offset=1.2
-        shader "shaders/cursor-glass/glass.frag"
+        shader file="shaders/cursor-glass/glass.frag"
     }
     // Debug: swap the active shader for this to check whether the effect path
     // and the silhouette field are actually running (magenta arrow = yes).
     // shader-pipeline version=1 {
-    //     shader "shaders/cursor-glass/debug.frag"
+    //     shader file="shaders/cursor-glass/debug.frag"
     // }
 }
 
@@ -133,7 +133,7 @@ blur {
     noise 0
     shader-pipeline version=1 {
         blur passes=2 offset=3
-        shader "shaders/liquid-glass-faithful/glass.frag"
+        shader file="shaders/liquid-glass-faithful/glass.frag"
     }
 }
 
@@ -280,9 +280,9 @@ window-rule {
   background-effect {
     shader-pipeline version=1 {
         blur passes=2 offset=2
-        shader "shaders/liquid-glass-faithful/glass.frag"
-        // shader "shaders/magnify/magnify.frag"
-        // shader "shaders/magnify/glass.frag"
+        shader file="shaders/liquid-glass-faithful/glass.frag"
+        // shader file="shaders/magnify/magnify.frag"
+        // shader file="shaders/magnify/glass.frag"
     }
   }
 }
@@ -313,7 +313,7 @@ window-rule {
     noise 0.0
     shader-pipeline version=1 {
         blur passes=1 offset=1
-        shader "shaders/liquid-glass-faithful/glass.frag"
+        shader file="shaders/liquid-glass-faithful/glass.frag"
     }
   }
 }
@@ -344,7 +344,20 @@ layer-rule {
     noise 0.0
     shader-pipeline version=1 {
         blur passes=2 offset=2
-        shader "shaders/liquid-glass-faithful/glass.frag"
+        shader file="shaders/liquid-glass-faithful/glass.frag"
+    }
+  }
+}
+
+layer-rule {
+  match namespace="donkey-test"
+  background-effect {
+    xray false
+    blur true
+    noise 0.0
+    shader-pipeline version=1 {
+        blur passes=2 offset=2
+        shader file="donkey-test/glass.frag"
     }
   }
 }
@@ -357,7 +370,7 @@ layer-rule {
     noise 0.0
     shader-pipeline version=1 {
         blur passes=2 offset=2
-        shader "shaders/liquid-glass-faithful/glass.frag"
+        shader file="shaders/liquid-glass-faithful/glass.frag"
     }
   }
 }
@@ -370,7 +383,7 @@ layer-rule {
     noise 0.0
     shader-pipeline version=1 {
         blur passes=1 offset=1
-        shader "shaders/prism-glass/window.frag"
+        shader file="shaders/prism-glass/window.frag"
     }
   }
 }
@@ -382,8 +395,8 @@ layer-rule {
     blur true
     noise 0.0
     shader-pipeline version=1 {
-        shader "shaders/magnify/magnify.frag"
-        shader "shaders/magnify/glass.frag"
+        shader file="shaders/magnify/magnify.frag"
+        shader file="shaders/magnify/glass.frag"
     }
   }
 }

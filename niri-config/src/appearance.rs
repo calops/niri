@@ -5,8 +5,9 @@ use knuffel::errors::DecodeError;
 use miette::{miette, IntoDiagnostic as _};
 use smithay::backend::renderer::Color32F;
 
+use crate::shader::{decode_shader_source, PositionalShaderSource};
 use crate::utils::{Flag, MergeWith};
-use crate::FloatOrInt;
+use crate::{FloatOrInt, ShaderSource};
 
 pub const DEFAULT_BACKGROUND_COLOR: Color = Color::from_array_unpremul([0.25, 0.25, 0.25, 1.]);
 pub const DEFAULT_BACKDROP_COLOR: Color = Color::from_array_unpremul([0.15, 0.15, 0.15, 1.]);
@@ -1030,12 +1031,6 @@ impl Default for Blur {
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
-pub struct FieldShaderPart {
-    #[knuffel(argument)]
-    pub file: String,
-}
-
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct BlurPassPart {
     #[knuffel(property)]
     pub passes: Option<u8>,
@@ -1043,17 +1038,31 @@ pub struct BlurPassPart {
     pub offset: Option<FloatOrInt<0, 100>>,
 }
 
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShaderPassPart {
-    #[knuffel(argument)]
-    pub file: String,
-    #[knuffel(property, default = 1.0)]
+    pub source: ShaderSource,
     pub scale: f32,
+}
+
+impl<S> knuffel::Decode<S> for ShaderPassPart
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let source = decode_shader_source(node, ctx, PositionalShaderSource::File, &["scale"])?;
+        let scale = match node.properties.get("scale") {
+            Some(value) => knuffel::traits::DecodeScalar::decode(value, ctx)?,
+            None => 1.0,
+        };
+        Ok(Self { source, scale })
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum ShaderPipelineStage {
-    FieldShader(FieldShaderPart),
     Blur(BlurPassPart),
     Shader(ShaderPassPart),
 }
@@ -1403,9 +1412,8 @@ mod tests {
             r##"
             blur {
                 shader-pipeline version=1 {
-                    field-shader "/path/to/field.frag"
                     blur passes=2 offset=1.5
-                    shader "/path/to/pass1.frag" scale=0.5
+                    shader inline="#version 300 es\nvoid main() {}" scale=0.5
                 }
             }
             "##,
@@ -1415,15 +1423,10 @@ mod tests {
         .shader_pipeline
         .unwrap();
 
-        assert_debug_snapshot!(pipeline, @r#"
+        assert_debug_snapshot!(pipeline, @r##"
         ShaderPipeline {
             version: 1,
             stages: [
-                FieldShader(
-                    FieldShaderPart {
-                        file: "/path/to/field.frag",
-                    },
-                ),
                 Blur(
                     BlurPassPart {
                         passes: Some(
@@ -1438,13 +1441,15 @@ mod tests {
                 ),
                 Shader(
                     ShaderPassPart {
-                        file: "/path/to/pass1.frag",
+                        source: Inline(
+                            "#version 300 es\nvoid main() {}",
+                        ),
                         scale: 0.5,
                     },
                 ),
             ],
         }
-        "#);
+        "##);
     }
 
     #[test]
@@ -1456,7 +1461,7 @@ mod tests {
                 shape-transition-duration-ms 75
                 motion-effect-strength 0.5
                 shader-pipeline version=1 {
-                    shader "/path/to/glass.frag"
+                    shader inline="#version 300 es\nvoid main() {}"
                 }
             }
             "##,

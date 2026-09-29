@@ -28,26 +28,21 @@ pub struct Blur {
     custom_textures: Vec<GlesTexture>,
     /// Final custom-pipeline output multiplied by authoritative field coverage.
     masked_output_texture: Option<GlesTexture>,
-    /// Full-resolution geometry-field texture, primary ping-pong buffer.
+    /// Full-resolution automatic geometry-field texture.
     mask_texture_a: Option<GlesTexture>,
-    /// Full-resolution geometry-field texture, secondary ping-pong buffer.
-    mask_texture_b: Option<GlesTexture>,
     /// Compiled analytical full-window field program.
     mask_program: Option<MaskProgram>,
     /// Compiled instanced analytical rectangle-field program.
     rect_field_program: Option<RectFieldProgram>,
     /// Program applying authoritative field coverage to the rendered output.
     mask_output_program: Option<MaskOutputProgram>,
-    /// Cached field inputs and final texture. Matching pipeline and geometry
-    /// inputs reuse the complete field without touching either ping-pong
-    /// texture.
+    /// Cached automatic-field inputs. Matching geometry inputs reuse the
+    /// complete field.
     cached_mask_rects: Arc<Vec<[f32; 4]>>,
     cached_mask_w: i32,
     cached_mask_h: i32,
     cached_mask_geo_size: (f32, f32),
     cached_mask_corner_radius: [f32; 4],
-    cached_mask_pipeline: Option<Rc<CustomBlurProgramInner>>,
-    cached_mask_texture_is_b: Option<bool>,
     /// Cursor coverage identity and silhouette placement the field was built
     /// from. `None` when the active field is rect-based.
     cached_mask_coverage: Option<(u64, Rectangle<i32, Buffer>)>,
@@ -290,7 +285,6 @@ struct CustomBlurPassProgram {
 
 #[derive(Debug)]
 struct CustomBlurProgramInner {
-    field_programs: Vec<CustomFieldProgram>,
     render_passes: Vec<RenderPassStep>,
     render_programs: Vec<Option<CustomBlurPassProgram>>,
 }
@@ -354,43 +348,16 @@ unsafe fn compile_mask_output_program(gl: &ffi::Gles2) -> Result<MaskOutputProgr
     })
 }
 
-unsafe fn compile_custom_field_pass(
-    gl: &ffi::Gles2,
-    frag_src: &str,
-) -> Result<CustomFieldProgram, GlesError> {
-    let vert_src = include_str!("shaders/blur_custom.vert");
-    let program = unsafe { link_program(gl, vert_src, frag_src)? };
-
-    Ok(CustomFieldProgram {
-        program,
-        uniform_field: gl.GetUniformLocation(program, c"niri_field".as_ptr()),
-        uniform_subregion_count: gl.GetUniformLocation(program, c"niri_subregion_count".as_ptr()),
-        uniform_subregion_rects: gl.GetUniformLocation(program, c"niri_subregion_rects".as_ptr()),
-        uniform_output_size: gl.GetUniformLocation(program, c"niri_output_size".as_ptr()),
-        uniform_bbox_origin: gl.GetUniformLocation(program, c"niri_bbox_origin".as_ptr()),
-        uniform_geo_size: gl.GetUniformLocation(program, c"niri_geo_size".as_ptr()),
-        uniform_corner_radius: gl.GetUniformLocation(program, c"niri_corner_radius".as_ptr()),
-        attrib_vert: gl.GetAttribLocation(program, c"vert".as_ptr()),
-    })
-}
-
 impl CustomBlurProgram {
     pub fn compile(renderer: &mut GlesRenderer, config: &PipelineConfig) -> anyhow::Result<Self> {
         renderer
             .with_context(move |gl| unsafe {
-                let mut field_programs = Vec::with_capacity(config.field_passes.len());
-                for (i, step) in config.field_passes.iter().enumerate() {
-                    field_programs.push(compile_custom_field_pass(gl, &step.source).with_context(
-                        || format!("error compiling custom field pass {} ({:?})", i, step.name),
-                    )?);
-                }
-
                 let mut render_programs = Vec::with_capacity(config.render_passes.len());
                 for (i, step) in config.render_passes.iter().enumerate() {
                     let prog = match step {
                         RenderPassStep::DualKawaseBlur { .. } => None,
                         RenderPassStep::Custom { source, name, .. } => {
-                            Some(compile_custom_pass(gl, source).with_context(|| {
+                            Some(compile_custom_pass(gl, source.source()).with_context(|| {
                                 format!("error compiling custom render pass {} ({:?})", i, name)
                             })?)
                         }
@@ -398,7 +365,6 @@ impl CustomBlurProgram {
                     render_programs.push(prog);
                 }
                 Ok(Self(Rc::new(CustomBlurProgramInner {
-                    field_programs,
                     render_passes: config.render_passes.clone(),
                     render_programs,
                 })))
@@ -408,9 +374,6 @@ impl CustomBlurProgram {
 
     pub fn destroy(self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         renderer.with_context(move |gl| unsafe {
-            for prog in &self.0.field_programs {
-                gl.DeleteProgram(prog.program);
-            }
             for prog in &self.0.render_programs {
                 if let Some(p) = prog {
                     gl.DeleteProgram(p.program);
@@ -443,19 +406,6 @@ struct MaskOutputProgram {
     uniform_input: ffi::types::GLint,
     uniform_mask: ffi::types::GLint,
     uniform_mask_uv_rect: ffi::types::GLint,
-    attrib_vert: ffi::types::GLint,
-}
-
-#[derive(Debug)]
-struct CustomFieldProgram {
-    program: ffi::types::GLuint,
-    uniform_field: ffi::types::GLint,
-    uniform_subregion_count: ffi::types::GLint,
-    uniform_subregion_rects: ffi::types::GLint,
-    uniform_output_size: ffi::types::GLint,
-    uniform_bbox_origin: ffi::types::GLint,
-    uniform_geo_size: ffi::types::GLint,
-    uniform_corner_radius: ffi::types::GLint,
     attrib_vert: ffi::types::GLint,
 }
 
@@ -1096,7 +1046,6 @@ impl Blur {
             textures: Vec::new(),
             custom_textures: Vec::new(),
             mask_texture_a: None,
-            mask_texture_b: None,
             mask_program: None,
             rect_field_program: None,
             masked_output_texture: None,
@@ -1106,8 +1055,6 @@ impl Blur {
             mask_output_program: None,
             cached_mask_geo_size: (0.0, 0.0),
             cached_mask_corner_radius: [0.0; 4],
-            cached_mask_pipeline: None,
-            cached_mask_texture_is_b: None,
             cached_mask_coverage: None,
             cached_rects_px: Vec::new(),
             jfa_pipeline: None,
@@ -1283,15 +1230,8 @@ impl Blur {
         let size_changed = self.cached_mask_w != mask_w || self.cached_mask_h != mask_h;
         let mask_geometry_changed = self.cached_mask_geo_size != geo_size
             || self.cached_mask_corner_radius != corner_radius;
-        let pipeline_changed = self
-            .cached_mask_pipeline
-            .as_ref()
-            .is_none_or(|cached| !Rc::ptr_eq(cached, &custom_program.0));
-        let mask_inputs_changed = rects_changed
-            || coverage_changed
-            || size_changed
-            || mask_geometry_changed
-            || pipeline_changed;
+        let mask_inputs_changed =
+            rects_changed || coverage_changed || size_changed || mask_geometry_changed;
 
         if rects_changed
             || size_changed
@@ -1319,18 +1259,6 @@ impl Blur {
         if need_new_mask {
             let tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
             self.mask_texture_a = Some(tex);
-        }
-        let need_mask_b = self
-            .mask_texture_b
-            .as_ref()
-            .is_none_or(|t| t.size() != mask_size);
-        if need_mask_b {
-            let tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr16161616f, mask_size)?;
-            self.mask_texture_b = Some(tex);
-        }
-
-        if need_new_mask || need_mask_b {
-            self.cached_mask_texture_is_b = None;
         }
 
         let needed = options.subregion_rects.len() as i32;
@@ -1493,8 +1421,6 @@ impl Blur {
             }
         };
 
-        let field_programs = &inner.field_programs;
-
         // If any render step is DualKawaseBlur, prepare Kawase textures
         // before entering the GL context. Use the maximum passes across
         // all DualKawaseBlur steps so that intermediate textures are sized
@@ -1518,10 +1444,7 @@ impl Blur {
                 max_kawase_passes,
             )?;
         }
-        let mask_cache_hit = !need_new_mask
-            && !need_mask_b
-            && !mask_inputs_changed
-            && self.cached_mask_texture_is_b.is_some();
+        let mask_cache_hit = !need_new_mask && !mask_inputs_changed;
 
         renderer.with_profiled_context(gpu_span_location!("Blur::render_custom"), |gl| unsafe {
             while gl.GetError() != ffi::NO_ERROR {}
@@ -1543,11 +1466,8 @@ impl Blur {
                 }
             }
 
-            // Step 1: generate the compositor-owned geometry field, then run
-            // optional user field transformations at the same stable size.
+            // Step 1: generate the compositor-owned geometry field.
             let mask_a = self.mask_texture_a.as_ref().unwrap();
-            let mask_b = self.mask_texture_b.as_ref().unwrap();
-            let mut active_mask_is_b = false;
             let mut field_available = mask_cache_hit;
 
             if !mask_cache_hit {
@@ -1702,118 +1622,20 @@ impl Blur {
                     ffi::TEXTURE_WRAP_T,
                     ffi::CLAMP_TO_EDGE as i32,
                 );
-
-                let mut src_field = mask_a;
-                for program in field_programs {
-                    let dst_field = if active_mask_is_b { mask_a } else { mask_b };
-
-                    if let (Some(rects_tex), true) = (
-                        self.rects_texture.as_ref(),
-                        !options.subregion_rects.is_empty(),
-                    ) {
-                        gl.ActiveTexture(ffi::TEXTURE1);
-                        gl.BindTexture(ffi::TEXTURE_2D, rects_tex.tex_id());
-                    }
-
-                    gl.FramebufferTexture2D(
-                        ffi::DRAW_FRAMEBUFFER,
-                        ffi::COLOR_ATTACHMENT0,
-                        ffi::TEXTURE_2D,
-                        dst_field.tex_id(),
-                        0,
-                    );
-                    gl.ActiveTexture(ffi::TEXTURE0);
-                    gl.BindTexture(ffi::TEXTURE_2D, src_field.tex_id());
-                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_WRAP_S,
-                        ffi::CLAMP_TO_EDGE as i32,
-                    );
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_WRAP_T,
-                        ffi::CLAMP_TO_EDGE as i32,
-                    );
-
-                    gl.UseProgram(program.program);
-                    if program.uniform_field >= 0 {
-                        gl.Uniform1i(program.uniform_field, 0);
-                    }
-                    if program.uniform_subregion_count >= 0 {
-                        gl.Uniform1i(
-                            program.uniform_subregion_count,
-                            options.subregion_rects.len() as i32,
-                        );
-                    }
-                    if program.uniform_subregion_rects >= 0 {
-                        gl.Uniform1i(program.uniform_subregion_rects, 1);
-                    }
-                    if program.uniform_output_size >= 0 {
-                        gl.Uniform2f(program.uniform_output_size, mask_w as f32, mask_h as f32);
-                    }
-                    if program.uniform_bbox_origin >= 0 {
-                        gl.Uniform2f(program.uniform_bbox_origin, 0.0, 0.0);
-                    }
-                    if program.uniform_geo_size >= 0 {
-                        gl.Uniform2f(program.uniform_geo_size, geo_size.0, geo_size.1);
-                    }
-                    if program.uniform_corner_radius >= 0 {
-                        gl.Uniform4f(
-                            program.uniform_corner_radius,
-                            corner_radius[0],
-                            corner_radius[1],
-                            corner_radius[2],
-                            corner_radius[3],
-                        );
-                    }
-
-                    gl.Viewport(0, 0, mask_w, mask_h);
-                    draw_fullscreen_quad(gl, program.attrib_vert);
-                    check_gl_error(gl);
-
-                    gl.BindTexture(ffi::TEXTURE_2D, dst_field.tex_id());
-                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-                    gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_WRAP_S,
-                        ffi::CLAMP_TO_EDGE as i32,
-                    );
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_WRAP_T,
-                        ffi::CLAMP_TO_EDGE as i32,
-                    );
-
-                    if self.cached_jfa_mask_texture_id == Some(dst_field.tex_id()) {
-                        self.cached_jfa_mask_texture_id = None;
-                    }
-                    src_field = dst_field;
-                    active_mask_is_b = !active_mask_is_b;
-                }
             }
 
-            if mask_cache_hit {
-                active_mask_is_b = self.cached_mask_texture_is_b.unwrap();
-            } else if field_available {
+            if !mask_cache_hit && field_available {
                 self.cached_mask_rects = options.subregion_rects.clone();
                 self.cached_mask_coverage = coverage_key;
                 self.cached_mask_w = mask_w;
                 self.cached_mask_h = mask_h;
                 self.cached_mask_geo_size = geo_size;
                 self.cached_mask_corner_radius = corner_radius;
-                self.cached_mask_pipeline = Some(custom_program.0.clone());
-                self.cached_mask_texture_is_b = Some(active_mask_is_b);
-            } else {
-                self.cached_mask_pipeline = None;
-                self.cached_mask_texture_is_b = None;
             }
 
             apply_output_mask &= field_available;
 
-            let active_mask = if active_mask_is_b { mask_b } else { mask_a };
+            let active_mask = mask_a;
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_2D, active_mask.tex_id());
             gl.ActiveTexture(ffi::TEXTURE0);

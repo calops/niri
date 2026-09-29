@@ -407,3 +407,31 @@ blur {
     saturation 1.5
 }
 ```
+
+#### `shader-pipeline`
+
+An ordered custom color pipeline. A `blur` stage runs the built-in dual Kawase blur. A `shader` stage runs a custom fragment shader against the previous stage's color and the compositor-owned geometry field.
+
+```kdl
+blur {
+    shader-pipeline version=1 {
+        blur passes=2 offset=2
+        shader file="examples/glass-liquid/composite.frag"
+    }
+}
+```
+
+Multiple stages are supported when an effect needs intermediate color textures or resolution changes:
+
+```kdl
+blur {
+    shader-pipeline version=1 {
+        shader file="examples/glass-liquid/refract.frag"
+        shader file="examples/glass-liquid/blur_down.frag" scale=0.5
+        shader file="examples/glass-liquid/blur_up.frag" scale=2.0
+        shader file="examples/glass-liquid/composite.frag"
+    }
+}
+```
+
+Use `shader inline="..."` for inline GLSL. `shader "file.frag"` remains accepted as the legacy positional file form. Relative paths resolve from the config file containing the declaration. Shader files are watched and reload with the config.

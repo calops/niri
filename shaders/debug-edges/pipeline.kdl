@@ -1,1 +1,1 @@
-shader "edges.frag"
+shader file="edges.frag"

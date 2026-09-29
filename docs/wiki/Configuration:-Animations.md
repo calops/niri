@@ -185,6 +185,8 @@ animations {
 
 You can write a custom shader for drawing the window during an open animation.
 
+The positional argument remains inline GLSL. Use `custom-shader file="open.frag"` to load it from a file relative to the declaring config file. Shader files are watched and reload with the config.
+
 See [this example shader](./examples/open_custom_shader.frag) for a full documentation with several animations to experiment with.
 
 If a custom shader fails to compile, niri will print a warning and fall back to the default, or previous successfully compiled shader.
@@ -244,6 +246,8 @@ animations {
 <sup>Since: 0.1.6</sup>
 
 You can write a custom shader for drawing the window during a close animation.
+
+The positional argument remains inline GLSL. Use `custom-shader file="close.frag"` to load it from a file relative to the declaring config file. Shader files are watched and reload with the config.
 
 See [this example shader](./examples/close_custom_shader.frag) for a full documentation with several animations to experiment with.
 
@@ -340,6 +344,8 @@ animations {
 <sup>Since: 0.1.6</sup>
 
 You can write a custom shader for drawing the window during a resize animation.
+
+The positional argument remains inline GLSL. Use `custom-shader file="resize.frag"` to load it from a file relative to the declaring config file. Shader files are watched and reload with the config.
 
 See [this example shader](./examples/resize_custom_shader.frag) for a full documentation with several animations to experiment with.
 

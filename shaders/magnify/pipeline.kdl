@@ -1,2 +1,2 @@
-shader "magnify.frag"
-shader "glass.frag"
+shader file="magnify.frag"
+shader file="glass.frag"

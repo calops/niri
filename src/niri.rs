@@ -1577,7 +1577,12 @@ impl State {
         if config.animations.window_resize.custom_shader
             != old_config.animations.window_resize.custom_shader
         {
-            let src = config.animations.window_resize.custom_shader.as_deref();
+            let src = config
+                .animations
+                .window_resize
+                .custom_shader
+                .as_ref()
+                .map(|source| source.source());
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_resize_program(renderer, src);
             });
@@ -1587,7 +1592,12 @@ impl State {
         if config.animations.window_close.custom_shader
             != old_config.animations.window_close.custom_shader
         {
-            let src = config.animations.window_close.custom_shader.as_deref();
+            let src = config
+                .animations
+                .window_close
+                .custom_shader
+                .as_ref()
+                .map(|source| source.source());
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_close_program(renderer, src);
             });
@@ -1597,18 +1607,26 @@ impl State {
         if config.animations.window_open.custom_shader
             != old_config.animations.window_open.custom_shader
         {
-            let src = config.animations.window_open.custom_shader.as_deref();
+            let src = config
+                .animations
+                .window_open
+                .custom_shader
+                .as_ref()
+                .map(|source| source.source());
             self.backend.with_primary_renderer(|renderer| {
                 shaders::set_custom_open_program(renderer, src);
             });
             shaders_changed = true;
         }
 
-        // Custom blur pipelines are resolved per-window from
-        // `BlurOptions::custom_shader` and cached lazily in `Shaders`
-        // keyed by path. Drop the cache when blur config or window rules
-        // changed so path overrides and shader-file edits get picked up.
-        if config.blur != old_config.blur || config.window_rules != old_config.window_rules {
+        // Shader files are loaded with the config and participate in config
+        // equality. Drop every compiled pipeline that can be selected by a
+        // changed global option, window rule, layer rule, or cursor option.
+        if config.blur != old_config.blur
+            || config.window_rules != old_config.window_rules
+            || config.layer_rules != old_config.layer_rules
+            || config.cursor.shader_pipeline != old_config.cursor.shader_pipeline
+        {
             self.backend.with_primary_renderer(|renderer| {
                 shaders::clear_custom_blur_cache(renderer);
             });
